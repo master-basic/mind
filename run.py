@@ -180,7 +180,7 @@ def setup_storage(args):
 
     (storage_root / "models").mkdir(parents=True, exist_ok=True)
     (storage_root / "store").mkdir(parents=True, exist_ok=True)
-    (storage_root / "snapshots").mkdir(parents=True, exist_ok=True)
+    (ROOT / "snapshots").mkdir(parents=True, exist_ok=True)
     return storage_root
 
 
@@ -255,7 +255,7 @@ def update_config(storage_root):
     with open(CONFIG_PATH) as f:
         config = yaml.safe_load(f)
     config["store_path"] = str(storage_root / "store")
-    config["snapshot_path"] = str(storage_root / "snapshots")
+    config["snapshot_path"] = str(ROOT / "snapshots")
     config["models_dir"] = str(storage_root / "models")
     with open(CONFIG_PATH, "w") as f:
         yaml.dump(config, f, default_flow_style=False)

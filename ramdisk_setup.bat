@@ -1,4 +1,5 @@
 @echo off
+setlocal EnableDelayedExpansion
 title Cued Recall — RAM Disk Setup
 cd /d "%~dp0"
 
@@ -15,7 +16,7 @@ echo No reboot needed — the driver loads on install.
 echo.
 
 :check_imdisk
-imdisk --version 2>nul >nul
+where imdisk 2>nul >nul
 if errorlevel 1 (
     echo [WARN] ImDisk not found in PATH.
     echo.
@@ -115,7 +116,6 @@ REM ── Create directory structure ──
 echo Creating directory structure for Cued Recall...
 mkdir "!DRIVE!:\cued_recall\models" 2>nul
 mkdir "!DRIVE!:\cued_recall\store" 2>nul
-mkdir "!DRIVE!:\cued_recall\snapshots" 2>nul
 echo Directories created.
 
 echo.
