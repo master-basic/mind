@@ -51,6 +51,21 @@ Three `llama-server` instances:
 - [ ] Cross-lingual paraphrase robustness (depends on embedding model choice)
 - [ ] Production hardening (rate limiting, auth, config validation)
 
+## Windows RAM Disk (optional, recommended)
+
+Models and the block store benefit from fast storage. On Windows, create a RAM disk:
+
+```
+ramdisk_setup.bat
+```
+
+Prompts for drive letter, size, block size, and volume label. Requires [ImDisk Toolkit](https://sourceforge.net/projects/imdisk-toolkit/) (free, open-source).
+
+Then run the launcher with:
+```
+run.bat --storage R:\cued_recall
+```
+
 ## Quick start
 
 ```bash
@@ -63,6 +78,11 @@ pip install -e cued_recall/
 cued-recall
 # or
 python -m cued_recall.main config.yaml
+```
+
+On Windows:
+```
+run.bat
 ```
 
 ## Configuration
