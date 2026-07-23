@@ -154,23 +154,30 @@ class Pipeline:
         def __init__(self, open_tag: str, close_tag: str):
             self.open_tag = open_tag
             self.close_tag = close_tag
+            self.hold = len(open_tag) - 1
             self.buffer = ""
             self.in_think = False
             self.reasoning_parts: List[str] = []
             self.result_parts: List[str] = []
 
-        def feed(self, chunk: str) -> List[str]:
+        def feed(self, chunk: str) -> List[tuple[str, str]]:
             self.buffer += chunk
             outputs = []
             while True:
                 if not self.in_think:
                     idx = self.buffer.find(self.open_tag)
                     if idx == -1:
-                        outputs.append(("result", self.buffer))
-                        self.buffer = ""
+                        if len(self.buffer) <= self.hold:
+                            break
+                        safe = self.buffer[:len(self.buffer) - self.hold]
+                        if safe:
+                            self.result_parts.append(safe)
+                            outputs.append(("result", safe))
+                        self.buffer = self.buffer[len(safe):]
                         break
                     before = self.buffer[:idx]
                     if before:
+                        self.result_parts.append(before)
                         outputs.append(("result", before))
                     self.buffer = self.buffer[idx + len(self.open_tag):]
                     self.in_think = True
@@ -186,7 +193,7 @@ class Pipeline:
                     self.in_think = False
             return outputs
 
-        def flush(self) -> List[Tuple[str, str]]:
+        def flush(self) -> List[tuple[str, str]]:
             outputs = []
             if self.buffer:
                 tag = "think" if self.in_think else "result"
@@ -252,8 +259,6 @@ class Pipeline:
         turn_index: int,
     ):
         splitter = self.ThinkSplitter(self.think_open, self.think_close)
-        reasoning_buffer = []
-        result_buffer = []
         response_text = ""
 
         async with httpx.AsyncClient() as client:
@@ -283,17 +288,9 @@ class Pipeline:
                     if not delta:
                         continue
                     response_text += delta
-                    for tag, content in splitter.feed(delta):
-                        if tag == "think":
-                            reasoning_buffer.append(content)
-                        else:
-                            result_buffer.append(content)
+                    splitter.feed(delta)
 
-                for tag, content in splitter.flush():
-                    if tag == "think":
-                        reasoning_buffer.append(content)
-                    else:
-                        result_buffer.append(content)
+                splitter.flush()
 
         full_reasoning = "".join(splitter.reasoning_parts)
         full_result = "".join(splitter.result_parts)
@@ -338,8 +335,7 @@ class Pipeline:
         )
 
         splitter = self.ThinkSplitter(self.think_open, self.think_close)
-        for tag, content in splitter.feed(response_text):
-            pass
+        splitter.feed(response_text)
         splitter.flush()
 
         full_reasoning = "".join(splitter.reasoning_parts)
@@ -375,12 +371,11 @@ class Pipeline:
     ):
         now = time.time()
 
-        if not full_reasoning:
-            return
-
-        reasoning_blocks = self._split_reasoning(
-            full_reasoning, conversation_id, turn_index, now
-        )
+        reasoning_blocks = []
+        if full_reasoning:
+            reasoning_blocks = self._split_reasoning(
+                full_reasoning, conversation_id, turn_index, now
+            )
 
         result_block = Block(
             type=BlockType.result,
