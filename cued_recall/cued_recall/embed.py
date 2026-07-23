@@ -14,7 +14,11 @@ class EmbeddingClient:
         })
         resp.raise_for_status()
         data = resp.json()
-        return data["data"][0]["embedding"]
+        vec = data["data"][0]["embedding"]
+        norm = sum(x * x for x in vec) ** 0.5
+        if norm > 0:
+            vec = [x / norm for x in vec]
+        return vec
 
     def close(self):
         self._client.close()

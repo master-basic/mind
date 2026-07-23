@@ -43,7 +43,7 @@ class VectorIndex:
         c.execute(f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS block_vec USING vec0(
                 block_id TEXT PRIMARY KEY,
-                embedding float[{self.dim}]
+                embedding float[{self.dim}] distance_metric=cosine
             )
         """)
         self._conn.commit()

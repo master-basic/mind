@@ -42,10 +42,28 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
     app = FastAPI(title="Cued Recall Middleware")
 
     judge_pass_counter = [0]
+    judge_running = [False]
+    judge_tokens = [0]
 
     async def run_judge_pass():
-        judge_pass_counter[0] += 1
-        await judge.run_pass()
+        if judge_running[0]:
+            return
+        judge_running[0] = True
+        try:
+            judge_pass_counter[0] += 1
+            await judge.run_pass()
+        finally:
+            judge_running[0] = False
+
+    def _accumulate_judge_tokens(n: int):
+        if n <= 0:
+            return
+        judge_tokens[0] += n
+        if judge_tokens[0] >= cfg.judge.interval_tokens:
+            judge_tokens[0] = 0
+            asyncio.create_task(run_judge_pass())
+
+    pipeline.token_sink = _accumulate_judge_tokens
 
     from fastapi.responses import HTMLResponse
     import pathlib
@@ -89,9 +107,12 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
                     )
                 except BaseException:
                     pass
-                await asyncio.wait_for(
-                    shutdown_event.wait(), timeout=interval
-                )
+                try:
+                    await asyncio.wait_for(
+                        shutdown_event.wait(), timeout=interval
+                    )
+                except asyncio.TimeoutError:
+                    pass
 
         snapshot_task = asyncio.create_task(snapshot_loop())
 
@@ -105,18 +126,33 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
         embed.close()
         index.close()
 
-    conversations = {}
+    def _derive_conversation(body: dict):
+        import hashlib
+        import json as _json
+        if "conversation_id" in body:
+            conv = str(body["conversation_id"])
+        else:
+            conv = None
+            for m in body.get("messages", []):
+                if m.get("role") == "user":
+                    c = m.get("content", "")
+                    if not isinstance(c, str):
+                        c = _json.dumps(c, sort_keys=True)
+                    conv = hashlib.sha256(c.encode()).hexdigest()[:16]
+                    break
+            if conv is None:
+                conv = str(uuid.uuid4())
+        n_user = sum(1 for m in body.get("messages", [])
+                     if m.get("role") == "user")
+        turn_index = max(0, n_user - 1)
+        return conv, turn_index
 
     @app.api_route("/v1/chat/completions", methods=["POST"])
     async def chat_completions(request: Request):
         body = await request.json()
         stream = body.get("stream", False)
 
-        conv_id = body.get("conversation_id", str(uuid.uuid4()))
-        if conv_id not in conversations:
-            conversations[conv_id] = {"turn_index": 0}
-        turn_state = conversations[conv_id]
-        turn_index = turn_state["turn_index"]
+        conv_id, turn_index = _derive_conversation(body)
 
         user_message = pipeline.get_last_user_message(body)
 
@@ -127,8 +163,6 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
         await pipeline.shelve_previous_turn(conv_id, turn_index)
 
         result = await pipeline.process_turn(body, conv_id, turn_index)
-
-        turn_state["turn_index"] += 1
 
         if turn_index > 1:
             await pipeline.apply_accepted_verification(conv_id, turn_index - 1)
@@ -142,13 +176,9 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
             )
             new_tokens = len(content.split())
         elif isinstance(result, dict) and result.get("type") == "streaming":
-            new_tokens = 0  # counted at stream end in pipeline
+            new_tokens = 0
 
-        judge_counter = getattr(cfg.judge, "accumulated_tokens", 0)
-        cfg.judge.accumulated_tokens = judge_counter + new_tokens
-        if cfg.judge.accumulated_tokens >= cfg.judge.interval_tokens:
-            cfg.judge.accumulated_tokens = 0
-            asyncio.create_task(run_judge_pass())
+        _accumulate_judge_tokens(new_tokens)
 
         if stream:
             stream_gen = result.get("stream")

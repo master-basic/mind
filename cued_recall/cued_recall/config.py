@@ -16,7 +16,6 @@ class JudgeConfig:
         self.min_age_s: int = d.get("min_age_s", 3600)
         self.purge_age_s: int = d.get("purge_age_s", 1209600)
         self.summary_max_tokens: int = d.get("summary_max_tokens", 400)
-        self.accumulated_tokens: int = 0
 
 
 class ServerConfig:

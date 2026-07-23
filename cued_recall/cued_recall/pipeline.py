@@ -38,6 +38,7 @@ class Pipeline:
         self.wal = wal
         self.think_open = config.think_tags[0]
         self.think_close = config.think_tags[1]
+        self.token_sink = None
 
     async def recall_blocks(self, user_message: str) -> List[Tuple[Block, float]]:
         embed_vec = await asyncio.to_thread(self.embed.embed, user_message)
@@ -300,6 +301,11 @@ class Pipeline:
             recall_blocks, conversation_id, turn_index, response_text,
         )
 
+        if self.token_sink:
+            self.token_sink(
+                len(full_reasoning.split()) + len(full_result.split())
+            )
+
         self.wal.write({
             "event": "turn_completed",
             "conversation_id": conversation_id,
@@ -345,6 +351,11 @@ class Pipeline:
             full_reasoning, full_result, user_message, reading_content,
             recall_blocks, conversation_id, turn_index, response_text,
         )
+
+        if self.token_sink:
+            self.token_sink(
+                len(full_reasoning.split()) + len(full_result.split())
+            )
 
         self.wal.write({
             "event": "turn_completed",

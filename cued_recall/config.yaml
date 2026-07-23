@@ -4,7 +4,7 @@ judge_endpoint: http://127.0.0.1:8081
 embed_endpoint: http://127.0.0.1:8082
 think_tags: ["<think>", "</think>"]
 store_path: /mnt/ramdisk/cued_recall/store
-snapshot_path: /mnt/ramdisk/cued_recall/snapshots
+snapshot_path: /var/lib/cued_recall/snapshots  # MUST be persistent storage, not tmpfs
 models_dir: /mnt/ramdisk/cued_recall/models
 snapshot_interval_min: 15
 block_tokens_reasoning: 8000
