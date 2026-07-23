@@ -1,0 +1,24 @@
+listen: 127.0.0.1:8000
+reasoning_endpoint: http://127.0.0.1:8080
+judge_endpoint: http://127.0.0.1:8081
+embed_endpoint: http://127.0.0.1:8082
+think_tags: ["<think>", "</think>"]
+store_path: /mnt/ramdisk/cued_recall
+snapshot_path: /var/lib/cued_recall/snapshots
+snapshot_interval_min: 15
+block_tokens_reasoning: 8000
+recall:
+  k: 4
+  threshold: 0.62
+  budget_tokens: 3000
+judge:
+  interval_tokens: 20000
+  min_age_s: 3600
+  purge_age_s: 1209600
+  summary_max_tokens: 400
+correction_patterns:
+  - "that's wrong"
+  - "doesn't work"
+  - "^no[,.]"
+  - "səhvdir"
+  - "işləmir"

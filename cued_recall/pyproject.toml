@@ -1,0 +1,17 @@
+[project]
+name = "cued-recall"
+version = "0.1.0"
+description = "Cued Recall Memory Middleware — semantic block memory for reasoning LLMs"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "httpx>=0.28.0",
+    "msgpack>=1.1.0",
+    "pyyaml>=6.0",
+    "sqlite-vec>=0.1.0",
+    "numpy>=1.26.0",
+]
+
+[project.scripts]
+cued-recall = "cued_recall.main:main"
