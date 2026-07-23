@@ -25,7 +25,7 @@ class Judge:
         self.store = store
         self.index = index
         self.wal = wal
-        self.judge_url = config.judge_endpoint.rstrip("/") + "/v1/chat/completions
+        self.judge_url = config.judge_endpoint.rstrip("/") + "/v1/chat/completions"
 
     async def run_pass(self):
         min_age = self.config.judge.min_age_s
