@@ -1,0 +1,64 @@
+# Cued Recall Memory Middleware — full configuration
+listen: 127.0.0.1:8000
+
+# llama-server endpoints (each is a separate process)
+reasoning_endpoint: http://127.0.0.1:8080
+judge_endpoint:     http://127.0.0.1:8081
+embed_endpoint:     http://127.0.0.1:8082
+
+# Model list for the auto-launcher
+models_dir: ./models
+
+servers:
+  reasoning:
+    model: Qwen3-8B-Q4_K_M.gguf
+    port: 8080
+    extra_args: ["--ctx-size", "32768", "--n-gpu-layers", "99", "--no-kv-offload"]
+
+  judge:
+    model: Qwen2.5-1.5B-Instruct-Q4_K_M.gguf
+    port: 8081
+    extra_args: ["--ctx-size", "8192", "--n-gpu-layers", "99"]
+
+  embed:
+    model: nomic-embed-text-v1.5-Q8_0.gguf
+    port: 8082
+    extra_args: ["--embedding", "--ctx-size", "2048", "--n-gpu-layers", "99"]
+
+# Model downloads from Hugging Face
+download:
+  models:
+    - repo: bartowski/Qwen3-8B-GGUF
+      file: Qwen3-8B-Q4_K_M.gguf
+    - repo: Qwen/Qwen2.5-1.5B-Instruct-GGUF
+      file: qwen2.5-1.5b-instruct-q4_k_m.gguf
+      save_as: Qwen2.5-1.5B-Instruct-Q4_K_M.gguf
+    - repo: nomic-ai/nomic-embed-text-v1.5-GGUF
+      file: nomic-embed-text-v1.5.Q8_0.gguf
+      save_as: nomic-embed-text-v1.5-Q8_0.gguf
+
+think_tags: ["<think>", "</think>"]
+
+store_path: ./data/store
+snapshot_path: ./data/snapshots
+snapshot_interval_min: 15
+
+block_tokens_reasoning: 8000
+
+recall:
+  k: 4
+  threshold: 0.62
+  budget_tokens: 3000
+
+judge:
+  interval_tokens: 20000
+  min_age_s: 3600
+  purge_age_s: 1209600
+  summary_max_tokens: 400
+
+correction_patterns:
+  - "that's wrong"
+  - "doesn't work"
+  - "^no[,.]"
+  - "səhvdir"
+  - "işləmir"

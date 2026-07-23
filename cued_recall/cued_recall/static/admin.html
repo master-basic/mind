@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Cued Recall — Admin</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, 'Segoe UI', monospace; background: #0d1117; color: #c9d1d9; padding: 24px; }
+h1 { font-size: 20px; margin-bottom: 20px; color: #58a6ff; }
+h2 { font-size: 14px; margin: 16px 0 8px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; }
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; margin-bottom: 16px; }
+.stat-card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px; }
+.stat-card .value { font-size: 28px; font-weight: 600; color: #f0f6fc; }
+.stat-card .label { font-size: 11px; color: #8b949e; margin-top: 2px; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th { text-align: left; padding: 6px 8px; background: #161b22; border-bottom: 1px solid #30363d; color: #8b949e; }
+td { padding: 6px 8px; border-bottom: 1px solid #21262d; font-family: monospace; }
+tr:hover td { background: #161b22; }
+.status-hot { color: #d29922; }
+.status-shelved { color: #58a6ff; }
+.status-truncated { color: #a371f7; }
+.status-purged { color: #f85149; }
+.verification-unknown { color: #8b949e; }
+.verification-accepted { color: #3fb950; }
+.verification-corrected { color: #f85149; }
+.badge { display: inline-block; padding: 1px 6px; border-radius: 10px; font-size: 10px; font-weight: 500; }
+.badge-hot { background: #d2992220; color: #d29922; border: 1px solid #d2992240; }
+.badge-shelved { background: #58a6ff20; color: #58a6ff; border: 1px solid #58a6ff40; }
+.badge-truncated { background: #a371f720; color: #a371f7; border: 1px solid #a371f740; }
+.badge-purged { background: #f8514920; color: #f85149; border: 1px solid #f8514940; }
+#last-updated { font-size: 11px; color: #484f58; margin-bottom: 16px; }
+.server-info { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px; margin-bottom: 16px; font-size: 12px; }
+.server-info span { color: #8b949e; }
+.filters { display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+.filters select, .filters input { background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; padding: 4px 8px; font-size: 12px; }
+.filters button { background: #238636; color: #fff; border: none; border-radius: 4px; padding: 4px 12px; cursor: pointer; font-size: 12px; }
+.filters button:hover { background: #2ea043; }
+.filters .btn-danger { background: #da3633; }
+.filters .btn-danger:hover { background: #f85149; }
+</style>
+</head>
+<body>
+
+<h1>⬡ Cued Recall Middleware</h1>
+<div class="server-info" id="server-info">Connecting...</div>
+<div id="last-updated"></div>
+
+<h2>Stats</h2>
+<div class="stats-grid" id="stats-grid"></div>
+
+<h2>Blocks</h2>
+<div class="filters">
+  <select id="filter-status">
+    <option value="">All status</option>
+    <option value="hot">hot</option>
+    <option value="shelved">shelved</option>
+    <option value="truncated">truncated</option>
+    <option value="purged">purged</option>
+  </select>
+  <select id="filter-type">
+    <option value="">All types</option>
+    <option value="reasoning">reasoning</option>
+    <option value="result">result</option>
+    <option value="reading">reading</option>
+  </select>
+  <input type="text" id="filter-conv" placeholder="conversation_id" size="24">
+  <button onclick="loadBlocks()">Refresh</button>
+  <button class="btn-danger" onclick="runJudge()">Run Judge Pass</button>
+</div>
+
+<div style="overflow-x: auto;">
+<table>
+<thead><tr>
+  <th>block_id</th>
+  <th>type</th>
+  <th>status</th>
+  <th>verification</th>
+  <th>tokens</th>
+  <th>recalls</th>
+  <th>created</th>
+  <th>conversation</th>
+  <th>turn</th>
+</tr></thead>
+<tbody id="blocks-tbody"></tbody>
+</table>
+</div>
+
+<script>
+const API = '';
+
+async function loadStats() {
+  try {
+    const r = await fetch(API + '/admin/stats');
+    const data = await r.json();
+    const grid = document.getElementById('stats-grid');
+    grid.innerHTML = '';
+
+    const cards = [
+      { label: 'Msgpack Files', value: data.msgpack_files },
+      { label: 'WAL Events', value: data.wal_events },
+    ];
+
+    for (const [key, val] of Object.entries(data.blocks_by_status_type || {})) {
+      cards.push({ label: key.replace(/_/g, ' '), value: val });
+    }
+
+    for (const c of cards) {
+      grid.innerHTML += `<div class="stat-card"><div class="value">${c.value}</div><div class="label">${c.label}</div></div>`;
+    }
+  } catch (e) {
+    document.getElementById('stats-grid').innerHTML = `<div class="stat-card" style="color:#f85149">Error: ${e.message}</div>`;
+  }
+}
+
+async function loadBlocks() {
+  const status = document.getElementById('filter-status').value;
+  const type = document.getElementById('filter-type').value;
+  const conv = document.getElementById('filter-conv').value;
+  const params = new URLSearchParams({ limit: 100 });
+  if (status) params.set('status', status);
+  if (type) params.set('type_', type);
+  if (conv) params.set('conversation_id', conv);
+
+  try {
+    const r = await fetch(API + '/admin/blocks?' + params);
+    const data = await r.json();
+    const tbody = document.getElementById('blocks-tbody');
+    tbody.innerHTML = '';
+
+    for (const b of data.items || []) {
+      const created = new Date(b.created_at * 1000);
+      tbody.innerHTML += `<tr>
+        <td title="${b.block_id}">${b.block_id.slice(0, 8)}..</td>
+        <td>${b.type}</td>
+        <td><span class="badge badge-${b.status}">${b.status}</span></td>
+        <td class="verification-${b.verification}">${b.verification}</td>
+        <td>${b.token_count}</td>
+        <td>${b.recall_count}</td>
+        <td title="${created.toISOString()}">${created.toLocaleString()}</td>
+        <td title="${b.conversation_id || ''}">${(b.conversation_id || '').slice(0, 12)}..</td>
+        <td>${b.turn_index}</td>
+      </tr>`;
+    }
+
+    if (!data.items?.length) {
+      tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:#484f58;padding:24px;">No blocks found</td></tr>';
+    }
+  } catch (e) {
+    document.getElementById('blocks-tbody').innerHTML = `<tr><td colspan="9" style="color:#f85149">Error: ${e.message}</td></tr>`;
+  }
+}
+
+async function runJudge() {
+  if (!confirm('Force a judge pass? This may take a while.')) return;
+  try {
+    const r = await fetch(API + '/admin/judge/run', { method: 'POST' });
+    const data = await r.json();
+    alert('Judge pass result: ' + data.status);
+    loadStats();
+    loadBlocks();
+  } catch (e) {
+    alert('Error: ' + e.message);
+  }
+}
+
+async function refresh() {
+  document.getElementById('last-updated').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
+  await Promise.all([loadStats(), loadBlocks()]);
+}
+
+document.getElementById('filter-status').addEventListener('change', loadBlocks);
+document.getElementById('filter-type').addEventListener('change', loadBlocks);
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

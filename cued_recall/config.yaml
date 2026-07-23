@@ -3,8 +3,9 @@ reasoning_endpoint: http://127.0.0.1:8080
 judge_endpoint: http://127.0.0.1:8081
 embed_endpoint: http://127.0.0.1:8082
 think_tags: ["<think>", "</think>"]
-store_path: /mnt/ramdisk/cued_recall
-snapshot_path: /var/lib/cued_recall/snapshots
+store_path: /mnt/ramdisk/cued_recall/store
+snapshot_path: /mnt/ramdisk/cued_recall/snapshots
+models_dir: /mnt/ramdisk/cued_recall/models
 snapshot_interval_min: 15
 block_tokens_reasoning: 8000
 recall:

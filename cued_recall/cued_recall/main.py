@@ -16,6 +16,7 @@ from .pipeline import Pipeline
 from .router import build_admin_router
 from .store import BlockStore
 from .wal import WAL
+from fastapi.staticfiles import StaticFiles
 
 
 def create_app(config_path: str = "config.yaml") -> FastAPI:
@@ -45,6 +46,21 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
     async def run_judge_pass():
         judge_pass_counter[0] += 1
         await judge.run_pass()
+
+    from fastapi.responses import HTMLResponse
+    import pathlib
+
+    static_dir = pathlib.Path(__file__).parent / "static"
+    static_dir.mkdir(exist_ok=True)
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok", "store": str(store_path)}
+
+    @app.get("/admin")
+    async def admin_page():
+        html = (static_dir / "admin.html").read_text(encoding="utf-8")
+        return HTMLResponse(html)
 
     admin_router = build_admin_router(index, store, wal, run_judge_pass)
     app.include_router(admin_router)

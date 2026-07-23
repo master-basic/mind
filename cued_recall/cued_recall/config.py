@@ -16,6 +16,14 @@ class JudgeConfig:
         self.min_age_s: int = d.get("min_age_s", 3600)
         self.purge_age_s: int = d.get("purge_age_s", 1209600)
         self.summary_max_tokens: int = d.get("summary_max_tokens", 400)
+        self.accumulated_tokens: int = 0
+
+
+class ServerConfig:
+    def __init__(self, d: dict):
+        self.model: str = d.get("model", "")
+        self.port: int = d.get("port", 0)
+        self.extra_args: List[str] = d.get("extra_args", [])
 
 
 class Config:
@@ -37,3 +45,8 @@ class Config:
         self.correction_patterns: List[str] = raw.get("correction_patterns", [
             "that's wrong", "doesn't work", "^no[,.]", "səhvdir", "işləmir",
         ])
+        self.servers: dict = raw.get("servers", {})
+        self.models_dir: str = raw.get("models_dir", "./models")
+
+    def get_server(self, name: str) -> ServerConfig:
+        return ServerConfig(self.servers.get(name, {}))
