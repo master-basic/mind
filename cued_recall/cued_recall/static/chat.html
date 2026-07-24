@@ -162,14 +162,29 @@ function renderAssistant(bodyEl, fullText, separateReasoning) {
   // Reasoning may arrive inline as <think>… or via a separate field.
   let allReasoning = (separateReasoning || '').trim();
   if (reasoning) allReasoning = (allReasoning ? allReasoning + '\n' : '') + reasoning;
-  bodyEl.innerHTML = '';
+
+  // Build the reasoning/answer nodes once and update text in place, so the
+  // <details> open/closed state the user set survives streaming re-renders.
+  if (!bodyEl._init) { bodyEl.textContent = ''; bodyEl._init = true; }
+
   if (allReasoning) {
-    const d = el('details', 'think');
-    d.appendChild(el('summary', null, 'Reasoning'));
-    d.appendChild(el('div', 'think-body', allReasoning));
-    bodyEl.appendChild(d);
+    if (!bodyEl._think) {
+      const d = el('details', 'think');
+      d.appendChild(el('summary', null, 'Reasoning'));
+      const tb = el('div', 'think-body');
+      d.appendChild(tb);
+      d._body = tb;
+      bodyEl.insertBefore(d, bodyEl.firstChild);
+      bodyEl._think = d;
+    }
+    bodyEl._think._body.textContent = allReasoning;
   }
-  bodyEl.appendChild(el('div', null, answer || (allReasoning ? '' : fullText)));
+
+  if (!bodyEl._answer) {
+    bodyEl._answer = el('div');
+    bodyEl.appendChild(bodyEl._answer);
+  }
+  bodyEl._answer.textContent = answer || (allReasoning ? '' : fullText);
   $messages.scrollTop = $messages.scrollHeight;
 }
 
