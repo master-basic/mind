@@ -53,6 +53,7 @@ set "SAVED_LLAMA_BIN="
 set "SAVED_MODELS_CACHE="
 set "SAVED_STORAGE="
 set "SAVED_REASONING="
+set "SAVED_REASONING_CHOICE="
 set "SAVED_JUDGE="
 set "SAVED_EMBED="
 set "HAVE_SAVED=0"
@@ -70,6 +71,7 @@ echo   llama-server:    !SAVED_LLAMA_BIN!
 echo   Models cache:    !SAVED_MODELS_CACHE!
 echo   Storage path:    !SAVED_STORAGE!
 echo   Reasoning model: !SAVED_REASONING!
+echo   Model choice #:  !SAVED_REASONING_CHOICE!
 echo   Judge model:     !SAVED_JUDGE!
 echo   Embedding model: !SAVED_EMBED!
 echo.
@@ -81,6 +83,7 @@ set "LLAMA_BIN=!SAVED_LLAMA_BIN!"
 set "MODELS_CACHE=!SAVED_MODELS_CACHE!"
 set "STORAGE=!SAVED_STORAGE!"
 set "REASONING=!SAVED_REASONING!"
+set "REASONING_CHOICE=!SAVED_REASONING_CHOICE!"
 set "JUDGE=!SAVED_JUDGE!"
 set "EMBED=!SAVED_EMBED!"
 goto :save_and_build
@@ -120,12 +123,16 @@ REM so parentheses in Windows paths can't truncate the write)
 >>"%SETTINGS_FILE%" echo REASONING=!REASONING!
 >>"%SETTINGS_FILE%" echo JUDGE=!JUDGE!
 >>"%SETTINGS_FILE%" echo EMBED=!EMBED!
+REM Preserve the remembered model-menu choice; run.py rewrites it when the
+REM user picks from the menu.
+if not "!REASONING_CHOICE!"=="" (>>"%SETTINGS_FILE%" echo REASONING_CHOICE=!REASONING_CHOICE!)
 
 set "ARGS="
 if not "!LLAMA_BIN!"=="" set "ARGS=!ARGS! --llama-bin !LLAMA_BIN!"
 if not "!MODELS_CACHE!"=="" set "ARGS=!ARGS! --models-cache !MODELS_CACHE!"
 if not "!STORAGE!"==""      set "ARGS=!ARGS! --storage !STORAGE!"
 if not "!REASONING!"==""    set "ARGS=!ARGS! --reasoning-model !REASONING!"
+if not "!REASONING_CHOICE!"=="" set "ARGS=!ARGS! --reasoning-choice !REASONING_CHOICE!"
 if not "!JUDGE!"==""        set "ARGS=!ARGS! --judge-model !JUDGE!"
 if not "!EMBED!"==""        set "ARGS=!ARGS! --embed-model !EMBED!"
 

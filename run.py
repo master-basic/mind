@@ -31,6 +31,54 @@ CONFIG_PATH = ROOT / "cued_recall" / "config.yaml"
 DEFAULT_TMPFS = Path("/mnt/ramdisk/cued_recall")
 TMPFS_SIZE = "64G"
 
+# Selectable reasoning models (menu in run.bat / --reasoning-choice N).
+# moe=True -> experts are kept in system RAM (--cpu-moe) so a 17-20 GB MoE
+# runs on a 12 GB GPU with only the ~3B active path + KV in VRAM.
+REASONING_CATALOG = [
+    {
+        "num": 1,
+        "label": "Qwen3-8B (default, censored)          5.0 GB  dense, full GPU",
+        "repo": "Qwen/Qwen3-8B-GGUF",
+        "file": "Qwen3-8B-Q4_K_M.gguf",
+        "moe": False,
+    },
+    {
+        "num": 2,
+        "label": "Qwen3.5-9B ultra-uncensored-heretic   6.5 GB  dense, full GPU",
+        "repo": "mradermacher/Qwen3.5-9B-ultra-uncensored-heretic-v2-i1-GGUF",
+        "file": "Qwen3.5-9B-ultra-uncensored-heretic-v2.i1-Q5_K_M.gguf",
+        "moe": False,
+    },
+    {
+        "num": 3,
+        "label": "Qwen3.5-9B abliterated                5.6 GB  dense, full GPU",
+        "repo": "Al3xG/Qwen3.5-9B-abliterated-Q4_K_M-GGUF",
+        "file": "Qwen3.5-9B-abliterated-Q4_K_M.gguf",
+        "moe": False,
+    },
+    {
+        "num": 4,
+        "label": "Qwen3.5-35B-A3B Abliterated          19.9 GB  MoE, experts in RAM",
+        "repo": "Carlosian/Qwen3.5-35B-A3B-Abliterated-GGUF",
+        "file": "Qwen3.5-35B-A3B-Abliterated.Q4_K_S.gguf",
+        "moe": True,
+    },
+    {
+        "num": 5,
+        "label": "Qwen3.6-35B-A3B unc-heretic MXFP4    20.3 GB  MoE, experts in RAM",
+        "repo": "noctrex/Qwen3.6-35B-A3B-uncensored-heretic-MXFP4_MOE-GGUF",
+        "file": "Qwen3.6-35B-A3B-uncensored-heretic-MXFP4_MOE.gguf",
+        "moe": True,
+    },
+    {
+        "num": 6,
+        "label": "Hermes3.6-35B-A3B Unc Genesis V5     17.4 GB  MoE, experts in RAM",
+        "repo": "LuffyTheFox/Qwen3.6-35B-A3B-Uncensored-Genesis-Hermes-V5-GGUF",
+        "file": "Hermes3.6-35B-A3B-Uncensored-Genesis-V5-APEX-Compact.gguf",
+        "moe": True,
+    },
+]
+
 MODEL_MANIFEST = [
     {
         "name": "reasoning",
@@ -102,6 +150,12 @@ def parse_args():
     g.add_argument("--reasoning-model", metavar="PATH", help="Path to reasoning model GGUF")
     g.add_argument("--judge-model",     metavar="PATH", help="Path to judge model GGUF")
     g.add_argument("--embed-model",     metavar="PATH", help="Path to embedding model GGUF")
+    g.add_argument("--reasoning-choice", type=int, metavar="N",
+                   help="Pick reasoning model N from the catalog without showing the menu")
+    g.add_argument("--model-menu", action="store_true",
+                   help="Force the reasoning model selection menu even if a choice is saved")
+    g.add_argument("--reasoning-cpu-moe", action="store_true",
+                   help="Force --cpu-moe for the reasoning server (auto-detected for A3B/MoE models)")
 
     g = p.add_argument_group("Port overrides")
     g.add_argument("--reasoning-port", type=int, default=8080, help="Reasoning model port (default: 8080)")
@@ -171,6 +225,72 @@ def ensure_hf_hub():
         subprocess.check_call([sys.executable, "-m", "pip", "install", "huggingface-hub", "-q"])
         import huggingface_hub
         return huggingface_hub
+
+
+SETTINGS_FILE = ROOT / "run_settings.txt"
+
+
+def is_moe_model(filename: str) -> bool:
+    low = (filename or "").lower()
+    return "a3b" in low or "moe" in low
+
+
+def save_reasoning_choice(num: int):
+    """Persist REASONING_CHOICE=N into run_settings.txt (KEY=VALUE lines,
+    shared with run.bat) so the next launch skips the menu."""
+    lines = []
+    if SETTINGS_FILE.exists():
+        try:
+            raw = SETTINGS_FILE.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            raw = SETTINGS_FILE.read_text(encoding="cp1252")
+        lines = [ln for ln in raw.splitlines()
+                 if ln.strip() and not ln.startswith("REASONING_CHOICE=")]
+    lines.append(f"REASONING_CHOICE={num}")
+    SETTINGS_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def choose_reasoning_model(args):
+    """Return the chosen catalog entry, or None to keep default behavior.
+
+    Order: explicit --reasoning-model path wins (no menu); --reasoning-choice N
+    picks silently; otherwise show a numbered menu, remember the answer in
+    run_settings.txt, and download later via the normal resolve flow.
+    """
+    if args.reasoning_model and not args.model_menu:
+        return None
+
+    by_num = {e["num"]: e for e in REASONING_CATALOG}
+
+    if args.reasoning_choice and not args.model_menu:
+        entry = by_num.get(args.reasoning_choice)
+        if entry:
+            info(f"Reasoning model (saved choice {entry['num']}): {entry['file']}")
+            return entry
+        warn(f"--reasoning-choice {args.reasoning_choice} is not in the catalog; showing menu")
+
+    cache_dir = Path(args.models_cache) if args.models_cache else None
+    print()
+    print("Which reasoning model do you want to use?")
+    for e in REASONING_CATALOG:
+        have = cache_dir and (cache_dir / e["file"]).exists()
+        status = "[downloaded]" if have else "[will download]"
+        print(f"  {e['num']}. {e['label']}  {status}")
+    print()
+    while True:
+        try:
+            raw = input(f"Enter number [1-{len(REASONING_CATALOG)}] (default 1): ").strip()
+        except EOFError:
+            raw = ""
+        if not raw:
+            raw = "1"
+        if raw.isdigit() and int(raw) in by_num:
+            entry = by_num[int(raw)]
+            break
+        print("Invalid choice, try again.")
+    save_reasoning_choice(entry["num"])
+    info(f"Selected: {entry['file']} (remembered in run_settings.txt)")
+    return entry
 
 
 def setup_storage(args):
@@ -369,6 +489,16 @@ def main():
         )
     info(f"llama-server: {llama_bin}")
 
+    # Reasoning model menu: pick from the catalog (or reuse the remembered
+    # choice), then let the normal resolve flow download/copy it.
+    chosen = choose_reasoning_model(args)
+    if chosen:
+        MODEL_MANIFEST[0] = {
+            "name": "reasoning",
+            "repo": chosen["repo"],
+            "file": chosen["file"],
+        }
+
     hf_hub = None if args.no_download and not args.models_cache else ensure_hf_hub()
 
     storage_root = setup_storage(args)
@@ -407,11 +537,17 @@ def main():
             continue
         model_path = models[name]
         defaults = SERVER_DEFAULTS[name]
+        extra = list(defaults["extra"])
+        if name == "reasoning" and (args.reasoning_cpu_moe or is_moe_model(Path(model_path).name)):
+            # MoE: keep router/attention/KV on GPU, park expert tensors in
+            # system RAM so 17-20 GB A3B models run on a 12 GB card.
+            extra.append("--cpu-moe")
+            info("Reasoning is MoE: adding --cpu-moe (experts in system RAM)")
         server_defs.append({
             "name": name,
             "model": model_path,
             "port": port_map[name],
-            "extra": defaults["extra"],
+            "extra": extra,
         })
 
     if not server_defs:
