@@ -103,9 +103,8 @@ class Pipeline:
         return total
 
     def _report_usage(self, usage: dict):
-        total = self._usage_total(usage)
-        if total is not None and self.usage_sink:
-            self.usage_sink(total)
+        if self.usage_sink:
+            self.usage_sink(usage)
 
     async def recall_blocks(self, user_message: str) -> List[Tuple[Block, float]]:
         # Only embed a bounded slice for the recall query: a pasted file can be

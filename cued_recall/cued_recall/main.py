@@ -75,15 +75,23 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
     # context-usage panel works even when llama-server /metrics is unavailable.
     ctx_usage = {}
 
-    def _record_usage(name, total_tokens):
+    def _record_usage(name, usage):
         try:
-            ctx_usage[name] = {"total_tokens": int(total_tokens), "at": time.time()}
+            # Use prompt_tokens as proxy for KV cache occupancy (the cache holds
+            # input tokens, not generated ones). Fall back to total_tokens.
+            pt = usage.get("prompt_tokens")
+            if pt is None:
+                total = usage.get("total_tokens")
+                if total is None:
+                    return
+                pt = total
+            ctx_usage[name] = {"total_tokens": int(pt), "at": time.time()}
         except (TypeError, ValueError):
             pass
 
-    pipeline.usage_sink = lambda total: _record_usage("reasoning", total)
-    judge.usage_sink = lambda total: _record_usage("judge", total)
-    embed.usage_sink = lambda total: _record_usage("embed", total)
+    pipeline.usage_sink = lambda usage: _record_usage("reasoning", usage)
+    judge.usage_sink = lambda usage: _record_usage("judge", usage)
+    embed.usage_sink = lambda usage: _record_usage("embed", usage)
 
     # T/S (tokens per second) tracking — ring buffer of recent completions
     tps_ring = []  # list of {"tokens": int, "elapsed": float, "tps": float, "at": float}
@@ -176,13 +184,16 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
                             pass
             except Exception:
                 pass
-            # Prefer live /metrics; otherwise show n/a (total_tokens is not
-            # a reliable proxy for KV cache usage).
+            # Prefer live /metrics; otherwise fall back to prompt_tokens
+            # tracking from the last request (more reliable than total_tokens
+            # since prompt_tokens directly maps to KV cache occupancy).
             if info["kv_used_ratio"] is None:
-                if info["n_ctx"] is not None:
-                    info["used_tokens"] = 0
-                    info["kv_used_ratio"] = 0
-                    info["source"] = "no-metrics"
+                tracked = ctx_usage.get(name)
+                if tracked and info["n_ctx"]:
+                    used = min(int(tracked["total_tokens"]), int(info["n_ctx"]))
+                    info["used_tokens"] = used
+                    info["kv_used_ratio"] = used / info["n_ctx"]
+                    info["source"] = "last-request"
             elif info["n_ctx"] is not None:
                 info["used_tokens"] = int(info["n_ctx"] * info["kv_used_ratio"])
                 info["source"] = "live"

@@ -25,14 +25,9 @@ class EmbeddingClient:
         data = resp.json()
         vec = data["data"][0]["embedding"]
         if self.usage_sink:
-            usage = data.get("usage") or {}
-            total = usage.get("total_tokens")
-            if total is None:
-                pt = usage.get("prompt_tokens", 0) or 0
-                ct = usage.get("completion_tokens", 0) or 0
-                total = pt + ct or None
-            if total is not None:
-                self.usage_sink(total)
+            usage = data.get("usage")
+            if usage:
+                self.usage_sink(usage)
         norm = sum(x * x for x in vec) ** 0.5
         if norm > 0:
             vec = [x / norm for x in vec]
