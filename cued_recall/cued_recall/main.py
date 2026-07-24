@@ -366,11 +366,25 @@ def _take_snapshot(store: BlockStore, index: VectorIndex, snapshot_path: Path):
         index.snapshot(tmp)
         latest = snapshot_path / "latest"
         if latest.exists():
-            shutil.rmtree(latest)
+            _rmtree_win32(latest)
         shutil.move(str(tmp), str(latest))
     finally:
         if tmp.exists():
-            shutil.rmtree(tmp)
+            _rmtree_win32(tmp)
+
+
+def _rmtree_win32(path: Path, retries: int = 5, delay: float = 0.3):
+    """shutil.rmtree with retries on Windows PermissionError (locked files)."""
+    import shutil, time
+    for attempt in range(retries):
+        try:
+            shutil.rmtree(path)
+            return
+        except PermissionError:
+            if attempt < retries - 1:
+                time.sleep(delay)
+            else:
+                raise
 
 
 def main():
