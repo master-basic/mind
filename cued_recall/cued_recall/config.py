@@ -27,6 +27,18 @@ class WebSearchConfig:
         self.api_key: str = d.get("api_key", "")
         self.max_results: int = d.get("max_results", 5)
         self.fetch_top_n: int = d.get("fetch_top_n", 0)
+        # Hard rule: if the user message matches any of these patterns, force
+        # the model to call web_search on that turn (tool_choice), rather than
+        # leaving it to the model's discretion.
+        self.force_search: bool = d.get("force_search", True)
+        self.force_patterns: List[str] = d.get("force_patterns", [
+            r"\bsearch\b", r"\blatest\b", r"\bcurrent(ly)?\b", r"\bnews\b",
+            r"\btoday\b", r"\brecent(ly)?\b", r"\bthis (week|month|year)\b",
+            r"\bright now\b", r"\bup[- ]?to[- ]?date\b", r"\bas of\b",
+            r"\bnowadays\b", r"\blook (it |this )?up\b", r"\bgoogle\b",
+            # Azerbaijani
+            r"\baxtar", r"\bson (xəbər|məlumat)", r"\bhal-?hazırda\b",
+        ])
 
 
 class ServerConfig:

@@ -579,19 +579,41 @@ class Pipeline:
         recall_text = self.build_recall_injection(recall_blocks)
         augmented_messages = self.build_messages(base_messages, recall_text)
 
-        # Inject web_fetch tool so the LLM can use it for research
+        # Inject web_fetch / web_search tools so the LLM can research.
         body_with_tools = self._inject_tools(body)
+
+        # Hard rule: for "search"/"latest"/etc. queries, force a web_search on
+        # the first turn instead of trusting the model to decide.
+        force_search = self._should_force_search(user_message)
 
         if body.get("stream", False):
             return await self._process_streaming(
                 body_with_tools, augmented_messages, user_message, reading_content,
-                recall_blocks, conversation_id, turn_index,
+                recall_blocks, conversation_id, turn_index, force_search,
             )
         else:
             return await self._process_nonstreaming(
                 body_with_tools, augmented_messages, user_message, reading_content,
-                recall_blocks, conversation_id, turn_index,
+                recall_blocks, conversation_id, turn_index, force_search,
             )
+
+    def _should_force_search(self, text: str) -> bool:
+        ws = getattr(self.config, "web_search", None)
+        if not ws or not ws.enabled or not getattr(ws, "force_search", False):
+            return False
+        t = text or ""
+        for pat in ws.force_patterns:
+            try:
+                if re.search(pat, t, re.IGNORECASE):
+                    return True
+            except re.error:
+                if pat.lower() in t.lower():
+                    return True
+        return False
+
+    @staticmethod
+    def _force_search_choice() -> dict:
+        return {"type": "function", "function": {"name": "web_search"}}
 
     async def _process_streaming(
         self,
@@ -602,12 +624,13 @@ class Pipeline:
         recall_blocks: List[Tuple[Block, float]],
         conversation_id: str,
         turn_index: int,
+        force_search: bool = False,
     ) -> dict:
         return {
             "type": "streaming",
             "stream": self._stream_and_blockify(
                 body, augmented_messages, user_message, reading_content,
-                recall_blocks, conversation_id, turn_index,
+                recall_blocks, conversation_id, turn_index, force_search,
             ),
         }
 
@@ -620,6 +643,7 @@ class Pipeline:
         recall_blocks: List[Tuple[Block, float]],
         conversation_id: str,
         turn_index: int,
+        force_search: bool = False,
     ):
         splitter = self.ThinkSplitter(self.think_open, self.think_close)
         response_text = ""
@@ -641,6 +665,9 @@ class Pipeline:
                     **body, "messages": self._fit_messages(messages), "stream": True,
                     "stream_options": {"include_usage": True},
                 }
+                # Hard rule: force web_search on the first round only.
+                if force_search and _round == 0:
+                    payload["tool_choice"] = self._force_search_choice()
                 async with client.stream(
                     "POST",
                     f"{self.config.reasoning_endpoint}/v1/chat/completions",
@@ -759,13 +786,17 @@ class Pipeline:
         recall_blocks: List[Tuple[Block, float]],
         conversation_id: str,
         turn_index: int,
+        force_search: bool = False,
     ) -> dict:
         # Tool-call loop: keep calling the LLM until no more tool_calls (max 5 rounds)
         messages = list(augmented_messages)
-        for _ in range(5):
+        for _round in range(5):
             t0 = time.time()
             async with httpx.AsyncClient() as client:
                 payload = {**body, "messages": self._fit_messages(messages), "stream": False}
+                # Hard rule: force web_search on the first round only.
+                if force_search and _round == 0:
+                    payload["tool_choice"] = self._force_search_choice()
                 resp = await client.post(
                     f"{self.config.reasoning_endpoint}/v1/chat/completions",
                     json=payload,
