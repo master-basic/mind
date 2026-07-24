@@ -124,6 +124,32 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
     async def health():
         return {"status": "ok", "store": str(store_path)}
 
+    @app.get("/v1/models")
+    async def list_models():
+        # OpenAI-compatible clients (opencode, most others) call this during
+        # setup to populate the model picker before ever hitting
+        # /v1/chat/completions. Without it, adding this middleware as a
+        # custom provider 404s immediately, before you can even chat.
+        import httpx
+        model_id = "cued-recall"
+        try:
+            async with httpx.AsyncClient(timeout=3) as client:
+                r = await client.get(cfg.reasoning_endpoint.rstrip("/") + "/props")
+                if r.status_code == 200:
+                    d = r.json()
+                    gs = d.get("default_generation_settings", {}) or {}
+                    mp = d.get("model_path") or d.get("model") or gs.get("model")
+                    if mp:
+                        model_id = str(mp).replace("\\", "/").split("/")[-1]
+        except Exception:
+            pass
+        return {
+            "object": "list",
+            "data": [
+                {"id": model_id, "object": "model", "created": 0, "owned_by": "cued-recall"},
+            ],
+        }
+
     @app.post("/v1/fetch")
     async def fetch_url(body: dict):
         url = body.get("url", "")

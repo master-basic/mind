@@ -238,8 +238,13 @@ class Pipeline:
         if not blocks:
             return ""
         parts = [
-            "Prior derivations from earlier sessions. These are advisory. Verify before",
-            "reuse; they may contain outdated assumptions.",
+            "The user has told you things in earlier conversations. Below is what was",
+            "recovered from that history -- treat it as true and use it directly to",
+            "answer the current message. Do not say you lack access to this",
+            "information; you have it, right here. If a recalled item conflicts with",
+            "something said in the CURRENT conversation, the current conversation",
+            "wins. If it's a technical derivation rather than a stated fact, re-verify",
+            "it before relying on it, since it may be outdated.",
         ]
         for block, sim in blocks:
             date_str = time.strftime(
@@ -566,6 +571,75 @@ class Pipeline:
                 self.buffer = ""
             return outputs
 
+    _FALLBACK_TOOL_CALL_RE = re.compile(
+        r"<tool_call>\s*<function=([\w\-]+)>(.*?)</function>\s*</tool_call>",
+        re.DOTALL,
+    )
+    _FALLBACK_PARAM_RE = re.compile(
+        r"<parameter=([\w\-]+)>(.*?)</parameter>", re.DOTALL,
+    )
+
+    @classmethod
+    def _parse_fallback_tool_calls(cls, text: str) -> List[dict]:
+        """Parse a Hermes-style textual tool call some fine-tunes fall back to
+        instead of emitting a properly structured tool_calls delta -- notably
+        abliterated/uncensored merges, whose alignment-removal training often
+        degrades structured-output adherence as a side effect. Recognizing
+        this means the call still executes instead of leaking as raw markup.
+        """
+        calls = []
+        for m in cls._FALLBACK_TOOL_CALL_RE.finditer(text):
+            name, body = m.group(1), m.group(2)
+            args = {pm.group(1): pm.group(2).strip()
+                    for pm in cls._FALLBACK_PARAM_RE.finditer(body)}
+            calls.append({"name": name, "arguments": json.dumps(args)})
+        return calls
+
+    class ToolCallFallbackFilter:
+        """Buffers content deltas to intercept a mis-emitted textual tool
+        call before it ever reaches the client, the same way ThinkSplitter
+        holds back a partial <think> tag split across SSE chunks.
+        """
+        OPEN_TAG = "<tool_call>"
+        CLOSE_TAG = "</tool_call>"
+
+        def __init__(self):
+            self.buffer = ""
+            self.hold = len(self.OPEN_TAG) - 1
+
+        def feed(self, chunk: str) -> Tuple[str, List[dict]]:
+            """Returns (text_safe_to_release, parsed_fallback_calls)."""
+            self.buffer += chunk
+            idx = self.buffer.find(self.OPEN_TAG)
+            if idx == -1:
+                if len(self.buffer) <= self.hold:
+                    return "", []
+                safe = self.buffer[:len(self.buffer) - self.hold]
+                self.buffer = self.buffer[len(safe):]
+                return safe, []
+            close_idx = self.buffer.find(self.CLOSE_TAG, idx)
+            if close_idx == -1:
+                # Might still be mid-call -- release anything before the open
+                # tag, keep the rest buffered until it closes (or the round
+                # ends and flush() releases it as plain text instead).
+                before = self.buffer[:idx]
+                self.buffer = self.buffer[idx:]
+                return before, []
+            end = close_idx + len(self.CLOSE_TAG)
+            full_match = self.buffer[idx:end]
+            before = self.buffer[:idx]
+            self.buffer = self.buffer[end:]
+            calls = Pipeline._parse_fallback_tool_calls(full_match)
+            if not calls:
+                # Looked like a tool call but didn't parse -- don't swallow it.
+                before += full_match
+            return before, calls
+
+        def flush(self) -> str:
+            rest = self.buffer
+            self.buffer = ""
+            return rest
+
     async def process_turn(
         self,
         body: dict,
@@ -662,6 +736,7 @@ class Pipeline:
             for _round in range(MAX_TOOL_ROUNDS):
                 tool_calls_by_index = {}
                 round_content = ""
+                tool_fallback_filter = self.ToolCallFallbackFilter()
                 payload = {
                     **body, "messages": self._fit_messages(messages), "stream": True,
                     "stream_options": {"include_usage": True},
@@ -712,11 +787,31 @@ class Pipeline:
                         delta = delta_obj.get("content", "")
                         if not delta:
                             continue
-                        response_text += delta
-                        round_content += delta
-                        token_count += len(delta.split())
-                        splitter.feed(delta)
-                        yield f"data: {json.dumps({'choices': [{'delta': {'content': delta}}]})}\n\n".encode()
+                        released, fallback_calls = tool_fallback_filter.feed(delta)
+                        for i, fc in enumerate(fallback_calls):
+                            idx = f"fallback-{len(tool_calls_by_index)}-{i}"
+                            tool_calls_by_index[idx] = {
+                                "id": f"fallback-{uuid.uuid4().hex[:8]}",
+                                "name": fc["name"], "arguments": fc["arguments"],
+                            }
+                        if released:
+                            response_text += released
+                            round_content += released
+                            token_count += len(released.split())
+                            splitter.feed(released)
+                            yield f"data: {json.dumps({'choices': [{'delta': {'content': released}}]})}\n\n".encode()
+
+                    # Round's SSE stream ended -- release whatever the filter
+                    # was still holding (either it never closed, meaning it
+                    # was never really a tool call, or a trailing tag split
+                    # right at the response boundary).
+                    trailing = tool_fallback_filter.flush()
+                    if trailing:
+                        response_text += trailing
+                        round_content += trailing
+                        token_count += len(trailing.split())
+                        splitter.feed(trailing)
+                        yield f"data: {json.dumps({'choices': [{'delta': {'content': trailing}}]})}\n\n".encode()
 
                 # No tools requested -> this was the final answer.
                 if not tool_calls_by_index:
