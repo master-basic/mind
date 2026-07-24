@@ -58,8 +58,9 @@ def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_ru
 
     @router.post("/judge/run")
     async def run_judge():
-        await judge_run_fn()
-        return {"status": "judge pass triggered"}
+        # Manual trigger judges all shelved blocks now (ignore the age gate).
+        result = await judge_run_fn(min_age=0)
+        return result or {"status": "ok", "processed": 0}
 
     @router.get("/stats")
     async def stats():

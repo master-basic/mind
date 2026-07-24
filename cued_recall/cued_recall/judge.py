@@ -27,17 +27,22 @@ class Judge:
         self.wal = wal
         self.judge_url = config.judge_endpoint.rstrip("/") + "/v1/chat/completions"
 
-    async def run_pass(self):
-        min_age = self.config.judge.min_age_s
+    async def run_pass(self, min_age: Optional[float] = None) -> int:
+        # Manual runs pass min_age=0 to judge all shelved blocks now; the
+        # automatic (token-triggered) pass uses the configured age gate.
+        if min_age is None:
+            min_age = self.config.judge.min_age_s
         block_ids = await asyncio.to_thread(
             self.index.oldest_shelved_blocks, min_age, limit=50
         )
+        processed = 0
         for bid in block_ids:
             block = await asyncio.to_thread(self.store.get, bid)
             if block is None:
                 continue
             action, summary = await self._judge_block(block)
             await self._apply_ladder(block, action, summary)
+            processed += 1
             self.wal.write({
                 "event": "judge_action",
                 "block_id": bid,
@@ -45,6 +50,7 @@ class Judge:
                 "summary_length": len(summary) if summary else 0,
                 "timestamp": time.time(),
             })
+        return processed
 
     async def _judge_block(self, block: Block) -> tuple[str, Optional[str]]:
         meta = await asyncio.to_thread(self.index.get_meta, block.block_id)

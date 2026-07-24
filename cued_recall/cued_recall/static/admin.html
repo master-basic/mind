@@ -9,6 +9,19 @@ body { font-family: -apple-system, 'Segoe UI', monospace; background: #0d1117; c
 h1 { font-size: 20px; margin-bottom: 20px; color: #58a6ff; }
 h2 { font-size: 14px; margin: 16px 0 8px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; }
 .stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; margin-bottom: 16px; }
+.models-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 8px; margin-bottom: 16px; }
+.model-card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px; }
+.model-card .head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.model-card .name { font-size: 13px; font-weight: 600; color: #f0f6fc; text-transform: capitalize; }
+.model-card .dot { width: 8px; height: 8px; border-radius: 50%; background: #f85149; }
+.model-card .dot.up { background: #3fb950; }
+.model-card .sub { font-size: 11px; color: #8b949e; margin-left: auto; }
+.model-card .meta { font-size: 11px; color: #8b949e; margin-bottom: 6px; word-break: break-all; }
+.bar { height: 8px; background: #0d1117; border: 1px solid #30363d; border-radius: 5px; overflow: hidden; }
+.bar > span { display: block; height: 100%; background: #58a6ff; width: 0; transition: width .3s; }
+.bar.warn > span { background: #d29922; }
+.bar.hot > span { background: #f85149; }
+.bar-label { display: flex; justify-content: space-between; font-size: 11px; color: #8b949e; margin-top: 4px; }
 .stat-card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px; }
 .stat-card .value { font-size: 28px; font-weight: 600; color: #f0f6fc; }
 .stat-card .label { font-size: 11px; color: #8b949e; margin-top: 2px; }
@@ -44,6 +57,9 @@ tr:hover td { background: #161b22; }
 <h1>⬡ Cued Recall Middleware</h1>
 <div class="server-info" id="server-info">Connecting...</div>
 <div id="last-updated"></div>
+
+<h2>Models — context usage</h2>
+<div class="models-grid" id="models-grid"></div>
 
 <h2>Stats</h2>
 <div class="stats-grid" id="stats-grid"></div>
@@ -96,6 +112,40 @@ async function loadServerInfo() {
       `<span>status</span> ${data.status} &nbsp; <span>store</span> ${data.store}`;
   } catch (e) {
     document.getElementById('server-info').textContent = 'Error: ' + e.message;
+  }
+}
+
+async function loadModels() {
+  const grid = document.getElementById('models-grid');
+  try {
+    const r = await fetch(API + '/admin/models');
+    const data = await r.json();
+    grid.innerHTML = '';
+    for (const m of data.models || []) {
+      const pct = m.kv_used_ratio != null ? Math.round(m.kv_used_ratio * 1000) / 10 : null;
+      const barCls = pct == null ? '' : (pct >= 90 ? 'hot' : (pct >= 70 ? 'warn' : ''));
+      const ctx = m.n_ctx != null ? m.n_ctx.toLocaleString() : '—';
+      const used = m.used_tokens != null ? m.used_tokens.toLocaleString() : '—';
+      const usageLine = pct == null
+        ? `<div class="bar-label"><span>context ${ctx} tokens</span><span>usage n/a</span></div>`
+        : `<div class="bar ${barCls}"><span style="width:${Math.min(pct,100)}%"></span></div>
+           <div class="bar-label"><span>${used} / ${ctx} tok</span><span>${pct}%</span></div>`;
+      grid.innerHTML += `
+        <div class="model-card">
+          <div class="head">
+            <span class="dot ${m.up ? 'up' : ''}"></span>
+            <span class="name">${m.name}</span>
+            <span class="sub">${m.up ? 'up' : 'down'}</span>
+          </div>
+          <div class="meta">${m.model || m.endpoint || ''}</div>
+          ${usageLine}
+        </div>`;
+    }
+    if (!(data.models || []).length) {
+      grid.innerHTML = '<div class="model-card" style="color:#8b949e">No model info</div>';
+    }
+  } catch (e) {
+    grid.innerHTML = `<div class="model-card" style="color:#f85149">Error: ${e.message}</div>`;
   }
 }
 
@@ -166,9 +216,9 @@ async function runJudge() {
   try {
     const r = await fetch(API + '/admin/judge/run', { method: 'POST' });
     const data = await r.json();
-    alert('Judge pass result: ' + data.status);
-    loadStats();
-    loadBlocks();
+    const n = data.processed != null ? data.processed : '?';
+    alert('Judge pass: ' + (data.status || 'done') + ' — ' + n + ' block(s) reviewed');
+    refresh();
   } catch (e) {
     alert('Error: ' + e.message);
   }
@@ -176,7 +226,7 @@ async function runJudge() {
 
 async function refresh() {
   document.getElementById('last-updated').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
-  await Promise.all([loadServerInfo(), loadStats(), loadBlocks()]);
+  await Promise.all([loadServerInfo(), loadModels(), loadStats(), loadBlocks()]);
 }
 
 document.getElementById('filter-status').addEventListener('change', loadBlocks);

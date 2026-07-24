@@ -50,13 +50,14 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
     judge_running = [False]
     judge_tokens = [0]
 
-    async def run_judge_pass():
+    async def run_judge_pass(min_age=None):
         if judge_running[0]:
-            return
+            return {"status": "already running", "processed": 0}
         judge_running[0] = True
         try:
             judge_pass_counter[0] += 1
-            await judge.run_pass()
+            processed = await judge.run_pass(min_age=min_age)
+            return {"status": "ok", "processed": processed}
         finally:
             judge_running[0] = False
 
@@ -94,6 +95,63 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
     async def chat_page():
         html = (static_dir / "chat.html").read_text(encoding="utf-8")
         return HTMLResponse(html)
+
+    @app.get("/admin/models")
+    async def admin_models():
+        import httpx
+        targets = [
+            ("reasoning", cfg.reasoning_endpoint),
+            ("judge", cfg.judge_endpoint),
+            ("embed", cfg.embed_endpoint),
+        ]
+
+        async def probe(name, base):
+            base = (base or "").rstrip("/")
+            info = {
+                "name": name, "endpoint": base, "up": False,
+                "model": None, "n_ctx": None,
+                "kv_used_ratio": None, "used_tokens": None,
+            }
+            try:
+                async with httpx.AsyncClient(timeout=3) as client:
+                    try:
+                        r = await client.get(base + "/props")
+                        if r.status_code == 200:
+                            info["up"] = True
+                            d = r.json()
+                            gs = d.get("default_generation_settings", {}) or {}
+                            info["n_ctx"] = gs.get("n_ctx") or d.get("n_ctx")
+                            mp = d.get("model_path") or d.get("model") or gs.get("model")
+                            if mp:
+                                info["model"] = str(mp).replace("\\", "/").split("/")[-1]
+                    except Exception:
+                        pass
+                    try:
+                        r = await client.get(base + "/metrics")
+                        if r.status_code == 200:
+                            info["up"] = True
+                            for line in r.text.splitlines():
+                                if line.startswith("llamacpp:kv_cache_usage_ratio"):
+                                    try:
+                                        info["kv_used_ratio"] = float(line.split()[-1])
+                                    except ValueError:
+                                        pass
+                    except Exception:
+                        pass
+                    if not info["up"]:
+                        try:
+                            r = await client.get(base + "/health")
+                            info["up"] = r.status_code == 200
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            if info["n_ctx"] and info["kv_used_ratio"] is not None:
+                info["used_tokens"] = int(info["n_ctx"] * info["kv_used_ratio"])
+            return info
+
+        models = await asyncio.gather(*[probe(n, u) for n, u in targets])
+        return {"models": list(models)}
 
     admin_router = build_admin_router(index, store, wal, run_judge_pass)
     app.include_router(admin_router)
