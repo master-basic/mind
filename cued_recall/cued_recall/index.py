@@ -79,10 +79,17 @@ class VectorIndex:
         if len(embedding) != self.dim:
             raise ValueError(f"expected dim {self.dim}, got {len(embedding)}")
         with self._lock:
+            # vec0 virtual tables support neither ON CONFLICT ... DO UPDATE
+            # ("UPSERT not implemented for virtual table") nor INSERT OR
+            # REPLACE (raises a UNIQUE constraint error instead of
+            # replacing). Delete-then-insert is the only working upsert.
+            packed = sqlite_vec.serialize_float32(embedding)
             self._conn.execute(
-                "INSERT INTO block_vec (block_id, embedding) VALUES (?, ?) "
-                "ON CONFLICT(block_id) DO UPDATE SET embedding=excluded.embedding",
-                (block_id, embedding),
+                "DELETE FROM block_vec WHERE block_id = ?", (block_id,)
+            )
+            self._conn.execute(
+                "INSERT INTO block_vec (block_id, embedding) VALUES (?, ?)",
+                (block_id, packed),
             )
             self._conn.commit()
 
@@ -91,22 +98,30 @@ class VectorIndex:
               status_filter: Tuple[str, ...] = ("shelved", "truncated")) -> List[Tuple[str, float]]:
         if len(embedding) != self.dim:
             raise ValueError(f"expected dim {self.dim}, got {len(embedding)}")
+        # sqlite-vec resolves the KNN "k" against block_vec alone, before the
+        # JOIN's status filter is applied. Filtering by status in the same
+        # WHERE clause as the MATCH/k constraint silently drops matches: if
+        # the nearest k raw vectors are all e.g. "hot", the join yields zero
+        # rows even when relevant "shelved"/"truncated" blocks exist further
+        # down. Over-fetch a large candidate pool and filter by status here.
+        candidate_k = max(k * 50, 500)
         with self._lock:
-            placeholders = ",".join("?" for _ in status_filter)
-            rows = self._conn.execute(f"""
-                SELECT v.block_id, v.distance
+            rows = self._conn.execute("""
+                SELECT v.block_id, v.distance, b.status
                 FROM block_vec v
                 JOIN blocks b ON b.block_id = v.block_id
-                WHERE b.status IN ({placeholders})
-                  AND v.embedding MATCH ?
-                  AND k = ?
+                WHERE v.embedding MATCH ? AND k = ?
                 ORDER BY v.distance
-            """, (*status_filter, embedding, k)).fetchall()
+            """, (sqlite_vec.serialize_float32(embedding), candidate_k)).fetchall()
         results = []
-        for block_id, distance in rows:
+        for block_id, distance, status in rows:
+            if status not in status_filter:
+                continue
             sim = 1.0 - distance
             if sim >= threshold:
                 results.append((block_id, sim))
+            if len(results) >= k:
+                break
         return results
 
     def get_meta(self, block_id: str) -> Optional[dict]:

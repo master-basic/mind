@@ -164,8 +164,8 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
 
         result = await pipeline.process_turn(body, conv_id, turn_index)
 
-        if turn_index > 1:
-            await pipeline.apply_accepted_verification(conv_id, turn_index - 1)
+        if turn_index > 0:
+            await pipeline.apply_accepted_verification(conv_id, turn_index)
 
         new_tokens = 0
         if isinstance(result, dict) and "stream" not in result:

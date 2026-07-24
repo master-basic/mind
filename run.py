@@ -125,8 +125,8 @@ def find_llama_server(args):
         Path("C:/llama.cpp/build/bin/Release/llama-server.exe"),
         Path("C:/llama/build/bin/Release/llama-server.exe"),
         ROOT / "llama.cpp" / "build" / "bin" / "llama-server",
-        "/usr/local/bin/llama-server",
-        "/usr/bin/llama-server",
+        Path("/usr/local/bin/llama-server"),
+        Path("/usr/bin/llama-server"),
     ]
     for c in candidates:
         if c.exists():
@@ -250,13 +250,17 @@ def resolve_models(args, storage_root, hf_hub):
     return result
 
 
-def update_config(storage_root):
+def update_config(storage_root, args):
     import yaml
     with open(CONFIG_PATH) as f:
         config = yaml.safe_load(f)
     config["store_path"] = str(storage_root / "store")
     config["snapshot_path"] = str(ROOT / "snapshots")
     config["models_dir"] = str(storage_root / "models")
+    config["listen"] = f"127.0.0.1:{args.middleware_port}"
+    config["reasoning_endpoint"] = f"http://127.0.0.1:{args.reasoning_port}"
+    config["judge_endpoint"] = f"http://127.0.0.1:{args.judge_port}"
+    config["embed_endpoint"] = f"http://127.0.0.1:{args.embed_port}"
     with open(CONFIG_PATH, "w") as f:
         yaml.dump(config, f, default_flow_style=False)
 
@@ -321,7 +325,7 @@ def main():
     if not models:
         die("No models resolved. Use --download-to, --models-cache, or explicit --*-model paths")
 
-    update_config(storage_root)
+    update_config(storage_root, args)
 
     skip_map = {
         "reasoning": args.skip_reasoning,

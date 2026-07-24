@@ -88,6 +88,17 @@ tr:hover td { background: #161b22; }
 <script>
 const API = '';
 
+async function loadServerInfo() {
+  try {
+    const r = await fetch(API + '/health');
+    const data = await r.json();
+    document.getElementById('server-info').innerHTML =
+      `<span>status</span> ${data.status} &nbsp; <span>store</span> ${data.store}`;
+  } catch (e) {
+    document.getElementById('server-info').textContent = 'Error: ' + e.message;
+  }
+}
+
 async function loadStats() {
   try {
     const r = await fetch(API + '/admin/stats');
@@ -165,7 +176,7 @@ async function runJudge() {
 
 async function refresh() {
   document.getElementById('last-updated').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
-  await Promise.all([loadStats(), loadBlocks()]);
+  await Promise.all([loadServerInfo(), loadStats(), loadBlocks()]);
 }
 
 document.getElementById('filter-status').addEventListener('change', loadBlocks);
