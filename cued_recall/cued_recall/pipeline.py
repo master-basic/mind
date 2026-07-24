@@ -42,10 +42,19 @@ class Pipeline:
 
     async def recall_blocks(self, user_message: str) -> List[Tuple[Block, float]]:
         # Only embed a bounded slice for the recall query: a pasted file can be
-        # far larger than the embed model's context, which would 500 the embed
-        # server (and the whole request).
-        query_text = truncate_tokens(user_message, 1024)
-        embed_vec = await asyncio.to_thread(self.embed.embed, query_text)
+        # far larger than the embed model's context.
+        query_text = truncate_tokens(user_message, 512)
+        # Recall is best-effort: if the embed server errors (e.g. input still too
+        # large), skip recall for this turn rather than 500 the whole chat.
+        try:
+            embed_vec = await asyncio.to_thread(self.embed.embed, query_text)
+        except Exception as e:
+            self.wal.write({
+                "event": "recall_embed_error",
+                "error": str(e),
+                "timestamp": time.time(),
+            })
+            return []
         results = await asyncio.to_thread(
             self.index.query,
             embed_vec,
@@ -478,8 +487,18 @@ class Pipeline:
         return blocks
 
     async def _embed_and_store(self, block: Block):
-        vec = await asyncio.to_thread(self.embed.embed, block.stimulus_text)
-        await asyncio.to_thread(self.index.upsert_vector, block.block_id, vec)
+        # Best-effort: a failed embed must not crash block creation. The block
+        # is still stored; it just won't be vector-recallable until re-embedded.
+        try:
+            vec = await asyncio.to_thread(self.embed.embed, block.stimulus_text)
+            await asyncio.to_thread(self.index.upsert_vector, block.block_id, vec)
+        except Exception as e:
+            self.wal.write({
+                "event": "embed_store_error",
+                "block_id": block.block_id,
+                "error": str(e),
+                "timestamp": time.time(),
+            })
 
     async def detect_and_apply_correction(
         self, user_message: str, conversation_id: str, turn_index: int

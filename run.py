@@ -54,7 +54,12 @@ MODEL_MANIFEST = [
 SERVER_DEFAULTS = {
     "reasoning": {"port": 8080, "extra": ["--ctx-size", "32768", "--n-gpu-layers", "99", "--no-kv-offload"]},
     "judge":     {"port": 8081, "extra": ["--ctx-size", "8192", "--n-gpu-layers", "99"]},
-    "embed":     {"port": 8082, "extra": ["--embedding", "--ctx-size", "8192", "--n-gpu-layers", "99"]},
+    # Embeddings need the whole sequence in one micro-batch; the default
+    # --ubatch-size (512) makes any input over ~512 tokens 500. Match batch
+    # sizes to the context so larger inputs embed instead of erroring.
+    "embed":     {"port": 8082, "extra": ["--embedding", "--ctx-size", "8192",
+                                          "--batch-size", "8192", "--ubatch-size", "8192",
+                                          "--n-gpu-layers", "99"]},
 }
 
 
