@@ -92,11 +92,7 @@ set /p "LLAMA_BIN=Folder containing llama-server.exe [!SAVED_LLAMA_BIN!] (blank=
 if not "!LLAMA_BIN!"=="" if not exist "!LLAMA_BIN!" echo [WARN] Not found: !LLAMA_BIN! - will pass it anyway
 
 set "MODELS_CACHE=!SAVED_MODELS_CACHE!"
-set /p "MODELS_CACHE=Path to existing models directory [!SAVED_MODELS_CACHE!]: "
-if not "!MODELS_CACHE!"=="" if not exist "!MODELS_CACHE!" (
-    echo Directory not found: !MODELS_CACHE!
-    set "MODELS_CACHE="
-)
+set /p "MODELS_CACHE=Folder on your hard drive to KEEP models (downloaded here once, copied to RAM each run) [!SAVED_MODELS_CACHE!] (blank=store in storage dir): "
 
 set "STORAGE=!SAVED_STORAGE!"
 set /p "STORAGE=Storage path (default: ./data on Windows) [!SAVED_STORAGE!]: "

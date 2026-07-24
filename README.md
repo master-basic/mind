@@ -227,7 +227,7 @@ run.bat               # start everything
 run.bat               # start everything
 ```
 
-Models don't need to be re-downloaded — they are cached in the RAM disk (or in `./models` if you didn't use a RAM disk).
+A RAM disk is wiped on reboot, so its copy of the models is gone. As long as you gave a **keep folder** (the "Folder on your hard drive to KEEP models" prompt, or `--models-cache DIR`), the models were downloaded there once and are simply **copied back to the RAM disk** on each start — no re-download. If you never set a keep folder, they live in the storage dir and are only re-downloaded when that dir is empty.
 
 ---
 
@@ -236,7 +236,7 @@ Models don't need to be re-downloaded — they are cached in the RAM disk (or in
 | Option | What it does |
 |---|---|
 | `--storage PATH` | Where to put models and data. Default: `./data` |
-| `--models-cache DIR` | Copy models from this folder instead of downloading |
+| `--models-cache DIR` | Keep models permanently in this hard-drive folder (downloaded here once if missing), then copy them to the RAM disk each run |
 | `--no-download` | Fail if models aren't already present |
 | `--reasoning-model PATH` | Use a specific reasoning model file |
 | `--judge-model PATH` | Use a specific judge model file |

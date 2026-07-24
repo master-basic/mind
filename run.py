@@ -200,14 +200,30 @@ def setup_storage(args):
 
 
 def resolve_models(args, storage_root, hf_hub):
-    """Resolve model paths. Download or copy as needed."""
-    models_dir = storage_root / "models"
+    """Resolve model paths using a keep-on-disk, run-from-RAM flow.
+
+    Models live permanently in a persistent directory on the hard drive (the
+    --models-cache / --download-to location) and are copied into the RAM-disk
+    working directory (<storage>/models) for use. A missing persistent copy is
+    downloaded once; a RAM-disk wipe on reboot then only triggers a fast local
+    copy, never another multi-GB download.
+
+    If no persistent location is given, models are downloaded straight into the
+    working directory (the previous behavior).
+    """
+    work_dir = storage_root / "models"
+    if not args.dry_run:
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+    # Where models are kept permanently. Falls back to the working dir when the
+    # user did not provide a hard-drive location to keep them in.
+    keep_root = args.models_cache or args.download_to
+    persist_dir = Path(keep_root) if keep_root else work_dir
+    same_location = persist_dir.resolve() == work_dir.resolve()
+    if keep_root and not args.dry_run:
+        persist_dir.mkdir(parents=True, exist_ok=True)
+
     result = {}
-
-    has_explicit = any([
-        args.reasoning_model, args.judge_model, args.embed_model,
-    ])
-
     for entry in MODEL_MANIFEST:
         name = entry["name"]
         save_as = entry.get("save_as", entry["file"])
@@ -221,56 +237,55 @@ def resolve_models(args, storage_root, hf_hub):
             info(f"Using explicit {name} model: {p}")
             continue
 
-        dest = models_dir / save_as
-        if dest.exists():
-            result[name] = str(dest)
-            info(f"{name} model already in storage: {dest}")
+        work_file = work_dir / save_as
+        persist_file = persist_dir / save_as
+
+        # Already staged in the working (RAM) dir -> use as-is.
+        if work_file.exists():
+            result[name] = str(work_file)
+            info(f"{name} model ready: {work_file}")
             continue
 
-        if args.no_download:
-            die(f"{name} model not found at {dest} and --no-download is set. "
-                f"Place it there or use --{name}-model PATH")
-
-        if args.models_cache:
-            cache = Path(args.models_cache) / save_as
-            if cache.exists():
-                if not args.dry_run:
-                    shutil.copy2(cache, dest)
-                info(f"Copied {name} from cache: {cache} -> {dest}")
-                result[name] = str(dest)
-                continue
-            warn(f"{name} not found in cache {cache}, will download")
-
-        if args.dry_run:
-            info(f"Would download {name} model: {entry['repo']}/{entry['file']} -> {dest}")
-            continue
-
-        info(f"Downloading {name} model ({save_as})...")
-        try:
-            hf_hub.hf_hub_download(
-                repo_id=entry["repo"],
-                filename=entry["file"],
-                local_dir=models_dir,
-            )
-            downloaded = models_dir / entry["file"]
-            if downloaded != dest and not dest.exists():
-                downloaded.rename(dest)
-            result[name] = str(dest)
-            info(f"Downloaded {name} model: {dest}")
-            # Populate the cache so a ramdisk wipe / next run restores from
-            # local disk instead of downloading ~GBs from HuggingFace again.
-            if args.models_cache:
+        # 1) Make sure a persistent copy exists on disk (download once).
+        if persist_file.exists():
+            info(f"{name} model found on disk: {persist_file}")
+        else:
+            if args.no_download:
+                die(f"{name} model not found at {persist_file} and --no-download "
+                    f"is set. Place it there or use --{name}-model PATH")
+            if args.dry_run:
+                info(f"Would download {name}: {entry['repo']}/{entry['file']} "
+                     f"-> {persist_file}")
+            else:
+                info(f"Downloading {name} model ({save_as}) to {persist_dir}...")
                 try:
-                    cache_dir = Path(args.models_cache)
-                    cache_dir.mkdir(parents=True, exist_ok=True)
-                    cache_file = cache_dir / save_as
-                    if cache_file.resolve() != dest.resolve() and not cache_file.exists():
-                        info(f"Saving {name} to cache for next time: {cache_file}")
-                        shutil.copy2(dest, cache_file)
+                    hf_hub.hf_hub_download(
+                        repo_id=entry["repo"],
+                        filename=entry["file"],
+                        local_dir=persist_dir,
+                    )
+                    downloaded = persist_dir / entry["file"]
+                    if downloaded != persist_file and not persist_file.exists():
+                        downloaded.rename(persist_file)
+                    info(f"Downloaded {name} -> {persist_file}")
                 except Exception as e:
-                    warn(f"Could not save {name} to cache: {e}")
+                    warn(f"Failed to download {name}: {e}")
+                    continue
+
+        # 2) Stage the persistent copy into the RAM-disk working dir.
+        if same_location:
+            result[name] = str(persist_file)
+            continue
+        if args.dry_run:
+            info(f"Would copy {name}: {persist_file} -> {work_file}")
+            continue
+        try:
+            info(f"Copying {name} to RAM disk: {persist_file} -> {work_file}")
+            shutil.copy2(persist_file, work_file)
+            result[name] = str(work_file)
         except Exception as e:
-            warn(f"Failed to download {name}: {e}")
+            warn(f"Could not copy {name} to work dir, using disk copy: {e}")
+            result[name] = str(persist_file)
 
     return result
 
