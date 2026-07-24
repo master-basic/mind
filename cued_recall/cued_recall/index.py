@@ -142,7 +142,7 @@ class VectorIndex:
             ).fetchone()
             if row is None:
                 return None
-            cols = [d[0] for d in self._conn.execute("PRAGMA table_info(blocks)")]
+            cols = [d[1] for d in self._conn.execute("PRAGMA table_info(blocks)")]
             return dict(zip(cols, row))
 
     def list_meta(self, status: Optional[str] = None,
@@ -170,7 +170,7 @@ class VectorIndex:
                 f"LIMIT ? OFFSET ?",
                 [*params, limit, offset],
             ).fetchall()
-            cols = [d[0] for d in self._conn.execute("PRAGMA table_info(blocks)")]
+            cols = [d[1] for d in self._conn.execute("PRAGMA table_info(blocks)")]
             items = [dict(zip(cols, row)) for row in rows]
         return items, count
 
