@@ -1,15 +1,18 @@
+import asyncio
 import time
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 
 from .index import VectorIndex
-from .models import BlockStatus, Verification
+from .models import Block, BlockStatus, BlockType, Verification
 from .store import BlockStore
+from .taxonomy import TAXONOMY, TAXONOMY_GROUPS, TAXONOMY_VERSION, validate_gist, validate_tags
 from .wal import WAL
 
 
-def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_run_fn, tps_ring: list):
+def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_run_fn,
+                        tps_ring: list, embed=None):
     router = APIRouter(prefix="/admin")
 
     @router.get("/blocks")
@@ -17,6 +20,7 @@ def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_ru
         status: Optional[str] = None,
         type_: Optional[str] = None,
         conversation_id: Optional[str] = None,
+        tag: Optional[str] = None,
         limit: int = 100,
         offset: int = 0,
     ):
@@ -24,10 +28,20 @@ def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_ru
             status=status,
             type_=type_,
             conversation_id=conversation_id,
+            tag=tag,
             limit=limit,
             offset=offset,
         )
         return {"total": total, "items": items, "limit": limit, "offset": offset}
+
+    @router.get("/tags")
+    async def list_tags():
+        return {
+            "taxonomy_version": TAXONOMY_VERSION,
+            "taxonomy": TAXONOMY,
+            "groups": TAXONOMY_GROUPS,
+            "counts": index.tag_counts(),
+        }
 
     @router.get("/blocks/{block_id}")
     async def get_block(block_id: str):
@@ -96,5 +110,103 @@ def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_ru
             return {"recent": [], "avg_tps": 0, "count": 0}
         avg = sum(e["tps"] for e in tps_ring) / len(tps_ring)
         return {"recent": tps_ring[-20:], "avg_tps": round(avg, 1), "count": len(tps_ring)}
+
+    @router.get("/export")
+    async def export_blocks(
+        status: Optional[str] = None,
+        type_: Optional[str] = None,
+        tag: Optional[str] = None,
+        include_full_text: bool = False,
+        limit: int = 1000,
+    ):
+        items, _ = index.list_meta(
+            status=status, type_=type_, tag=tag, limit=limit, offset=0
+        )
+        exported = []
+        for m in items:
+            block = store.get(m["block_id"])
+            if block is None:
+                continue
+            # Privacy default: raw shelved blocks can contain whatever a
+            # client pasted (configs, IPs, credentials). Only ship the actual
+            # text when it's already a judge-produced summary (status
+            # truncated), or when the caller explicitly opts in.
+            text = block.text if (include_full_text or m["status"] == "truncated") else None
+            exported.append({
+                "block_id": block.block_id,
+                "type": m["type"],
+                "status": m["status"],
+                "verification": m["verification"],
+                "token_count": block.token_count,
+                "created_at": block.created_at,
+                "stimulus_text": block.stimulus_text,
+                "gist": m.get("gist", ""),
+                "tags": m.get("tags", []),
+                "text": text,
+            })
+        return {
+            "taxonomy_version": TAXONOMY_VERSION,
+            "count": len(exported),
+            "blocks": exported,
+        }
+
+    @router.post("/import")
+    async def import_blocks(body: dict):
+        if embed is None:
+            raise HTTPException(status_code=503, detail="embedding client not available")
+        incoming = body.get("blocks", [])
+        imported = 0
+        skipped = 0
+        for item in incoming:
+            text = item.get("text") or ""
+            stimulus = item.get("stimulus_text", "") or ""
+            if not text and not stimulus:
+                skipped += 1
+                continue
+            try:
+                type_ = BlockType(item.get("type", "reasoning"))
+            except ValueError:
+                type_ = BlockType.reasoning
+            block = Block(
+                type=type_,
+                status=BlockStatus.truncated if text else BlockStatus.shelved,
+                conversation_id="imported",
+                turn_index=0,
+                token_count=item.get("token_count", 0),
+                text=text,
+                stimulus_text=stimulus,
+                # Verification is not portable: someone else's "accepted" is
+                # not evidence for this instance. It has to be earned again
+                # through this instance's own conversations.
+                verification=Verification.unknown,
+                created_at=item.get("created_at", time.time()),
+                tags=validate_tags(item.get("tags", [])),
+                gist=validate_gist(item.get("gist", "")),
+            )
+            store.put(block)
+            index.upsert_block_meta(
+                block.block_id, block.type.value, block.status.value,
+                block.created_at, block.conversation_id, block.turn_index,
+                block.token_count, block.verification.value, 0, 0.0,
+            )
+            index.set_tags(block.block_id, block.tags, block.gist)
+            # Embeddings aren't portable across instances running different
+            # embedding models, so the receiving side always re-embeds locally
+            # rather than trusting a vector shipped in the export.
+            embed_text = (stimulus or text)[:2000]
+            if embed_text:
+                try:
+                    vec = await asyncio.to_thread(embed.embed, embed_text)
+                    await asyncio.to_thread(index.upsert_vector, block.block_id, vec)
+                except Exception:
+                    pass
+            imported += 1
+        wal.write({
+            "event": "admin_import",
+            "imported": imported,
+            "skipped": skipped,
+            "timestamp": time.time(),
+        })
+        return {"status": "ok", "imported": imported, "skipped": skipped}
 
     return router

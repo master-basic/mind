@@ -39,6 +39,8 @@ class Block:
     verification: Verification = Verification.unknown
     recall_count: int = 0
     last_recalled: float = 0.0
+    tags: List[str] = field(default_factory=list)
+    gist: str = ""
 
     def to_msgpack(self) -> dict:
         d = asdict(self)

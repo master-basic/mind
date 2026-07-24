@@ -1,5 +1,9 @@
 ﻿__pycache__/
 run_settings.txt
-snapshots/
 data/
 models/
+snapshots/
+# Machine-specific: real store_path/snapshot_path live here. Never commit
+# someone's local ramdisk drive letter or absolute path for the next clone
+# to accidentally inherit. cued_recall/config.example.yaml is the template.
+cued_recall/config.yaml

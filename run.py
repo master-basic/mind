@@ -144,7 +144,13 @@ def parse_args():
     g.add_argument("--no-tmpfs", action="store_true",
                    help="Use local directories instead of tmpfs (always true on Windows)")
     g.add_argument("--storage", metavar="DIR", default=None,
-                   help="Root storage path (default: /mnt/ramdisk/cued_recall or ./data on Windows)")
+                   help="Root storage path for models+blocks: ramdisk, NVMe, or any "
+                        "directory. Sticky -- once used, future runs without --storage "
+                        "keep reusing it instead of silently relocating. Default on a "
+                        "genuinely fresh config: /mnt/ramdisk/cued_recall, or ./data on Windows")
+    g.add_argument("--snapshot", metavar="DIR", default=None,
+                   help="Snapshot backup location, independent of --storage. Sticky like "
+                        "--storage. Default on a fresh config: ./snapshots next to run.py")
 
     g = p.add_argument_group("Model overrides")
     g.add_argument("--reasoning-model", metavar="PATH", help="Path to reasoning model GGUF")
@@ -293,16 +299,66 @@ def choose_reasoning_model(args):
     return entry
 
 
-def setup_storage(args):
-    """Determine and prepare the storage root (tmpfs or local)."""
+def _load_configured_paths() -> dict:
+    """Read store_path/snapshot_path already in config.yaml, if any.
+
+    Used to make storage sticky: a value already sitting in config.yaml
+    reflects a deliberate past choice (a ramdisk, an NVMe folder, wherever),
+    and should survive a `run.py` invocation that doesn't explicitly ask to
+    change it.
+    """
+    if not CONFIG_PATH.exists():
+        return {}
+    import yaml
+    with open(CONFIG_PATH, encoding="utf-8") as f:
+        config = yaml.safe_load(f) or {}
+    return {
+        "store_path": config.get("store_path"),
+        "snapshot_path": config.get("snapshot_path"),
+    }
+
+
+def _path_usable_here(path_str: str) -> bool:
+    """Reject a configured path that belongs to a different OS's conventions.
+
+    A repo cloned onto Windows may still carry a Linux-style store_path (or
+    vice versa) from whoever last ran it elsewhere. Treating that as "sticky"
+    would resolve to nonsense, so fall back to the platform default instead.
+    """
+    if not path_str:
+        return False
     is_windows = platform.system() == "Windows"
+    drive, _ = os.path.splitdrive(path_str)
+    if is_windows:
+        return bool(drive) or path_str.startswith("\\\\")
+    return path_str.startswith("/")
+
+
+def setup_storage(args):
+    """Determine and prepare the storage root (tmpfs or local).
+
+    Ramdisk, NVMe, or any other directory all work the same way via
+    --storage. Precedence: explicit --storage this run > whatever is already
+    configured (sticky, survives re-runs and repo moves) > platform default
+    (first-run-only fallback).
+    """
+    is_windows = platform.system() == "Windows"
+    configured = _load_configured_paths()
+    prev_store = configured.get("store_path")
+    prev_root = Path(prev_store).parent if prev_store else None
 
     if args.storage:
         storage_root = Path(args.storage)
-    elif is_windows or args.no_tmpfs:
-        storage_root = ROOT / "data"
+        if prev_root and prev_root.resolve() != storage_root.resolve():
+            warn(f"Storage root changing: {prev_root} -> {storage_root}")
+            warn("Memory at the old location is NOT automatically migrated or deleted.")
+    elif prev_store and _path_usable_here(prev_store):
+        storage_root = prev_root
+        info(f"No --storage given; reusing configured storage root: {storage_root}")
     else:
-        storage_root = DEFAULT_TMPFS
+        if prev_store:
+            info(f"Configured store_path ({prev_store}) doesn't match this OS; using default")
+        storage_root = (ROOT / "data") if (is_windows or args.no_tmpfs) else DEFAULT_TMPFS
 
     if args.dry_run:
         info(f"Storage root: {storage_root}" + (" (tmpfs)" if not is_windows and not args.no_tmpfs else ""))
@@ -328,8 +384,35 @@ def setup_storage(args):
 
     (storage_root / "models").mkdir(parents=True, exist_ok=True)
     (storage_root / "store").mkdir(parents=True, exist_ok=True)
-    (ROOT / "snapshots").mkdir(parents=True, exist_ok=True)
     return storage_root
+
+
+def resolve_snapshot_path(args):
+    """Same sticky precedence as setup_storage, but independent of --storage.
+
+    This is the piece that was missing: snapshot_path used to always reset to
+    ROOT/"snapshots" (wherever the repo folder currently is), with no flag to
+    control it and no memory of a previous choice -- so moving or re-cloning
+    the repo silently orphaned old snapshots.
+    """
+    configured = _load_configured_paths()
+    prev_snapshot = configured.get("snapshot_path")
+
+    if args.snapshot:
+        snapshot_path = Path(args.snapshot)
+        if prev_snapshot and Path(prev_snapshot).resolve() != snapshot_path.resolve():
+            warn(f"Snapshot path changing: {prev_snapshot} -> {snapshot_path}")
+            warn("Snapshots at the old location are NOT automatically migrated.")
+    elif prev_snapshot and _path_usable_here(prev_snapshot):
+        snapshot_path = Path(prev_snapshot)
+    else:
+        if prev_snapshot:
+            info(f"Configured snapshot_path ({prev_snapshot}) doesn't match this OS; using default")
+        snapshot_path = ROOT / "snapshots"
+
+    if not args.dry_run:
+        snapshot_path.mkdir(parents=True, exist_ok=True)
+    return snapshot_path
 
 
 def resolve_models(args, storage_root, hf_hub):
@@ -423,7 +506,7 @@ def resolve_models(args, storage_root, hf_hub):
     return result
 
 
-def update_config(storage_root, args):
+def update_config(storage_root, snapshot_path, args):
     import yaml
     # encoding="utf-8" is required: config.yaml holds non-ASCII correction
     # patterns (e.g. Azerbaijani). Without it, Windows' default codepage
@@ -431,7 +514,7 @@ def update_config(storage_root, args):
     with open(CONFIG_PATH, encoding="utf-8") as f:
         config = yaml.safe_load(f)
     config["store_path"] = str(storage_root / "store")
-    config["snapshot_path"] = str(ROOT / "snapshots")
+    config["snapshot_path"] = str(snapshot_path)
     config["models_dir"] = str(storage_root / "models")
     config["listen"] = f"127.0.0.1:{args.middleware_port}"
     config["reasoning_endpoint"] = f"http://127.0.0.1:{args.reasoning_port}"
@@ -473,12 +556,31 @@ def start_server(llama_bin, name, model_path, port, extra):
     )
 
 
+def ensure_config_exists():
+    """Bootstrap config.yaml from the template on a genuinely fresh clone.
+
+    config.yaml is gitignored (it holds a specific machine's store_path /
+    snapshot_path), so a new clone won't have one at all -- only the generic
+    config.example.yaml template. Without this, update_config() would crash
+    trying to open a file that was never there.
+    """
+    if CONFIG_PATH.exists():
+        return
+    example = CONFIG_PATH.parent / "config.example.yaml"
+    if not example.exists():
+        die(f"config.yaml not found and no template at {example}")
+    shutil.copy2(example, CONFIG_PATH)
+    info(f"First run: created {CONFIG_PATH} from config.example.yaml")
+
+
 def main():
     os.chdir(ROOT)
     args = parse_args()
 
     print("=== Cued Recall Memory Middleware ===")
     print()
+
+    ensure_config_exists()
 
     llama_bin = find_llama_server(args)
     if not llama_bin:
@@ -502,6 +604,7 @@ def main():
     hf_hub = None if args.no_download and not args.models_cache else ensure_hf_hub()
 
     storage_root = setup_storage(args)
+    snapshot_path = resolve_snapshot_path(args)
     models = resolve_models(args, storage_root, hf_hub)
 
     if args.dry_run:
@@ -512,7 +615,7 @@ def main():
     if not models:
         die("No models resolved. Use --download-to, --models-cache, or explicit --*-model paths")
 
-    update_config(storage_root, args)
+    update_config(storage_root, snapshot_path, args)
 
     skip_map = {
         "reasoning": args.skip_reasoning,
@@ -581,6 +684,7 @@ def main():
             if name != "middleware":
                 print(f"  {name.capitalize():14} http://127.0.0.1:{port}")
         print(f"  Storage:        {storage_root}")
+        print(f"  Snapshots:      {snapshot_path}")
         print("  Press Ctrl+C to stop all processes")
         print()
 

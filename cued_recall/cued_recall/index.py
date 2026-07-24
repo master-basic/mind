@@ -41,6 +41,13 @@ class VectorIndex:
                 last_recalled REAL
             )
         """)
+        # Migrate older DBs created before tagging existed. SQLite has no
+        # "ADD COLUMN IF NOT EXISTS", so check first.
+        existing_cols = {row[1] for row in c.execute("PRAGMA table_info(blocks)")}
+        if "tags" not in existing_cols:
+            c.execute("ALTER TABLE blocks ADD COLUMN tags TEXT DEFAULT ''")
+        if "gist" not in existing_cols:
+            c.execute("ALTER TABLE blocks ADD COLUMN gist TEXT DEFAULT ''")
         # If an existing block_vec was created with a different dimension,
         # drop it: a dim change invalidates stored vectors, and keeping the
         # old table makes every upsert/query raise a dim-mismatch error.
@@ -79,6 +86,30 @@ class VectorIndex:
                   turn_index, token_count, verification, recall_count,
                   last_recalled))
             self._conn.commit()
+
+    def set_tags(self, block_id: str, tags: List[str], gist: str):
+        # Stored delimiter-wrapped (",tag1,tag2,") so a LIKE '%,tag,%' filter
+        # can't false-match a tag that's a substring of another (e.g. "dns"
+        # inside "dns-server").
+        tags_str = "," + ",".join(tags) + "," if tags else ""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE blocks SET tags=?, gist=? WHERE block_id=?",
+                (tags_str, gist, block_id),
+            )
+            self._conn.commit()
+
+    def tag_counts(self) -> dict:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT tags FROM blocks WHERE tags != ''"
+            ).fetchall()
+        counts: dict = {}
+        for (raw,) in rows:
+            for t in raw.split(","):
+                if t:
+                    counts[t] = counts.get(t, 0) + 1
+        return counts
 
     def delete_meta(self, block_id: str):
         with self._lock:
@@ -143,11 +174,14 @@ class VectorIndex:
             if row is None:
                 return None
             cols = [d[1] for d in self._conn.execute("PRAGMA table_info(blocks)")]
-            return dict(zip(cols, row))
+            meta = dict(zip(cols, row))
+            meta["tags"] = [t for t in (meta.get("tags") or "").split(",") if t]
+            return meta
 
     def list_meta(self, status: Optional[str] = None,
                   type_: Optional[str] = None,
                   conversation_id: Optional[str] = None,
+                  tag: Optional[str] = None,
                   limit: int = 100, offset: int = 0) -> Tuple[List[dict], int]:
         where = []
         params = []
@@ -160,6 +194,9 @@ class VectorIndex:
         if conversation_id:
             where.append("conversation_id=?")
             params.append(conversation_id)
+        if tag:
+            where.append("tags LIKE ?")
+            params.append(f"%,{tag},%")
         clause = " AND ".join(where) if where else "1"
         with self._lock:
             count = self._conn.execute(
@@ -172,6 +209,8 @@ class VectorIndex:
             ).fetchall()
             cols = [d[1] for d in self._conn.execute("PRAGMA table_info(blocks)")]
             items = [dict(zip(cols, row)) for row in rows]
+        for item in items:
+            item["tags"] = [t for t in (item.get("tags") or "").split(",") if t]
         return items, count
 
     def update_status(self, block_id: str, status: str):
@@ -230,6 +269,22 @@ class VectorIndex:
                 SELECT block_id FROM blocks
                 WHERE status IN ('shelved', 'truncated')
                   AND created_at < ?
+                ORDER BY created_at ASC
+                LIMIT ?
+            """, (cutoff, limit)).fetchall()
+        return [r[0] for r in rows]
+
+    def hot_blocks_older_than(self, min_age_s: float,
+                              limit: int = 200) -> List[str]:
+        # A turn's blocks only shelve when the NEXT turn arrives in the same
+        # conversation. A one-off message that's never followed up on would
+        # otherwise stay 'hot' -- invisible to recall -- forever. This finds
+        # those abandoned blocks so a background sweep can shelve them.
+        cutoff = __import__("time").time() - min_age_s
+        with self._lock:
+            rows = self._conn.execute("""
+                SELECT block_id FROM blocks
+                WHERE status = 'hot' AND created_at < ?
                 ORDER BY created_at ASC
                 LIMIT ?
             """, (cutoff, limit)).fetchall()

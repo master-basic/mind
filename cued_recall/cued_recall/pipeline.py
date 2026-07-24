@@ -124,6 +124,7 @@ class Pipeline:
         self.token_sink = None
         self.usage_sink = None
         self.tps_sink = None
+        self.tagger = None
 
     def _fit_messages(self, messages: list) -> list:
         """Truncate messages to fit within max_context_tokens.
@@ -1029,6 +1030,19 @@ class Pipeline:
             and m["turn_index"] == turn_index
         ]
 
+    async def _shelve_block_id(self, block_id: str):
+        await asyncio.to_thread(self.index.update_status, block_id, "shelved")
+        block = await asyncio.to_thread(self.store.get, block_id)
+        if block:
+            block.status = BlockStatus.shelved
+            await asyncio.to_thread(self.store.put, block)
+            # Tag at shelve time, not at the next judge pass (which may be
+            # hours away) -- tagging exists so the admin page is readable
+            # now. Fire-and-forget: a slow/failed tag call must not hold
+            # up the request that triggered this shelve.
+            if self.tagger and not block.tags:
+                asyncio.create_task(self.tagger.tag_block(block))
+
     async def shelve_previous_turn(self, conversation_id: str, turn_index: int):
         prev_turn = turn_index - 1
         if prev_turn < 0:
@@ -1037,8 +1051,19 @@ class Pipeline:
             self._find_turn_blocks, conversation_id, prev_turn
         )
         for bid in block_ids:
-            await asyncio.to_thread(self.index.update_status, bid, "shelved")
-            block = await asyncio.to_thread(self.store.get, bid)
-            if block:
-                block.status = BlockStatus.shelved
-                await asyncio.to_thread(self.store.put, block)
+            await self._shelve_block_id(bid)
+
+    async def shelve_stale_hot_blocks(self, min_idle_s: float, limit: int = 200) -> int:
+        """Shelve 'hot' blocks whose conversation was never continued.
+
+        Normal shelving only fires when the NEXT turn arrives in the same
+        conversation, so a single "remember this" message with no follow-up
+        would otherwise sit unrecallable indefinitely. This is the idle-timeout
+        safety net -- called periodically, not just at startup.
+        """
+        block_ids = await asyncio.to_thread(
+            self.index.hot_blocks_older_than, min_idle_s, limit
+        )
+        for bid in block_ids:
+            await self._shelve_block_id(bid)
+        return len(block_ids)

@@ -17,6 +17,7 @@ from .models import BlockStatus
 from .pipeline import Pipeline
 from .router import build_admin_router
 from .store import BlockStore
+from .tagger import Tagger
 from .wal import WAL
 from fastapi.staticfiles import StaticFiles
 
@@ -44,6 +45,8 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
 
     pipeline = Pipeline(cfg, store, index, embed, wal)
     judge = Judge(cfg, store, index, wal)
+    tagger = Tagger(cfg, store, index, wal)
+    pipeline.tagger = tagger
 
     app = FastAPI(title="Cued Recall Middleware")
 
@@ -93,6 +96,7 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
     pipeline.usage_sink = lambda usage: _record_usage("reasoning", usage)
     judge.usage_sink = lambda usage: _record_usage("judge", usage)
     embed.usage_sink = lambda usage: _record_usage("embed", usage)
+    tagger.usage_sink = lambda usage: _record_usage("tagger", usage)
 
     # T/S (tokens per second) tracking — ring buffer of recent completions
     tps_ring = []  # list of {"tokens": int, "elapsed": float, "tps": float, "at": float}
@@ -215,15 +219,16 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
         models = await asyncio.gather(*[probe(n, u) for n, u in targets])
         return {"models": list(models)}
 
-    admin_router = build_admin_router(index, store, wal, run_judge_pass, tps_ring)
+    admin_router = build_admin_router(index, store, wal, run_judge_pass, tps_ring, embed)
     app.include_router(admin_router)
 
     snapshot_task = None
+    hot_sweep_task = None
     shutdown_event = asyncio.Event()
 
     @app.on_event("startup")
     async def startup():
-        nonlocal snapshot_task
+        nonlocal snapshot_task, hot_sweep_task
 
         snapshot = snapshot_path / "latest"
         if snapshot.exists() and not any(store.blocks_dir.iterdir()):
@@ -258,11 +263,38 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
 
         snapshot_task = asyncio.create_task(snapshot_loop())
 
+        async def hot_sweep_loop():
+            # Poll faster than the timeout itself so an abandoned
+            # conversation becomes recallable close to hot_shelve_timeout_s
+            # after its last message, not after some much longer cycle.
+            check_interval = max(2, min(10, cfg.hot_shelve_timeout_s // 2 or 1))
+            while not shutdown_event.is_set():
+                try:
+                    n = await pipeline.shelve_stale_hot_blocks(cfg.hot_shelve_timeout_s)
+                    if n:
+                        wal.write({
+                            "event": "idle_shelve",
+                            "count": n,
+                            "timestamp": time.time(),
+                        })
+                except BaseException:
+                    pass
+                try:
+                    await asyncio.wait_for(
+                        shutdown_event.wait(), timeout=check_interval
+                    )
+                except asyncio.TimeoutError:
+                    pass
+
+        hot_sweep_task = asyncio.create_task(hot_sweep_loop())
+
     @app.on_event("shutdown")
     async def shutdown():
         shutdown_event.set()
         if snapshot_task:
             snapshot_task.cancel()
+        if hot_sweep_task:
+            hot_sweep_task.cancel()
         _take_snapshot(store, index, snapshot_path)
         wal.close()
         embed.close()

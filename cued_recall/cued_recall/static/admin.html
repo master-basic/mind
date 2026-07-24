@@ -53,6 +53,8 @@ tr:hover td { background: #161b22; }
 .chk-cell { width: 32px; text-align: center; }
 .chk { width: 14px; height: 14px; cursor: pointer; accent-color: #58a6ff; }
 #sel-count { font-size: 12px; color: #8b949e; margin-left: 8px; }
+.gist-cell { color: #c9d1d9; max-width: 240px; }
+.tag-badge { display: inline-block; padding: 1px 6px; border-radius: 10px; font-size: 10px; margin: 1px 2px 1px 0; background: #30363d; color: #c9d1d9; border: 1px solid #484f58; white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -86,9 +88,15 @@ tr:hover td { background: #161b22; }
     <option value="reading">reading</option>
   </select>
   <input type="text" id="filter-conv" placeholder="conversation_id" size="24">
+  <select id="filter-tag">
+    <option value="">All tags</option>
+  </select>
   <button onclick="loadBlocks()">Refresh</button>
   <button class="btn-danger" id="btn-delete" onclick="deleteSelected()" disabled>Delete Selected <span id="sel-count"></span></button>
   <button class="btn-danger" onclick="runJudge()">Run Judge Pass</button>
+  <button onclick="exportBlocks()">Export</button>
+  <input type="file" id="import-file" accept="application/json" style="display:none">
+  <button onclick="document.getElementById('import-file').click()">Import</button>
 </div>
 
 <div style="overflow-x: auto;">
@@ -99,6 +107,8 @@ tr:hover td { background: #161b22; }
   <th>type</th>
   <th>status</th>
   <th>verification</th>
+  <th>gist</th>
+  <th>tags</th>
   <th>tokens</th>
   <th>recalls</th>
   <th>created</th>
@@ -221,10 +231,12 @@ async function loadBlocks() {
   const status = document.getElementById('filter-status').value;
   const type = document.getElementById('filter-type').value;
   const conv = document.getElementById('filter-conv').value;
+  const tag = document.getElementById('filter-tag').value;
   const params = new URLSearchParams({ limit: 100 });
   if (status) params.set('status', status);
   if (type) params.set('type_', type);
   if (conv) params.set('conversation_id', conv);
+  if (tag) params.set('tag', tag);
 
   try {
     const r = await fetch(API + '/admin/blocks?' + params);
@@ -235,12 +247,15 @@ async function loadBlocks() {
     for (const b of data.items || []) {
       const created = new Date(b.created_at * 1000);
       const checked = selected.has(b.block_id) ? 'checked' : '';
+      const tags = (b.tags || []).map(t => `<span class="tag-badge">${t}</span>`).join('');
       tbody.innerHTML += `<tr>
         <td class="chk-cell"><input type="checkbox" class="chk" data-id="${b.block_id}" ${checked}></td>
         <td title="${b.block_id}">${b.block_id}</td>
         <td>${b.type}</td>
         <td><span class="badge badge-${b.status}">${b.status}</span></td>
         <td class="verification-${b.verification}">${b.verification}</td>
+        <td class="gist-cell" title="${b.gist || ''}">${b.gist || ''}</td>
+        <td>${tags}</td>
         <td>${b.token_count}</td>
         <td>${b.recall_count}</td>
         <td title="${created.toISOString()}">${created.toLocaleString()}</td>
@@ -250,12 +265,79 @@ async function loadBlocks() {
     }
 
     if (!data.items?.length) {
-      tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:#484f58;padding:24px;">No blocks found</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;color:#484f58;padding:24px;">No blocks found</td></tr>';
     }
   } catch (e) {
-    document.getElementById('blocks-tbody').innerHTML = `<tr><td colspan="9" style="color:#f85149">Error: ${e.message}</td></tr>`;
+    document.getElementById('blocks-tbody').innerHTML = `<tr><td colspan="11" style="color:#f85149">Error: ${e.message}</td></tr>`;
+  }
+  loadTagFilter();
+}
+
+async function loadTagFilter() {
+  try {
+    const r = await fetch(API + '/admin/tags');
+    const data = await r.json();
+    const sel = document.getElementById('filter-tag');
+    const current = sel.value;
+    sel.innerHTML = '<option value="">All tags</option>';
+    const groups = data.groups || { tags: data.taxonomy || [] };
+    for (const [group, tags] of Object.entries(groups)) {
+      let optionsHtml = '';
+      for (const t of tags) {
+        const n = (data.counts || {})[t] || 0;
+        optionsHtml += `<option value="${t}">${t}${n ? ' (' + n + ')' : ''}</option>`;
+      }
+      sel.innerHTML += `<optgroup label="${group}">${optionsHtml}</optgroup>`;
+    }
+    sel.value = current;
+  } catch (e) {
+    // non-fatal: tag filter just stays empty
   }
 }
+
+async function exportBlocks() {
+  const status = document.getElementById('filter-status').value;
+  const type = document.getElementById('filter-type').value;
+  const tag = document.getElementById('filter-tag').value;
+  const params = new URLSearchParams({ limit: 1000 });
+  if (status) params.set('status', status);
+  if (type) params.set('type_', type);
+  if (tag) params.set('tag', tag);
+  try {
+    const r = await fetch(API + '/admin/export?' + params);
+    const data = await r.json();
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `cued_recall_export_${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    alert('Export error: ' + e.message);
+  }
+}
+
+document.getElementById('import-file').addEventListener('change', async function(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const data = JSON.parse(text);
+    const r = await fetch(API + '/admin/import', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(data),
+    });
+    const result = await r.json();
+    alert(`Imported ${result.imported || 0} block(s), skipped ${result.skipped || 0}`);
+    loadBlocks();
+  } catch (e) {
+    alert('Import error: ' + e.message);
+  } finally {
+    e.target.value = '';
+  }
+});
 
 async function runJudge() {
   if (!confirm('Force a judge pass? This may take a while.')) return;
@@ -277,6 +359,7 @@ async function refresh() {
 
 document.getElementById('filter-status').addEventListener('change', loadBlocks);
 document.getElementById('filter-type').addEventListener('change', loadBlocks);
+document.getElementById('filter-tag').addEventListener('change', loadBlocks);
 
 document.getElementById('sel-all').addEventListener('change', function() {
   const boxes = document.querySelectorAll('#blocks-tbody .chk');

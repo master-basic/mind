@@ -1,3 +1,4 @@
+import shutil
 from pathlib import Path
 from typing import List
 import yaml
@@ -16,6 +17,16 @@ class JudgeConfig:
         self.min_age_s: int = d.get("min_age_s", 3600)
         self.purge_age_s: int = d.get("purge_age_s", 1209600)
         self.summary_max_tokens: int = d.get("summary_max_tokens", 400)
+
+
+class TaggerConfig:
+    def __init__(self, d: dict):
+        self.enabled: bool = d.get("enabled", True)
+        # Empty = reuse judge_endpoint (tagging is a cheap call, doesn't
+        # need its own model unless you want to split the load).
+        self.endpoint: str = d.get("endpoint", "")
+        self.max_tags: int = d.get("max_tags", 3)
+        self.gist_max_chars: int = d.get("gist_max_chars", 40)
 
 
 class WebSearchConfig:
@@ -50,6 +61,19 @@ class ServerConfig:
 
 class Config:
     def __init__(self, path: str | Path = "config.yaml"):
+        path = Path(path)
+        if not path.exists():
+            # config.yaml is gitignored (it holds a machine-specific
+            # store_path/snapshot_path); a fresh clone only has the generic
+            # template. Bootstrap from it rather than a bare FileNotFoundError.
+            example = path.parent / "config.example.yaml"
+            if example.exists():
+                shutil.copy2(example, path)
+            else:
+                raise FileNotFoundError(
+                    f"{path} not found and no config.example.yaml template at {example}. "
+                    "Run via run.py, or copy config.example.yaml to config.yaml yourself."
+                )
         with open(path, encoding="utf-8") as f:
             raw = yaml.safe_load(f)
 
@@ -62,9 +86,16 @@ class Config:
         self.snapshot_path: str = raw.get("snapshot_path", "/var/lib/cued_recall/snapshots")
         self.snapshot_interval_min: int = raw.get("snapshot_interval_min", 15)
         self.block_tokens_reasoning: int = raw.get("block_tokens_reasoning", 8000)
+        # A conversation left with no follow-up would otherwise stay 'hot'
+        # (unrecallable) forever; this is how long to wait before treating it
+        # as abandoned and shelving it anyway. Shelving is idempotent, so a
+        # short value is safe -- a real follow-up a moment later just re-marks
+        # already-shelved blocks, no conflict.
+        self.hot_shelve_timeout_s: int = raw.get("hot_shelve_timeout_s", 15)
         self.embed_dim: int = raw.get("embed_dim", 768)
         self.recall = RecallConfig(raw.get("recall", {}))
         self.judge = JudgeConfig(raw.get("judge", {}))
+        self.tagger = TaggerConfig(raw.get("tagger", {}))
         self.correction_patterns: List[str] = raw.get("correction_patterns", [
             "that's wrong", "doesn't work", "^no[,.]", "səhvdir", "işləmir",
         ])
