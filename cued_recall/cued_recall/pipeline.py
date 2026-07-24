@@ -309,32 +309,75 @@ class Pipeline:
 
     # ---- Web search -------------------------------------------------------
 
+    def _backend_usable(self, name: str) -> bool:
+        ws = self.config.web_search
+        if name == "searxng":
+            return bool(ws.searxng_url)
+        if name in ("brave", "serper"):
+            return bool(ws.key_for(name))
+        return name == "duckduckgo"  # needs no credentials
+
+    def _search_chain(self) -> List[str]:
+        """Backends to try in order: the configured one, then any others.
+
+        DuckDuckGo is throttled unpredictably, so a configured paid backend
+        should be able to cover for it and vice versa rather than letting one
+        bad response become "no results".
+        """
+        ws = self.config.web_search
+        chain = []
+        chosen = (ws.backend or "duckduckgo").lower()
+        if self._backend_usable(chosen):
+            chain.append(chosen)
+        if ws.fallback:
+            for name in ("brave", "serper", "searxng", "duckduckgo"):
+                if name not in chain and self._backend_usable(name):
+                    chain.append(name)
+        return chain or ["duckduckgo"]
+
+    async def _run_backend(self, name: str, query: str, n: int) -> Tuple[list, bool]:
+        """Returns (results, blocked)."""
+        if name == "searxng":
+            return await self._search_searxng(query, n), False
+        if name == "brave":
+            return await self._search_brave(query, n), False
+        if name == "serper":
+            return await self._search_serper(query, n), False
+        return await self._search_duckduckgo_checked(query, n)
+
     async def _web_search(self, query: str) -> str:
         ws = self.config.web_search
         n = max(1, ws.max_results)
-        backend = (ws.backend or "duckduckgo").lower()
+        results: list = []
         blocked = False
-        if backend == "searxng" and ws.searxng_url:
-            results = await self._search_searxng(query, n)
-        elif backend == "brave" and ws.api_key:
-            results = await self._search_brave(query, n)
-        elif backend == "serper" and ws.api_key:
-            results = await self._search_serper(query, n)
-        else:
-            results, blocked = await self._search_duckduckgo_checked(query, n)
-        if blocked:
+        for name in self._search_chain():
+            try:
+                results, blocked = await self._run_backend(name, query, n)
+            except Exception as e:
+                self.wal.write({
+                    "event": "web_search_error",
+                    "backend": name,
+                    "error": str(e),
+                    "timestamp": time.time(),
+                }) if self.wal else None
+                results, blocked = [], True
+                continue
+            if results:
+                break
+        if blocked and not results:
             # Distinguish "the engine refused us" from "nothing matched". A
             # bland "no results" reads to the model as bad luck, so it retries
             # the same dead backend until it burns every tool round -- which is
             # exactly what an anti-bot block looks like from the inside.
+            tried = ", ".join(self._search_chain())
             return (
-                "web_search is UNAVAILABLE: the DuckDuckGo backend is being "
-                "blocked by anti-bot protection, so no query can succeed right "
-                "now. Do NOT retry this tool or rephrase the query -- the "
-                "result will be identical. Either answer from your own "
-                "knowledge and say the information may be out of date, or ask "
-                "the user to configure a working search backend (searxng, "
-                "brave, or serper) under web_search in config.yaml."
+                f"web_search is UNAVAILABLE: every configured backend ({tried}) "
+                "failed or was refused, so no query can succeed right now. Do "
+                "NOT retry this tool or rephrase the query -- the result will "
+                "be identical. Either answer from your own knowledge and say "
+                "the information may be out of date, or ask the user to "
+                "configure a working search backend (brave, serper, or "
+                "searxng) under web_search in config.yaml."
             )
         if not results:
             return f"No search results for: {query}"
@@ -451,15 +494,22 @@ class Pipeline:
         async with httpx.AsyncClient(timeout=20) as client:
             resp = await client.get(
                 "https://api.search.brave.com/res/v1/web/search",
-                params={"q": query, "count": n},
-                headers={"X-Subscription-Token": self.config.web_search.api_key,
-                         "Accept": "application/json"},
+                # Brave caps count at 20 and rejects larger values outright.
+                params={"q": query, "count": min(max(n, 1), 20)},
+                headers={
+                    "X-Subscription-Token": self.config.web_search.key_for("brave"),
+                    "Accept": "application/json",
+                    # Brave's API documents gzip as required.
+                    "Accept-Encoding": "gzip",
+                },
             )
             resp.raise_for_status()
             data = resp.json()
         return [
-            {"title": r.get("title", ""), "url": r.get("url", ""),
-             "snippet": r.get("description", "")}
+            # Titles and descriptions come back with <strong> highlight markup.
+            {"title": self._strip_html(r.get("title", "")),
+             "url": r.get("url", ""),
+             "snippet": self._strip_html(r.get("description", ""))}
             for r in ((data.get("web") or {}).get("results") or [])[:n]
         ]
 
@@ -468,7 +518,7 @@ class Pipeline:
             resp = await client.post(
                 "https://google.serper.dev/search",
                 json={"q": query, "num": n},
-                headers={"X-API-KEY": self.config.web_search.api_key,
+                headers={"X-API-KEY": self.config.web_search.key_for("serper"),
                          "Content-Type": "application/json"},
             )
             resp.raise_for_status()

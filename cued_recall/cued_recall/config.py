@@ -35,7 +35,15 @@ class WebSearchConfig:
         # backend: "duckduckgo" (no key), "searxng", "brave", "serper"
         self.backend: str = d.get("backend", "duckduckgo")
         self.searxng_url: str = d.get("searxng_url", "")
+        # Legacy single key: applied to whichever backend is selected.
         self.api_key: str = d.get("api_key", "")
+        # Per-provider keys, so more than one paid backend can be configured
+        # at once and used as fallbacks for each other.
+        self.brave_api_key: str = d.get("brave_api_key", "")
+        self.serper_api_key: str = d.get("serper_api_key", "")
+        # Try other configured backends when the chosen one fails or is
+        # throttled, instead of reporting "no results" to the model.
+        self.fallback: bool = d.get("fallback", True)
         self.max_results: int = d.get("max_results", 5)
         self.fetch_top_n: int = d.get("fetch_top_n", 0)
         # Hard rule: if the user message matches any of these patterns, force
@@ -50,6 +58,15 @@ class WebSearchConfig:
             # Azerbaijani
             r"\baxtar", r"\bson (xəbər|məlumat)", r"\bhal-?hazırda\b",
         ])
+
+    def key_for(self, backend: str) -> str:
+        specific = {"brave": self.brave_api_key,
+                    "serper": self.serper_api_key}.get(backend, "")
+        if specific:
+            return specific
+        # Fall back to the shared key only for the explicitly chosen backend,
+        # so a Brave key is never sent to Serper or vice versa.
+        return self.api_key if (self.backend or "").lower() == backend else ""
 
 
 class ServerConfig:

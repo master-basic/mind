@@ -41,6 +41,19 @@ tagger:
   endpoint: ""
   max_tags: 3
   gist_max_chars: 40
+web_search:
+  enabled: true
+  # duckduckgo needs no key but is rate-limited unpredictably. Set a
+  # brave_api_key below and switch backend to "brave" for reliable search.
+  backend: duckduckgo
+  # Get a key at https://brave.com/search/api/ (free tier available).
+  brave_api_key: ''
+  serper_api_key: ''
+  searxng_url: ''
+  # If the chosen backend fails or is throttled, try the others that are
+  # configured rather than reporting "no results".
+  fallback: true
+  max_results: 5
 correction_patterns:
 - that's wrong
 - doesn't work
