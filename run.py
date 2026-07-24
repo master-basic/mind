@@ -52,12 +52,15 @@ MODEL_MANIFEST = [
 ]
 
 # --metrics exposes /metrics (incl. kv_cache_usage_ratio) for the admin panel.
+# --jinja applies the model's tool-calling chat template; without it llama.cpp
+# ignores the `tools` parameter and never emits tool_calls (web_search/web_fetch
+# would be dead).
 # Placement (tuned for a 12 GB GPU):
 #   reasoning: weights + 32K KV cache on GPU (no --no-kv-offload) -> fastest.
 #   judge:     fully on CPU (-ngl 0) to free VRAM for the reasoning KV.
 #   embed:     weights on GPU, KV/context in RAM (--no-kv-offload).
 SERVER_DEFAULTS = {
-    "reasoning": {"port": 8080, "extra": ["--ctx-size", "32768", "--n-gpu-layers", "99", "--metrics"]},
+    "reasoning": {"port": 8080, "extra": ["--ctx-size", "32768", "--n-gpu-layers", "99", "--metrics", "--jinja"]},
     "judge":     {"port": 8081, "extra": ["--ctx-size", "8192", "--n-gpu-layers", "0", "--metrics"]},
     # Embeddings need the whole sequence in one micro-batch; the default
     # --ubatch-size (512) makes any input over ~512 tokens 500. Match batch

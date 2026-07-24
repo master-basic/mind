@@ -1,7 +1,9 @@
 import asyncio
 import html as html_lib
+import ipaddress
 import json
 import re
+import socket
 import time
 import uuid
 from typing import AsyncIterator, List, Optional, Tuple
@@ -9,6 +11,39 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 import numpy as np
+
+
+def url_block_reason(url: str) -> Optional[str]:
+    """Return a reason string if a URL should not be fetched (SSRF guard).
+
+    Blocks non-http(s) schemes and any host that resolves to a loopback,
+    private, link-local, reserved, or otherwise internal address — so a model
+    (or prompt injection from a fetched page) can't make the middleware hit
+    internal services like the llama-servers or cloud metadata endpoints.
+    """
+    try:
+        p = urlparse(url)
+    except Exception:
+        return "invalid URL"
+    if p.scheme not in ("http", "https"):
+        return f"scheme '{p.scheme}' not allowed"
+    host = p.hostname
+    if not host:
+        return "missing host"
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return None  # unresolvable — let the HTTP client fail normally
+    for info in infos:
+        ip = info[4][0]
+        try:
+            addr = ipaddress.ip_address(ip.split("%")[0])
+        except ValueError:
+            continue
+        if (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+            return f"blocked internal address ({ip})"
+    return None
 
 from .config import Config
 from .embed import EmbeddingClient
@@ -99,6 +134,8 @@ class Pipeline:
         """
         def _msg_tokens(m):
             c = m.get("content", "")
+            if c is None:  # assistant tool-call messages carry content=None
+                return 0
             if isinstance(c, list):
                 c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
             return len(c.split())
@@ -126,7 +163,7 @@ class Pipeline:
         # If still over, truncate the last user message
         if total > limit and result:
             last = result[-1]
-            c = last.get("content", "")
+            c = last.get("content", "") or ""
             if isinstance(c, list):
                 c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
             words = c.split()
@@ -136,6 +173,12 @@ class Pipeline:
                 result[-1] = _set_content(last, truncated)
             else:
                 result[-1] = _set_content(last, "")
+
+        # Trimming can orphan a `tool` result whose preceding assistant
+        # tool_calls message was dropped, which llama.cpp rejects. Drop any
+        # leading tool messages left just after the system prompt.
+        while len(result) > 1 and result[1].get("role") == "tool":
+            result.pop(1)
         return result
 
     @staticmethod
@@ -223,7 +266,19 @@ class Pipeline:
         return str(content or "")
 
     @staticmethod
+    def _html_to_text(raw: str) -> str:
+        raw = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", raw)
+        text = re.sub(r"(?s)<[^>]+>", " ", raw)
+        text = html_lib.unescape(text)
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n[ \t]*\n[ \t]*\n+", "\n\n", text)
+        return text.strip()
+
+    @staticmethod
     async def _fetch_url(url: str) -> str:
+        reason = await asyncio.to_thread(url_block_reason, url)
+        if reason:
+            return f"Refused to fetch {url}: {reason}"
         async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
             resp = await client.get(
                 url,
@@ -233,14 +288,141 @@ class Pipeline:
             ct = resp.headers.get("content-type", "")
             if "json" in ct:
                 return json.dumps(resp.json(), indent=2)[:8000]
-            text = resp.text[:20000]
-            return text
+            resp.encoding = resp.encoding or "utf-8"
+            if "html" in ct:
+                return Pipeline._html_to_text(resp.text)[:20000]
+            return resp.text[:20000]
+
+    # ---- Web search -------------------------------------------------------
+
+    async def _web_search(self, query: str) -> str:
+        ws = self.config.web_search
+        n = max(1, ws.max_results)
+        backend = (ws.backend or "duckduckgo").lower()
+        if backend == "searxng" and ws.searxng_url:
+            results = await self._search_searxng(query, n)
+        elif backend == "brave" and ws.api_key:
+            results = await self._search_brave(query, n)
+        elif backend == "serper" and ws.api_key:
+            results = await self._search_serper(query, n)
+        else:
+            results = await self._search_duckduckgo(query, n)
+        if not results:
+            return f"No search results for: {query}"
+        lines = [f"Search results for '{query}':", ""]
+        for i, r in enumerate(results, 1):
+            lines.append(f"{i}. {r['title']}")
+            lines.append(f"   URL: {r['url']}")
+            if r.get("snippet"):
+                lines.append(f"   {r['snippet']}")
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _strip_html(s: str) -> str:
+        s = re.sub(r"<[^>]+>", "", s or "")
+        return html_lib.unescape(s).strip()
+
+    @staticmethod
+    def _ddg_unwrap(href: str) -> str:
+        # DuckDuckGo wraps result URLs as //duckduckgo.com/l/?uddg=<encoded>
+        if href.startswith("//"):
+            href = "https:" + href
+        try:
+            qs = parse_qs(urlparse(href).query)
+            if "uddg" in qs:
+                return unquote(qs["uddg"][0])
+        except Exception:
+            pass
+        return href
+
+    async def _search_duckduckgo(self, query: str, n: int) -> list:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0 Safari/537.36"
+            ),
+        }
+        async with httpx.AsyncClient(follow_redirects=True, timeout=20) as client:
+            resp = await client.post(
+                "https://html.duckduckgo.com/html/",
+                data={"q": query, "kl": "us-en"},
+                headers=headers,
+            )
+            resp.raise_for_status()
+            resp.encoding = "utf-8"  # DDG serves UTF-8; avoid mojibake in titles
+            html = resp.text
+        link_re = re.compile(
+            r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.DOTALL)
+        snip_re = re.compile(
+            r'<a[^>]*class="result__snippet"[^>]*>(.*?)</a>', re.DOTALL)
+        links = link_re.findall(html)
+        snippets = snip_re.findall(html)
+        results = []
+        for i, (href, title) in enumerate(links[:n]):
+            results.append({
+                "title": self._strip_html(title),
+                "url": self._ddg_unwrap(href),
+                "snippet": self._strip_html(snippets[i]) if i < len(snippets) else "",
+            })
+        return results
+
+    async def _search_searxng(self, query: str, n: int) -> list:
+        base = self.config.web_search.searxng_url.rstrip("/")
+        async with httpx.AsyncClient(follow_redirects=True, timeout=20) as client:
+            resp = await client.get(base + "/search",
+                                    params={"q": query, "format": "json"})
+            resp.raise_for_status()
+            data = resp.json()
+        return [
+            {"title": r.get("title", ""), "url": r.get("url", ""),
+             "snippet": r.get("content", "")}
+            for r in (data.get("results") or [])[:n]
+        ]
+
+    async def _search_brave(self, query: str, n: int) -> list:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.get(
+                "https://api.search.brave.com/res/v1/web/search",
+                params={"q": query, "count": n},
+                headers={"X-Subscription-Token": self.config.web_search.api_key,
+                         "Accept": "application/json"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        return [
+            {"title": r.get("title", ""), "url": r.get("url", ""),
+             "snippet": r.get("description", "")}
+            for r in ((data.get("web") or {}).get("results") or [])[:n]
+        ]
+
+    async def _search_serper(self, query: str, n: int) -> list:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(
+                "https://google.serper.dev/search",
+                json={"q": query, "num": n},
+                headers={"X-API-KEY": self.config.web_search.api_key,
+                         "Content-Type": "application/json"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        return [
+            {"title": r.get("title", ""), "url": r.get("link", ""),
+             "snippet": r.get("snippet", "")}
+            for r in (data.get("organic") or [])[:n]
+        ]
+
+    # ---- Tool plumbing ----------------------------------------------------
 
     def _inject_tools(self, body: dict) -> dict:
         tools = body.get("tools") or []
         existing_names = {t.get("function", {}).get("name") for t in tools if t.get("type") == "function"}
         if "web_fetch" not in existing_names:
             tools.append(WEB_FETCH_TOOL)
+        ws = getattr(self.config, "web_search", None)
+        if ws and ws.enabled and "web_search" not in existing_names:
+            tools.append(WEB_SEARCH_TOOL)
         return {**body, "tools": tools}
 
     async def _handle_tool_calls(self, messages: list, tool_calls: list) -> list:
@@ -250,19 +432,22 @@ class Pipeline:
         for tc in tool_calls:
             fn = tc.get("function", {})
             name = fn.get("name", "")
-            if name != "web_fetch":
-                results.append({"tool_call_id": tc["id"], "role": "tool", "content": f"Unknown tool: {name}"})
-                continue
             try:
-                args = json.loads(fn.get("arguments", "{}"))
-                url = args.get("url", "")
-                if not url:
-                    results.append({"tool_call_id": tc["id"], "role": "tool", "content": "No URL provided"})
-                    continue
-                content = await self._fetch_url(url)
-                results.append({"tool_call_id": tc["id"], "role": "tool", "content": content[:8000]})
+                args = json.loads(fn.get("arguments", "{}") or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            try:
+                if name == "web_fetch":
+                    url = args.get("url", "")
+                    content = "No URL provided" if not url else (await self._fetch_url(url))[:8000]
+                elif name == "web_search":
+                    query = args.get("query", "")
+                    content = "No query provided" if not query else await self._web_search(query)
+                else:
+                    content = f"Unknown tool: {name}"
             except Exception as e:
-                results.append({"tool_call_id": tc["id"], "role": "tool", "content": f"Fetch error: {e}"})
+                content = f"{name} error: {e}"
+            results.append({"tool_call_id": tc.get("id"), "role": "tool", "content": content})
         return results
 
     def read_messages_from_body(self, body: dict) -> list:
@@ -441,117 +626,97 @@ class Pipeline:
         reasoning_content_parts: List[str] = []
         t0 = time.time()
         token_count = 0
+        MAX_TOOL_ROUNDS = 5
 
-        # Tool-call detection state for streaming
-        tool_calls_by_index = {}  # index -> {id, name, arguments}
-        finish_reason = None
-
+        # Multi-round tool loop: stream each model turn to the client; if it
+        # requests tools, run them, append the results, and stream the next
+        # turn — so chains like web_search -> web_fetch -> answer complete
+        # (the old code did a single non-streaming follow-up and stopped).
+        messages = list(augmented_messages)
         async with httpx.AsyncClient() as client:
-            payload = {
-                **body, "messages": self._fit_messages(augmented_messages), "stream": True,
-                "stream_options": {"include_usage": True},
-            }
-            async with client.stream(
-                "POST",
-                f"{self.config.reasoning_endpoint}/v1/chat/completions",
-                json=payload,
-                timeout=300,
-            ) as resp:
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    data_str = line[6:]
-                    if data_str.strip() == "[DONE]":
-                        continue
-                    try:
-                        data = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
-                    if data.get("usage"):
-                        self._report_usage(data["usage"])
-                    choices = data.get("choices") or []
-                    delta_obj = choices[0].get("delta", {}) if choices else {}
-                    fr = choices[0].get("finish_reason") if choices else None
-                    if fr:
-                        finish_reason = fr
-
-                    # Collect streaming tool_calls
-                    delta_tool_calls = delta_obj.get("tool_calls")
-                    if delta_tool_calls:
-                        for tc in delta_tool_calls:
-                            idx = tc.get("index", 0)
-                            if idx not in tool_calls_by_index:
-                                tool_calls_by_index[idx] = {"id": "", "name": "", "arguments": ""}
-                            entry = tool_calls_by_index[idx]
-                            if tc.get("id"):
-                                entry["id"] = tc["id"]
-                            fn = tc.get("function", {})
-                            if fn.get("name"):
-                                entry["name"] = fn["name"]
-                            if fn.get("arguments"):
-                                entry["arguments"] += fn["arguments"]
-                        continue  # don't yield tool_call chunks to client
-
-                    rc = delta_obj.get("reasoning_content")
-                    if rc:
-                        reasoning_content_parts.append(rc)
-                    delta = delta_obj.get("content", "")
-                    if not delta:
-                        continue
-                    response_text += delta
-                    token_count += len(delta.split())
-                    splitter.feed(delta)
-                    # Yield content to client as we get it
-                    yield f"data: {json.dumps({'choices': [{'delta': {'content': delta}}]})}\n\n".encode()
-
-                splitter.flush()
-
-        # If LLM called a tool, execute it and continue
-        if tool_calls_by_index:
-            tool_results = await self._handle_tool_calls(
-                augmented_messages,
-                [{"id": tc["id"], "function": {"name": tc["name"], "arguments": tc["arguments"]}}
-                 for tc in tool_calls_by_index.values()]
-            )
-            # Build follow-up messages
-            assistant_msg = {"role": "assistant", "content": response_text or None, "tool_calls": [
-                {"id": tc["id"], "type": "function", "function": {"name": tc["name"], "arguments": tc["arguments"]}}
-                for tc in tool_calls_by_index.values()
-            ]}
-            follow_messages = augmented_messages + [assistant_msg] + tool_results
-
-            # Send follow-up as non-streaming (tool results are typically short)
-            t1 = time.time()
-            async with httpx.AsyncClient() as client:
-                payload = {**body, "messages": self._fit_messages(follow_messages), "stream": False}
-                follow_resp = await client.post(
+            for _round in range(MAX_TOOL_ROUNDS):
+                tool_calls_by_index = {}
+                round_content = ""
+                payload = {
+                    **body, "messages": self._fit_messages(messages), "stream": True,
+                    "stream_options": {"include_usage": True},
+                }
+                async with client.stream(
+                    "POST",
                     f"{self.config.reasoning_endpoint}/v1/chat/completions",
                     json=payload,
                     timeout=300,
+                ) as resp:
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        if data_str.strip() == "[DONE]":
+                            continue
+                        try:
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+                        if data.get("usage"):
+                            self._report_usage(data["usage"])
+                        choices = data.get("choices") or []
+                        delta_obj = choices[0].get("delta", {}) if choices else {}
+
+                        delta_tool_calls = delta_obj.get("tool_calls")
+                        if delta_tool_calls:
+                            for tc in delta_tool_calls:
+                                idx = tc.get("index", 0)
+                                entry = tool_calls_by_index.setdefault(
+                                    idx, {"id": "", "name": "", "arguments": ""})
+                                if tc.get("id"):
+                                    entry["id"] = tc["id"]
+                                fn = tc.get("function", {})
+                                if fn.get("name"):
+                                    entry["name"] = fn["name"]
+                                if fn.get("arguments"):
+                                    entry["arguments"] += fn["arguments"]
+                            continue  # tool_call chunks aren't shown to the client
+
+                        rc = delta_obj.get("reasoning_content")
+                        if rc:
+                            reasoning_content_parts.append(rc)
+                            yield f"data: {json.dumps({'choices': [{'delta': {'reasoning_content': rc}}]})}\n\n".encode()
+                        delta = delta_obj.get("content", "")
+                        if not delta:
+                            continue
+                        response_text += delta
+                        round_content += delta
+                        token_count += len(delta.split())
+                        splitter.feed(delta)
+                        yield f"data: {json.dumps({'choices': [{'delta': {'content': delta}}]})}\n\n".encode()
+
+                # No tools requested -> this was the final answer.
+                if not tool_calls_by_index:
+                    break
+
+                calls = list(tool_calls_by_index.values())
+                names = ", ".join(c["name"] for c in calls if c["name"]) or "tool"
+                # Surface activity in the Reasoning panel (not stored as a block).
+                note = f"\n[running {names}…]\n"
+                yield f"data: {json.dumps({'choices': [{'delta': {'reasoning_content': note}}]})}\n\n".encode()
+
+                tool_results = await self._handle_tool_calls(
+                    messages,
+                    [{"id": c["id"], "function": {"name": c["name"], "arguments": c["arguments"]}}
+                     for c in calls],
                 )
-                follow_resp.raise_for_status()
-                follow_result = follow_resp.json()
-            elapsed2 = time.time() - t1
-            self._report_usage(follow_result.get("usage") or {})
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": round_content or None,
+                    "tool_calls": [
+                        {"id": c["id"], "type": "function",
+                         "function": {"name": c["name"], "arguments": c["arguments"]}}
+                        for c in calls
+                    ],
+                }
+                messages = messages + [assistant_msg] + tool_results
 
-            follow_message = follow_result.get("choices", [{}])[0].get("message", {})
-            follow_content = follow_message.get("content", "") or ""
-            follow_reasoning = follow_message.get("reasoning_content", "") or ""
-
-            # Yield follow-up content to client
-            if follow_content:
-                yield f"data: {json.dumps({'choices': [{'delta': {'content': follow_content}}]})}\n\n".encode()
-                response_text += follow_content
-                token_count += len(follow_content.split())
-
-            # Merge reasoning
-            if follow_reasoning:
-                reasoning_content_parts.append(follow_reasoning)
-
-            splitter2 = self.ThinkSplitter(self.think_open, self.think_close)
-            splitter2.feed(follow_content)
-            splitter2.flush()
-            splitter.result_parts.extend(splitter2.result_parts)
+        splitter.flush()
 
         # Yield [DONE]
         yield b"data: [DONE]\n\n"

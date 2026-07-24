@@ -122,23 +122,13 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
 
     @app.post("/v1/fetch")
     async def fetch_url(body: dict):
-        import httpx as _httpx
         url = body.get("url", "")
         if not url:
             return JSONResponse(content={"error": "No url provided"}, status_code=400)
         try:
-            async with _httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
-                resp = await client.get(
-                    url,
-                    headers={"User-Agent": "CuedRecall/1.0 web-fetch-tool"},
-                )
-                resp.raise_for_status()
-                ct = resp.headers.get("content-type", "")
-                if "json" in ct:
-                    content = json.dumps(resp.json(), indent=2)[:20000]
-                else:
-                    content = resp.text[:20000]
-                return JSONResponse(content={"url": url, "content": content})
+            # Reuse the pipeline fetch (SSRF guard + HTML->text applied there).
+            content = await pipeline._fetch_url(url)
+            return JSONResponse(content={"url": url, "content": content})
         except Exception as e:
             return JSONResponse(content={"error": str(e)}, status_code=500)
 
