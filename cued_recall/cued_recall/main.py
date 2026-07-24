@@ -12,6 +12,7 @@ from .config import Config
 from .embed import EmbeddingClient
 from .index import VectorIndex
 from .judge import Judge
+from .models import BlockStatus
 from .pipeline import Pipeline
 from .router import build_admin_router
 from .store import BlockStore
@@ -108,6 +109,13 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
         if snapshot.exists() and not any(store.blocks_dir.iterdir()):
             store.restore(snapshot)
             index.restore(snapshot)
+
+        # Shelve any 'hot' blocks left over from previous sessions so they
+        # become recallable. The per-turn logic only shelves a turn when the
+        # NEXT turn arrives, so the last turn of a session (and everything
+        # from a crashed/killed run) would otherwise stay hot forever and
+        # never surface in recall.
+        await asyncio.to_thread(_shelve_leftover_hot, store, index, wal)
 
         async def snapshot_loop():
             interval = cfg.snapshot_interval_min * 60
@@ -220,6 +228,34 @@ def _detect_embed_dim(embed: EmbeddingClient, cfg: Config) -> int:
         except Exception:
             time.sleep(1)
     return fallback
+
+
+def _shelve_leftover_hot(store: BlockStore, index: VectorIndex, wal: WAL):
+    """Promote leftover 'hot' blocks to 'shelved' at startup.
+
+    Recall only searches shelved/truncated blocks, and the per-turn shelving
+    only fires when a later turn arrives in the same conversation. So the last
+    turn before shutdown -- and anything from an unclean stop -- must be shelved
+    here, or it can never be recalled in a future session.
+    """
+    items, _ = index.list_meta(status="hot", limit=1_000_000)
+    count = 0
+    for m in items:
+        bid = m.get("block_id")
+        if not bid:
+            continue
+        index.update_status(bid, BlockStatus.shelved.value)
+        block = store.get(bid)
+        if block:
+            block.status = BlockStatus.shelved
+            store.put(block)
+        count += 1
+    if count:
+        wal.write({
+            "event": "startup_shelve",
+            "count": count,
+            "timestamp": time.time(),
+        })
 
 
 def _take_snapshot(store: BlockStore, index: VectorIndex, snapshot_path: Path):
