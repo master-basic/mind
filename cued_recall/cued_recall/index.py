@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import threading
 from pathlib import Path
@@ -40,6 +41,16 @@ class VectorIndex:
                 last_recalled REAL
             )
         """)
+        # If an existing block_vec was created with a different dimension,
+        # drop it: a dim change invalidates stored vectors, and keeping the
+        # old table makes every upsert/query raise a dim-mismatch error.
+        row = c.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='block_vec'"
+        ).fetchone()
+        if row and row[0]:
+            m = re.search(r"float\[(\d+)\]", row[0])
+            if m and int(m.group(1)) != self.dim:
+                c.execute("DROP TABLE block_vec")
         c.execute(f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS block_vec USING vec0(
                 block_id TEXT PRIMARY KEY,

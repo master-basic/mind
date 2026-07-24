@@ -31,10 +31,14 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
     wal.open()
 
     store = BlockStore(store_path)
-    index = VectorIndex(store_path)
-    index.open()
-
     embed = EmbeddingClient(cfg.embed_endpoint)
+
+    # The vector index dimension MUST match the embedding model's output
+    # (e.g. nomic-embed-text-v1.5 = 768). A mismatch makes every upsert/query
+    # raise and the whole chat path 500s. Detect it live from the embed server.
+    embed_dim = _detect_embed_dim(embed, cfg)
+    index = VectorIndex(store_path, dim=embed_dim)
+    index.open()
 
     pipeline = Pipeline(cfg, store, index, embed, wal)
     judge = Judge(cfg, store, index, wal)
@@ -189,6 +193,23 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
         return JSONResponse(content=result)
 
     return app
+
+
+def _detect_embed_dim(embed: EmbeddingClient, cfg: Config) -> int:
+    """Probe the embedding server for its output dimension.
+
+    Retries briefly in case the embed server is still warming up, then falls
+    back to the configured embed_dim (default 768 for nomic-embed-text-v1.5).
+    """
+    fallback = getattr(cfg, "embed_dim", 768) or 768
+    for attempt in range(15):
+        try:
+            vec = embed.embed("dimension probe")
+            if vec:
+                return len(vec)
+        except Exception:
+            time.sleep(1)
+    return fallback
 
 
 def _take_snapshot(store: BlockStore, index: VectorIndex, snapshot_path: Path):

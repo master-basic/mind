@@ -39,6 +39,7 @@ class Config:
         self.snapshot_path: str = raw.get("snapshot_path", "/var/lib/cued_recall/snapshots")
         self.snapshot_interval_min: int = raw.get("snapshot_interval_min", 15)
         self.block_tokens_reasoning: int = raw.get("block_tokens_reasoning", 8000)
+        self.embed_dim: int = raw.get("embed_dim", 768)
         self.recall = RecallConfig(raw.get("recall", {}))
         self.judge = JudgeConfig(raw.get("judge", {}))
         self.correction_patterns: List[str] = raw.get("correction_patterns", [
