@@ -49,6 +49,7 @@ echo No options provided. Let's set things up interactively.
 echo.
 
 REM Load answers remembered from a previous run, if any
+set "SAVED_LLAMA_BIN="
 set "SAVED_MODELS_CACHE="
 set "SAVED_STORAGE="
 set "SAVED_REASONING="
@@ -65,6 +66,7 @@ goto :ask
 
 :offer_saved
 echo Found settings from your last run:
+echo   llama-server:    !SAVED_LLAMA_BIN!
 echo   Models cache:    !SAVED_MODELS_CACHE!
 echo   Storage path:    !SAVED_STORAGE!
 echo   Reasoning model: !SAVED_REASONING!
@@ -75,6 +77,7 @@ set "REUSE=Y"
 set /p "REUSE=Reuse these settings? (Y/n) [Y]: "
 if /i "!REUSE!"=="" set "REUSE=Y"
 if /i not "!REUSE!"=="Y" goto :ask
+set "LLAMA_BIN=!SAVED_LLAMA_BIN!"
 set "MODELS_CACHE=!SAVED_MODELS_CACHE!"
 set "STORAGE=!SAVED_STORAGE!"
 set "REASONING=!SAVED_REASONING!"
@@ -84,6 +87,10 @@ goto :save_and_build
 
 :ask
 REM Each prompt offers the previously saved value as its default (press Enter to keep)
+set "LLAMA_BIN=!SAVED_LLAMA_BIN!"
+set /p "LLAMA_BIN=Folder containing llama-server.exe [!SAVED_LLAMA_BIN!] (blank=auto-detect from PATH): "
+if not "!LLAMA_BIN!"=="" if not exist "!LLAMA_BIN!" echo [WARN] Not found: !LLAMA_BIN! - will pass it anyway
+
 set "MODELS_CACHE=!SAVED_MODELS_CACHE!"
 set /p "MODELS_CACHE=Path to existing models directory [!SAVED_MODELS_CACHE!]: "
 if not "!MODELS_CACHE!"=="" if not exist "!MODELS_CACHE!" (
@@ -111,13 +118,15 @@ echo.
 REM Remember these answers for next time (redirection first avoids the
 REM trailing-digit stream-number trap; separate echoes avoid a ( ) block
 REM so parentheses in Windows paths can't truncate the write)
->"%SETTINGS_FILE%"  echo MODELS_CACHE=!MODELS_CACHE!
+>"%SETTINGS_FILE%"  echo LLAMA_BIN=!LLAMA_BIN!
+>>"%SETTINGS_FILE%" echo MODELS_CACHE=!MODELS_CACHE!
 >>"%SETTINGS_FILE%" echo STORAGE=!STORAGE!
 >>"%SETTINGS_FILE%" echo REASONING=!REASONING!
 >>"%SETTINGS_FILE%" echo JUDGE=!JUDGE!
 >>"%SETTINGS_FILE%" echo EMBED=!EMBED!
 
 set "ARGS="
+if not "!LLAMA_BIN!"=="" set "ARGS=!ARGS! --llama-bin !LLAMA_BIN!"
 if not "!MODELS_CACHE!"=="" set "ARGS=!ARGS! --models-cache !MODELS_CACHE!"
 if not "!STORAGE!"==""      set "ARGS=!ARGS! --storage !STORAGE!"
 if not "!REASONING!"==""    set "ARGS=!ARGS! --reasoning-model !REASONING!"

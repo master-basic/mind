@@ -34,7 +34,7 @@ TMPFS_SIZE = "64G"
 MODEL_MANIFEST = [
     {
         "name": "reasoning",
-        "repo": "bartowski/Qwen3-8B-GGUF",
+        "repo": "Qwen/Qwen3-8B-GGUF",
         "file": "Qwen3-8B-Q4_K_M.gguf",
     },
     {
@@ -109,11 +109,26 @@ def parse_args():
 
 
 def find_llama_server(args):
-    if args.llama_bin:
-        if Path(args.llama_bin).exists():
-            return str(Path(args.llama_bin).resolve())
-        die(f"Specified --llama-bin not found: {args.llama_bin}")
     names = ["llama-server.exe", "llama-server"]
+    if args.llama_bin:
+        p = Path(args.llama_bin)
+        if p.is_file():
+            return str(p.resolve())
+        if p.is_dir():
+            # Accept a folder: look in it and the usual build subdirectories
+            subdirs = [
+                p,
+                p / "build" / "bin" / "Release",
+                p / "build" / "bin",
+                p / "bin",
+            ]
+            for d in subdirs:
+                for name in names:
+                    cand = d / name
+                    if cand.is_file():
+                        return str(cand.resolve())
+            die(f"No llama-server executable found under directory: {p}")
+        die(f"Specified --llama-bin not found: {args.llama_bin}")
     for name in names:
         which = shutil.which(name)
         if which:
@@ -236,14 +251,24 @@ def resolve_models(args, storage_root, hf_hub):
                 repo_id=entry["repo"],
                 filename=entry["file"],
                 local_dir=models_dir,
-                local_dir_use_symlinks=False,
-                resume_download=True,
             )
             downloaded = models_dir / entry["file"]
             if downloaded != dest and not dest.exists():
                 downloaded.rename(dest)
             result[name] = str(dest)
             info(f"Downloaded {name} model: {dest}")
+            # Populate the cache so a ramdisk wipe / next run restores from
+            # local disk instead of downloading ~GBs from HuggingFace again.
+            if args.models_cache:
+                try:
+                    cache_dir = Path(args.models_cache)
+                    cache_dir.mkdir(parents=True, exist_ok=True)
+                    cache_file = cache_dir / save_as
+                    if cache_file.resolve() != dest.resolve() and not cache_file.exists():
+                        info(f"Saving {name} to cache for next time: {cache_file}")
+                        shutil.copy2(dest, cache_file)
+                except Exception as e:
+                    warn(f"Could not save {name} to cache: {e}")
         except Exception as e:
             warn(f"Failed to download {name}: {e}")
 
@@ -252,7 +277,10 @@ def resolve_models(args, storage_root, hf_hub):
 
 def update_config(storage_root, args):
     import yaml
-    with open(CONFIG_PATH) as f:
+    # encoding="utf-8" is required: config.yaml holds non-ASCII correction
+    # patterns (e.g. Azerbaijani). Without it, Windows' default codepage
+    # mangles them, and yaml.dump without allow_unicode re-escapes them.
+    with open(CONFIG_PATH, encoding="utf-8") as f:
         config = yaml.safe_load(f)
     config["store_path"] = str(storage_root / "store")
     config["snapshot_path"] = str(ROOT / "snapshots")
@@ -261,8 +289,9 @@ def update_config(storage_root, args):
     config["reasoning_endpoint"] = f"http://127.0.0.1:{args.reasoning_port}"
     config["judge_endpoint"] = f"http://127.0.0.1:{args.judge_port}"
     config["embed_endpoint"] = f"http://127.0.0.1:{args.embed_port}"
-    with open(CONFIG_PATH, "w") as f:
-        yaml.dump(config, f, default_flow_style=False)
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        yaml.dump(config, f, default_flow_style=False,
+                  allow_unicode=True, sort_keys=False)
 
 
 def wait_for_server(name, port, proc, timeout=120):

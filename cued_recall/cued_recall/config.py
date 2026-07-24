@@ -27,7 +27,7 @@ class ServerConfig:
 
 class Config:
     def __init__(self, path: str | Path = "config.yaml"):
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             raw = yaml.safe_load(f)
 
         self.listen: str = raw.get("listen", "127.0.0.1:8000")
