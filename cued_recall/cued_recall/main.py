@@ -84,6 +84,16 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
         html = (static_dir / "admin.html").read_text(encoding="utf-8")
         return HTMLResponse(html)
 
+    @app.get("/")
+    async def root_page():
+        html = (static_dir / "chat.html").read_text(encoding="utf-8")
+        return HTMLResponse(html)
+
+    @app.get("/chat")
+    async def chat_page():
+        html = (static_dir / "chat.html").read_text(encoding="utf-8")
+        return HTMLResponse(html)
+
     admin_router = build_admin_router(index, store, wal, run_judge_pass)
     app.include_router(admin_router)
 

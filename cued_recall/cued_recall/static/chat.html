@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cued Recall — Chat</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; }
+body { font-family: -apple-system, 'Segoe UI', system-ui, sans-serif; background: #0d1117; color: #c9d1d9; display: flex; flex-direction: column; }
+header { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid #30363d; background: #161b22; }
+header h1 { font-size: 16px; color: #58a6ff; font-weight: 600; }
+header .status { font-size: 12px; color: #8b949e; margin-left: auto; }
+header a { color: #8b949e; font-size: 12px; text-decoration: none; border: 1px solid #30363d; padding: 4px 10px; border-radius: 6px; }
+header a:hover { color: #c9d1d9; border-color: #8b949e; }
+#dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#f85149; margin-right:6px; vertical-align:middle; }
+#dot.ok { background:#3fb950; }
+#messages { flex: 1; overflow-y: auto; padding: 20px 16px; display: flex; flex-direction: column; gap: 14px; }
+.msg { max-width: 780px; width: 100%; margin: 0 auto; display: flex; gap: 10px; }
+.msg .who { flex: 0 0 64px; font-size: 12px; color: #8b949e; text-transform: uppercase; letter-spacing: .5px; padding-top: 3px; }
+.msg .body { flex: 1; white-space: pre-wrap; word-wrap: break-word; line-height: 1.55; }
+.msg.user .body { color: #f0f6fc; }
+.msg.assistant .body { color: #c9d1d9; }
+.think { margin: 6px 0; border: 1px solid #30363d; border-radius: 6px; background: #161b22; }
+.think summary { cursor: pointer; padding: 6px 10px; font-size: 12px; color: #a371f7; user-select: none; }
+.think .think-body { padding: 8px 10px; border-top: 1px solid #30363d; font-size: 13px; color: #8b949e; white-space: pre-wrap; }
+.recall-note { max-width: 780px; margin: 0 auto; width: 100%; font-size: 12px; color: #d29922; }
+footer { border-top: 1px solid #30363d; background: #161b22; padding: 12px 16px; }
+.composer { max-width: 780px; margin: 0 auto; display: flex; gap: 8px; }
+textarea { flex: 1; resize: none; background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 8px; padding: 10px 12px; font-size: 14px; font-family: inherit; line-height: 1.4; max-height: 200px; }
+textarea:focus { outline: none; border-color: #58a6ff; }
+button { background: #238636; color: #fff; border: none; border-radius: 8px; padding: 0 18px; font-size: 14px; cursor: pointer; font-weight: 600; }
+button:hover { background: #2ea043; }
+button:disabled { background: #30363d; color: #8b949e; cursor: not-allowed; }
+.hint { max-width: 780px; margin: 6px auto 0; font-size: 11px; color: #484f58; }
+.err { color: #f85149; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>⬡ Cued Recall Chat</h1>
+  <span class="status"><span id="dot"></span><span id="status-text">connecting…</span></span>
+  <a href="/admin">Admin</a>
+</header>
+
+<div id="messages"></div>
+
+<footer>
+  <div class="composer">
+    <textarea id="input" rows="1" placeholder="Send a message…  (Enter to send, Shift+Enter for newline)"></textarea>
+    <button id="send">Send</button>
+  </div>
+  <div class="hint">Goes through the memory middleware on this port. Reasoning is recorded and recalled across sessions. New conversation on reload.</div>
+</footer>
+
+<script>
+const API = '';
+const conversationId = 'chat-' + (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(16).slice(2));
+const history = [];   // OpenAI-style messages we send to the middleware
+
+const $messages = document.getElementById('messages');
+const $input = document.getElementById('input');
+const $send = document.getElementById('send');
+
+async function checkHealth() {
+  try {
+    const r = await fetch(API + '/health');
+    const ok = r.ok;
+    document.getElementById('dot').className = ok ? 'ok' : '';
+    document.getElementById('status-text').textContent = ok ? 'connected' : 'unreachable';
+  } catch {
+    document.getElementById('dot').className = '';
+    document.getElementById('status-text').textContent = 'offline';
+  }
+}
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+
+function addMessage(role, text) {
+  const wrap = el('div', 'msg ' + role);
+  wrap.appendChild(el('div', 'who', role === 'user' ? 'You' : 'AI'));
+  const body = el('div', 'body');
+  body.textContent = text || '';
+  wrap.appendChild(body);
+  $messages.appendChild(wrap);
+  $messages.scrollTop = $messages.scrollHeight;
+  return body;   // caller updates .textContent as tokens stream
+}
+
+// Split "<think>...</think> answer" into { reasoning, answer }
+function splitThink(text) {
+  let reasoning = '', answer = text;
+  const open = text.indexOf('<think>');
+  if (open !== -1) {
+    const close = text.indexOf('</think>');
+    if (close !== -1) {
+      reasoning = text.slice(open + 7, close).trim();
+      answer = (text.slice(0, open) + text.slice(close + 8)).trim();
+    } else {
+      reasoning = text.slice(open + 7).trim();
+      answer = '';
+    }
+  }
+  return { reasoning, answer };
+}
+
+function renderAssistant(bodyEl, fullText) {
+  const { reasoning, answer } = splitThink(fullText);
+  bodyEl.innerHTML = '';
+  if (reasoning) {
+    const d = el('details', 'think');
+    d.appendChild(el('summary', null, 'Reasoning'));
+    d.appendChild(el('div', 'think-body', reasoning));
+    bodyEl.appendChild(d);
+  }
+  bodyEl.appendChild(el('div', null, answer || (reasoning ? '' : fullText)));
+  $messages.scrollTop = $messages.scrollHeight;
+}
+
+async function send() {
+  const text = $input.value.trim();
+  if (!text) return;
+  $input.value = '';
+  $input.style.height = 'auto';
+  $send.disabled = true;
+
+  addMessage('user', text);
+  history.push({ role: 'user', content: text });
+
+  const bodyEl = addMessage('assistant', '…');
+  let full = '';
+
+  try {
+    const resp = await fetch(API + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'default',
+        stream: true,
+        conversation_id: conversationId,
+        messages: history,
+      }),
+    });
+
+    if (!resp.ok) {
+      const t = await resp.text();
+      bodyEl.innerHTML = '';
+      bodyEl.appendChild(el('div', 'err', 'Error ' + resp.status + ': ' + t.slice(0, 300)));
+      $send.disabled = false;
+      return;
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) {
+        const s = line.trim();
+        if (!s.startsWith('data:')) continue;
+        const data = s.slice(5).trim();
+        if (data === '[DONE]') continue;
+        try {
+          const json = JSON.parse(data);
+          const delta = json.choices?.[0]?.delta?.content || '';
+          if (delta) { full += delta; renderAssistant(bodyEl, full); }
+        } catch { /* ignore keep-alives / partials */ }
+      }
+    }
+    if (!full) renderAssistant(bodyEl, '(no content)');
+    history.push({ role: 'assistant', content: full });
+  } catch (e) {
+    bodyEl.innerHTML = '';
+    bodyEl.appendChild(el('div', 'err', 'Request failed: ' + e.message));
+  } finally {
+    $send.disabled = false;
+    $input.focus();
+  }
+}
+
+$send.addEventListener('click', send);
+$input.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+$input.addEventListener('input', () => {
+  $input.style.height = 'auto';
+  $input.style.height = Math.min($input.scrollHeight, 200) + 'px';
+});
+
+checkHealth();
+setInterval(checkHealth, 10000);
+$input.focus();
+</script>
+</body>
+</html>
