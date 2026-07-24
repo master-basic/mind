@@ -32,6 +32,17 @@ textarea:focus { outline: none; border-color: #58a6ff; }
 button { background: #238636; color: #fff; border: none; border-radius: 8px; padding: 0 18px; font-size: 14px; cursor: pointer; font-weight: 600; }
 button:hover { background: #2ea043; }
 button:disabled { background: #30363d; color: #8b949e; cursor: not-allowed; }
+button.stop { background: #da3633; }
+button.stop:hover { background: #f85149; }
+.stopped-note { font-size: 11px; color: #8b949e; margin-top: 4px; }
+.attach { background: #21262d; color: #c9d1d9; padding: 0 12px; font-size: 16px; }
+.attach:hover { background: #30363d; }
+.attachments { max-width: 780px; margin: 0 auto 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+.attachments:empty { display: none; }
+.chip { display: inline-flex; align-items: center; gap: 6px; background: #161b22; border: 1px solid #30363d; border-radius: 14px; padding: 3px 10px; font-size: 12px; color: #c9d1d9; }
+.chip-x { cursor: pointer; color: #8b949e; font-size: 11px; }
+.chip-x:hover { color: #f85149; }
+.msg-files { font-size: 11px; color: #8b949e; margin-top: 4px; }
 .hint { max-width: 780px; margin: 6px auto 0; font-size: 11px; color: #484f58; }
 .err { color: #f85149; }
 </style>
@@ -47,11 +58,15 @@ button:disabled { background: #30363d; color: #8b949e; cursor: not-allowed; }
 <div id="messages"></div>
 
 <footer>
+  <div id="attachments" class="attachments"></div>
   <div class="composer">
+    <input type="file" id="file" multiple hidden
+      accept=".txt,.md,.markdown,.py,.js,.ts,.json,.csv,.tsv,.log,.html,.css,.xml,.yaml,.yml,.ini,.cfg,.conf,.sh,.bat,.c,.cpp,.h,.hpp,.java,.go,.rs,.rb,.php,.sql,text/*">
+    <button id="attach" class="attach" title="Attach text or code files">📎</button>
     <textarea id="input" rows="1" placeholder="Send a message…  (Enter to send, Shift+Enter for newline)"></textarea>
     <button id="send">Send</button>
   </div>
-  <div class="hint">Goes through the memory middleware on this port. Reasoning is recorded and recalled across sessions. New conversation on reload.</div>
+  <div class="hint">Goes through the memory middleware on this port. Attach text/code files with 📎 (their contents are read and included). New conversation on reload.</div>
 </footer>
 
 <script>
@@ -62,6 +77,38 @@ const history = [];   // OpenAI-style messages we send to the middleware
 const $messages = document.getElementById('messages');
 const $input = document.getElementById('input');
 const $send = document.getElementById('send');
+const $file = document.getElementById('file');
+const $attach = document.getElementById('attach');
+const $attachments = document.getElementById('attachments');
+
+const attachments = [];   // { name, content } read from disk, cleared on send
+
+$attach.addEventListener('click', () => $file.click());
+$file.addEventListener('change', () => {
+  for (const f of $file.files) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      attachments.push({ name: f.name, content: String(reader.result || '') });
+      renderAttachments();
+    };
+    reader.onerror = () => alert('Could not read ' + f.name);
+    reader.readAsText(f);
+  }
+  $file.value = '';   // allow re-selecting the same file
+});
+
+function renderAttachments() {
+  $attachments.innerHTML = '';
+  attachments.forEach((a, i) => {
+    const kb = Math.max(1, Math.round(a.content.length / 1024));
+    const chip = el('span', 'chip');
+    chip.appendChild(el('span', null, '📎 ' + a.name + ' (' + kb + ' KB)'));
+    const x = el('span', 'chip-x', '✕');
+    x.addEventListener('click', () => { attachments.splice(i, 1); renderAttachments(); });
+    chip.appendChild(x);
+    $attachments.appendChild(chip);
+  });
+}
 
 async function checkHealth() {
   try {
@@ -123,23 +170,51 @@ function renderAssistant(bodyEl, fullText) {
   $messages.scrollTop = $messages.scrollHeight;
 }
 
+let controller = null;
+let generating = false;
+
+function setGenerating(on) {
+  generating = on;
+  $send.textContent = on ? 'Stop' : 'Send';
+  $send.classList.toggle('stop', on);
+}
+
 async function send() {
   const text = $input.value.trim();
-  if (!text) return;
+  if (!text && attachments.length === 0) return;
   $input.value = '';
   $input.style.height = 'auto';
-  $send.disabled = true;
 
-  addMessage('user', text);
-  history.push({ role: 'user', content: text });
+  // Take and clear the pending attachments
+  const attached = attachments.splice(0);
+  renderAttachments();
+
+  // What the model receives: full file contents + the typed text
+  let content = text;
+  if (attached.length) {
+    const blocks = attached
+      .map(a => '[Attached file: ' + a.name + ']\n' + a.content)
+      .join('\n\n');
+    content = blocks + (text ? '\n\n---\n\n' + text : '');
+  }
+
+  // What the user sees: their text plus a compact file note (not the dump)
+  const userBody = addMessage('user', text || '');
+  if (attached.length) {
+    userBody.appendChild(el('div', 'msg-files', '📎 ' + attached.map(a => a.name).join(', ')));
+  }
+  history.push({ role: 'user', content });
 
   const bodyEl = addMessage('assistant', '…');
   let full = '';
+  controller = new AbortController();
+  setGenerating(true);
 
   try {
     const resp = await fetch(API + '/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
       body: JSON.stringify({
         model: 'default',
         stream: true,
@@ -152,7 +227,6 @@ async function send() {
       const t = await resp.text();
       bodyEl.innerHTML = '';
       bodyEl.appendChild(el('div', 'err', 'Error ' + resp.status + ': ' + t.slice(0, 300)));
-      $send.disabled = false;
       return;
     }
 
@@ -180,17 +254,36 @@ async function send() {
     if (!full) renderAssistant(bodyEl, '(no content)');
     history.push({ role: 'assistant', content: full });
   } catch (e) {
-    bodyEl.innerHTML = '';
-    bodyEl.appendChild(el('div', 'err', 'Request failed: ' + e.message));
+    if (e.name === 'AbortError') {
+      // Stop pressed: keep whatever streamed so far as conversation context.
+      if (full) {
+        renderAssistant(bodyEl, full);
+        bodyEl.appendChild(el('div', 'stopped-note', '(stopped)'));
+        history.push({ role: 'assistant', content: full });
+      } else {
+        bodyEl.innerHTML = '';
+        bodyEl.appendChild(el('div', 'stopped-note', '(stopped)'));
+      }
+    } else {
+      bodyEl.innerHTML = '';
+      bodyEl.appendChild(el('div', 'err', 'Request failed: ' + e.message));
+    }
   } finally {
-    $send.disabled = false;
+    controller = null;
+    setGenerating(false);
     $input.focus();
   }
 }
 
-$send.addEventListener('click', send);
+$send.addEventListener('click', () => {
+  if (generating) { if (controller) controller.abort(); return; }
+  send();
+});
 $input.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    if (!generating) send();
+  }
 });
 $input.addEventListener('input', () => {
   $input.style.height = 'auto';
