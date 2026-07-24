@@ -727,6 +727,37 @@ class Pipeline:
         token_count = 0
         MAX_TOOL_ROUNDS = 5
 
+        # Strict OpenAI-compatible clients (the AI SDK used by opencode, etc.)
+        # expect every chunk to carry the full envelope -- id/object/created/
+        # model and a choices[0].index -- not just a bare delta. Reuse the
+        # upstream id/model when llama.cpp provides them so the whole stream
+        # is internally consistent.
+        env = {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+            "model": body.get("model") or "cued-recall",
+            "created": int(t0),
+            "role_sent": False,
+        }
+        upstream_finish = None
+
+        def sse(delta: dict, finish_reason=None) -> bytes:
+            # OpenAI sends role on the first delta of the message.
+            if delta and not env["role_sent"]:
+                delta = {"role": "assistant", **delta}
+                env["role_sent"] = True
+            chunk = {
+                "id": env["id"],
+                "object": "chat.completion.chunk",
+                "created": env["created"],
+                "model": env["model"],
+                "choices": [{
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": finish_reason,
+                }],
+            }
+            return f"data: {json.dumps(chunk)}\n\n".encode()
+
         # Multi-round tool loop: stream each model turn to the client; if it
         # requests tools, run them, append the results, and stream the next
         # turn — so chains like web_search -> web_fetch -> answer complete
@@ -762,8 +793,16 @@ class Pipeline:
                             continue
                         if data.get("usage"):
                             self._report_usage(data["usage"])
+                        # Adopt upstream's id/model so the stream we emit is
+                        # consistent with what actually generated it.
+                        if data.get("id") and _round == 0:
+                            env["id"] = data["id"]
+                        if data.get("model"):
+                            env["model"] = data["model"]
                         choices = data.get("choices") or []
                         delta_obj = choices[0].get("delta", {}) if choices else {}
+                        if choices and choices[0].get("finish_reason"):
+                            upstream_finish = choices[0]["finish_reason"]
 
                         delta_tool_calls = delta_obj.get("tool_calls")
                         if delta_tool_calls:
@@ -783,7 +822,7 @@ class Pipeline:
                         rc = delta_obj.get("reasoning_content")
                         if rc:
                             reasoning_content_parts.append(rc)
-                            yield f"data: {json.dumps({'choices': [{'delta': {'reasoning_content': rc}}]})}\n\n".encode()
+                            yield sse({"reasoning_content": rc})
                         delta = delta_obj.get("content", "")
                         if not delta:
                             continue
@@ -799,7 +838,7 @@ class Pipeline:
                             round_content += released
                             token_count += len(released.split())
                             splitter.feed(released)
-                            yield f"data: {json.dumps({'choices': [{'delta': {'content': released}}]})}\n\n".encode()
+                            yield sse({"content": released})
 
                     # Round's SSE stream ended -- release whatever the filter
                     # was still holding (either it never closed, meaning it
@@ -811,7 +850,7 @@ class Pipeline:
                         round_content += trailing
                         token_count += len(trailing.split())
                         splitter.feed(trailing)
-                        yield f"data: {json.dumps({'choices': [{'delta': {'content': trailing}}]})}\n\n".encode()
+                        yield sse({"content": trailing})
 
                 # No tools requested -> this was the final answer.
                 if not tool_calls_by_index:
@@ -821,7 +860,7 @@ class Pipeline:
                 names = ", ".join(c["name"] for c in calls if c["name"]) or "tool"
                 # Surface activity in the Reasoning panel (not stored as a block).
                 note = f"\n[running {names}…]\n"
-                yield f"data: {json.dumps({'choices': [{'delta': {'reasoning_content': note}}]})}\n\n".encode()
+                yield sse({"reasoning_content": note})
 
                 tool_results = await self._handle_tool_calls(
                     messages,
@@ -841,7 +880,11 @@ class Pipeline:
 
         splitter.flush()
 
-        # Yield [DONE]
+        # Terminating chunk: an empty delta carrying finish_reason. Strict
+        # OpenAI-compatible clients use this -- not [DONE] -- to finalize the
+        # assembled message; without it the stream ends with no completion
+        # signal and the client can drop everything it accumulated.
+        yield sse({}, finish_reason=upstream_finish or "stop")
         yield b"data: [DONE]\n\n"
 
         elapsed = time.time() - t0

@@ -11,7 +11,11 @@
       "models": {
         "local-model": {
           "name": "Local LLM",
-          "tool_call": true
+          "tool_call": true,
+          "reasoning": true,
+          "interleaved": {
+            "field": "reasoning_content"
+          }
         }
       }
     }
