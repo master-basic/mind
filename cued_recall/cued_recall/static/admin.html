@@ -126,10 +126,11 @@ async function loadModels() {
       const barCls = pct == null ? '' : (pct >= 90 ? 'hot' : (pct >= 70 ? 'warn' : ''));
       const ctx = m.n_ctx != null ? m.n_ctx.toLocaleString() : '—';
       const used = m.used_tokens != null ? m.used_tokens.toLocaleString() : '—';
+      const src = m.source ? ` <span style="color:#484f58">(${m.source})</span>` : '';
       const usageLine = pct == null
         ? `<div class="bar-label"><span>context ${ctx} tokens</span><span>usage n/a</span></div>`
         : `<div class="bar ${barCls}"><span style="width:${Math.min(pct,100)}%"></span></div>
-           <div class="bar-label"><span>${used} / ${ctx} tok</span><span>${pct}%</span></div>`;
+           <div class="bar-label"><span>${used} / ${ctx} tok</span><span>${pct}%${src}</span></div>`;
       grid.innerHTML += `
         <div class="model-card">
           <div class="head">

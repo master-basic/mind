@@ -39,6 +39,24 @@ class Pipeline:
         self.think_open = config.think_tags[0]
         self.think_close = config.think_tags[1]
         self.token_sink = None
+        self.usage_sink = None
+
+    @staticmethod
+    def _usage_total(usage: dict) -> Optional[int]:
+        if not usage:
+            return None
+        total = usage.get("total_tokens")
+        if total is None:
+            pt, ct = usage.get("prompt_tokens"), usage.get("completion_tokens")
+            if pt is None and ct is None:
+                return None
+            total = (pt or 0) + (ct or 0)
+        return total
+
+    def _report_usage(self, usage: dict):
+        total = self._usage_total(usage)
+        if total is not None and self.usage_sink:
+            self.usage_sink(total)
 
     async def recall_blocks(self, user_message: str) -> List[Tuple[Block, float]]:
         # Only embed a bounded slice for the recall query: a pasted file can be
@@ -280,7 +298,10 @@ class Pipeline:
         reasoning_content_parts: List[str] = []
 
         async with httpx.AsyncClient() as client:
-            payload = {**body, "messages": augmented_messages, "stream": True}
+            payload = {
+                **body, "messages": augmented_messages, "stream": True,
+                "stream_options": {"include_usage": True},
+            }
             async with client.stream(
                 "POST",
                 f"{self.config.reasoning_endpoint}/v1/chat/completions",
@@ -298,7 +319,10 @@ class Pipeline:
                         data = json.loads(data_str)
                     except json.JSONDecodeError:
                         continue
-                    delta_obj = data.get("choices", [{}])[0].get("delta", {})
+                    if data.get("usage"):
+                        self._report_usage(data["usage"])
+                    choices = data.get("choices") or []
+                    delta_obj = choices[0].get("delta", {}) if choices else {}
                     rc = delta_obj.get("reasoning_content")
                     if rc:
                         reasoning_content_parts.append(rc)
@@ -354,6 +378,8 @@ class Pipeline:
             )
             resp.raise_for_status()
             result = resp.json()
+
+        self._report_usage(result.get("usage") or {})
 
         message = result.get("choices", [{}])[0].get("message", {})
         response_text = message.get("content", "") or ""

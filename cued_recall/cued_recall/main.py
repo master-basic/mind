@@ -71,6 +71,18 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
 
     pipeline.token_sink = _accumulate_judge_tokens
 
+    # Track real token usage per model (from response `usage`) so the admin
+    # context-usage panel works even when llama-server /metrics is unavailable.
+    ctx_usage = {}
+
+    def _record_usage(name, total_tokens):
+        try:
+            ctx_usage[name] = {"total_tokens": int(total_tokens), "at": time.time()}
+        except (TypeError, ValueError):
+            pass
+
+    pipeline.usage_sink = lambda total: _record_usage("reasoning", total)
+
     from fastapi.responses import HTMLResponse
     import pathlib
 
@@ -146,8 +158,18 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
                             pass
             except Exception:
                 pass
-            if info["n_ctx"] and info["kv_used_ratio"] is not None:
+            # Prefer live /metrics; otherwise fall back to the last real token
+            # usage the middleware recorded from this model's responses.
+            if info["kv_used_ratio"] is None:
+                tracked = ctx_usage.get(name)
+                if tracked and info["n_ctx"]:
+                    used = min(int(tracked["total_tokens"]), int(info["n_ctx"]))
+                    info["used_tokens"] = used
+                    info["kv_used_ratio"] = used / info["n_ctx"]
+                    info["source"] = "last-request"
+            elif info["n_ctx"] is not None:
                 info["used_tokens"] = int(info["n_ctx"] * info["kv_used_ratio"])
+                info["source"] = "live"
             return info
 
         models = await asyncio.gather(*[probe(n, u) for n, u in targets])
