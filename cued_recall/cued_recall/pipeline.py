@@ -313,6 +313,7 @@ class Pipeline:
         ws = self.config.web_search
         n = max(1, ws.max_results)
         backend = (ws.backend or "duckduckgo").lower()
+        blocked = False
         if backend == "searxng" and ws.searxng_url:
             results = await self._search_searxng(query, n)
         elif backend == "brave" and ws.api_key:
@@ -320,7 +321,21 @@ class Pipeline:
         elif backend == "serper" and ws.api_key:
             results = await self._search_serper(query, n)
         else:
-            results = await self._search_duckduckgo(query, n)
+            results, blocked = await self._search_duckduckgo_checked(query, n)
+        if blocked:
+            # Distinguish "the engine refused us" from "nothing matched". A
+            # bland "no results" reads to the model as bad luck, so it retries
+            # the same dead backend until it burns every tool round -- which is
+            # exactly what an anti-bot block looks like from the inside.
+            return (
+                "web_search is UNAVAILABLE: the DuckDuckGo backend is being "
+                "blocked by anti-bot protection, so no query can succeed right "
+                "now. Do NOT retry this tool or rephrase the query -- the "
+                "result will be identical. Either answer from your own "
+                "knowledge and say the information may be out of date, or ask "
+                "the user to configure a working search backend (searxng, "
+                "brave, or serper) under web_search in config.yaml."
+            )
         if not results:
             return f"No search results for: {query}"
         lines = [f"Search results for '{query}':", ""]
@@ -350,7 +365,32 @@ class Pipeline:
             pass
         return href
 
-    async def _search_duckduckgo(self, query: str, n: int) -> list:
+    async def _search_duckduckgo_checked(self, query: str, n: int) -> Tuple[list, bool]:
+        """Search, and report whether the engine blocked us.
+
+        DuckDuckGo answers scraped requests with HTTP 202 and an anti-bot
+        interstitial that contains none of the result markup, which is
+        indistinguishable from "no matches" unless checked explicitly.
+        """
+        try:
+            html, status = await self._fetch_ddg_html(query)
+        except Exception:
+            return [], True
+        results = self._parse_ddg_html(html, n)
+        if results:
+            return results, False
+        blocked = status != 200 or "result__a" not in html
+        return [], blocked
+
+    async def _fetch_ddg_html(self, query: str) -> Tuple[str, int]:
+        """Fetch DDG's HTML endpoint, retrying a throttled response.
+
+        DuckDuckGo rate-limits scraped requests rather than blocking outright:
+        it answers with HTTP 202 and an anti-bot interstitial, then serves the
+        same query normally a moment later. Backing off here keeps a transient
+        throttle from surfacing to the model as "no results" -- which used to
+        make it retry immediately and throttle itself harder.
+        """
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -358,15 +398,27 @@ class Pipeline:
                 "Chrome/122.0 Safari/537.36"
             ),
         }
+        text, status = "", 0
         async with httpx.AsyncClient(follow_redirects=True, timeout=20) as client:
-            resp = await client.post(
-                "https://html.duckduckgo.com/html/",
-                data={"q": query, "kl": "us-en"},
-                headers=headers,
-            )
-            resp.raise_for_status()
-            resp.encoding = "utf-8"  # DDG serves UTF-8; avoid mojibake in titles
-            html = resp.text
+            for attempt in range(3):
+                resp = await client.post(
+                    "https://html.duckduckgo.com/html/",
+                    data={"q": query, "kl": "us-en"},
+                    headers=headers,
+                )
+                resp.encoding = "utf-8"  # DDG serves UTF-8; avoid mojibake
+                text, status = resp.text, resp.status_code
+                if status == 200 and "result__a" in text:
+                    return text, status
+                if attempt < 2:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+        return text, status
+
+    async def _search_duckduckgo(self, query: str, n: int) -> list:
+        html, _ = await self._fetch_ddg_html(query)
+        return self._parse_ddg_html(html, n)
+
+    def _parse_ddg_html(self, html: str, n: int) -> list:
         link_re = re.compile(
             r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.DOTALL)
         snip_re = re.compile(
@@ -800,6 +852,7 @@ class Pipeline:
                 tool_calls_by_index = {}
                 round_content = ""
                 tool_fallback_filter = self.ToolCallFallbackFilter()
+                reasoning_fallback_filter = self.ToolCallFallbackFilter()
                 payload = {
                     **body, "messages": self._fit_messages(messages), "stream": True,
                     "stream_options": {"include_usage": True},
@@ -853,8 +906,21 @@ class Pipeline:
 
                         rc = delta_obj.get("reasoning_content")
                         if rc:
-                            reasoning_content_parts.append(rc)
-                            yield sse({"reasoning_content": rc})
+                            # This model emits its fallback textual tool calls
+                            # inside the reasoning stream, not the content
+                            # stream, so the same filter has to run here or the
+                            # raw <tool_call> markup reaches the user and the
+                            # call never executes.
+                            rc_out, rc_calls = reasoning_fallback_filter.feed(rc)
+                            for i, fc in enumerate(rc_calls):
+                                key = f"rfallback-{len(tool_calls_by_index)}-{i}"
+                                tool_calls_by_index[key] = {
+                                    "id": f"fallback-{uuid.uuid4().hex[:8]}",
+                                    "name": fc["name"], "arguments": fc["arguments"],
+                                }
+                            if rc_out:
+                                reasoning_content_parts.append(rc_out)
+                                yield sse({"reasoning_content": rc_out})
                         delta = delta_obj.get("content", "")
                         if not delta:
                             continue
@@ -883,6 +949,10 @@ class Pipeline:
                         token_count += len(trailing.split())
                         splitter.feed(trailing)
                         yield sse({"content": trailing})
+                    rc_trailing = reasoning_fallback_filter.flush()
+                    if rc_trailing:
+                        reasoning_content_parts.append(rc_trailing)
+                        yield sse({"reasoning_content": rc_trailing})
 
                 # No tools requested -> this was the final answer.
                 if not tool_calls_by_index:
