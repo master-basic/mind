@@ -51,17 +51,20 @@ MODEL_MANIFEST = [
     },
 ]
 
-# --metrics exposes /metrics (incl. kv_cache_usage_ratio) for the admin panel's
-# per-model context-usage display.
+# --metrics exposes /metrics (incl. kv_cache_usage_ratio) for the admin panel.
+# Placement (tuned for a 12 GB GPU):
+#   reasoning: weights + 32K KV cache on GPU (no --no-kv-offload) -> fastest.
+#   judge:     fully on CPU (-ngl 0) to free VRAM for the reasoning KV.
+#   embed:     weights on GPU, KV/context in RAM (--no-kv-offload).
 SERVER_DEFAULTS = {
-    "reasoning": {"port": 8080, "extra": ["--ctx-size", "32768", "--n-gpu-layers", "99", "--no-kv-offload", "--metrics"]},
-    "judge":     {"port": 8081, "extra": ["--ctx-size", "8192", "--n-gpu-layers", "99", "--metrics"]},
+    "reasoning": {"port": 8080, "extra": ["--ctx-size", "32768", "--n-gpu-layers", "99", "--metrics"]},
+    "judge":     {"port": 8081, "extra": ["--ctx-size", "8192", "--n-gpu-layers", "0", "--metrics"]},
     # Embeddings need the whole sequence in one micro-batch; the default
     # --ubatch-size (512) makes any input over ~512 tokens 500. Match batch
     # sizes to the context so larger inputs embed instead of erroring.
     "embed":     {"port": 8082, "extra": ["--embedding", "--ctx-size", "8192",
                                           "--batch-size", "8192", "--ubatch-size", "8192",
-                                          "--n-gpu-layers", "99", "--metrics"]},
+                                          "--n-gpu-layers", "99", "--no-kv-offload", "--metrics"]},
 }
 
 
