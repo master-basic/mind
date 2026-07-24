@@ -1,9 +1,11 @@
 import asyncio
+import html as html_lib
 import json
 import re
 import time
 import uuid
 from typing import AsyncIterator, List, Optional, Tuple
+from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 import numpy as np
@@ -20,6 +22,52 @@ from .utils import (
     truncate_tokens,
 )
 from .wal import WAL
+
+WEB_FETCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_fetch",
+        "description": (
+            "Fetch content from a URL and return it as text. "
+            "Use this to look up documentation, read articles, or "
+            "research any topic by fetching its web page content."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The URL to fetch content from",
+                }
+            },
+            "required": ["url"],
+        },
+    },
+}
+
+WEB_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": (
+            "Search the internet and return a ranked list of results "
+            "(title, URL, and snippet). Use this to find current or factual "
+            "information when you don't already know the answer or a specific "
+            "URL. After searching, call web_fetch on the most relevant URL to "
+            "read the full page."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query.",
+                }
+            },
+            "required": ["query"],
+        },
+    },
+}
 
 
 class Pipeline:
@@ -160,15 +208,62 @@ class Pipeline:
             parts.append("")
         return "\n".join(parts)
 
-    def build_messages(
-        self,
-        original_messages: list,
-        recall_text: str,
-    ) -> list:
+    def build_messages(self, original_messages: list, recall_text: str) -> list:
         if not recall_text:
             return original_messages
         recall_msg = {"role": "system", "content": recall_text}
         return [recall_msg] + original_messages
+
+    @staticmethod
+    def _extract_text(content) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return " ".join(p.get("text", "") for p in content if isinstance(p, dict))
+        return str(content or "")
+
+    @staticmethod
+    async def _fetch_url(url: str) -> str:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+            resp = await client.get(
+                url,
+                headers={"User-Agent": "CuedRecall/1.0 web-fetch-tool"},
+            )
+            resp.raise_for_status()
+            ct = resp.headers.get("content-type", "")
+            if "json" in ct:
+                return json.dumps(resp.json(), indent=2)[:8000]
+            text = resp.text[:20000]
+            return text
+
+    def _inject_tools(self, body: dict) -> dict:
+        tools = body.get("tools") or []
+        existing_names = {t.get("function", {}).get("name") for t in tools if t.get("type") == "function"}
+        if "web_fetch" not in existing_names:
+            tools.append(WEB_FETCH_TOOL)
+        return {**body, "tools": tools}
+
+    async def _handle_tool_calls(self, messages: list, tool_calls: list) -> list:
+        if not tool_calls:
+            return []
+        results = []
+        for tc in tool_calls:
+            fn = tc.get("function", {})
+            name = fn.get("name", "")
+            if name != "web_fetch":
+                results.append({"tool_call_id": tc["id"], "role": "tool", "content": f"Unknown tool: {name}"})
+                continue
+            try:
+                args = json.loads(fn.get("arguments", "{}"))
+                url = args.get("url", "")
+                if not url:
+                    results.append({"tool_call_id": tc["id"], "role": "tool", "content": "No URL provided"})
+                    continue
+                content = await self._fetch_url(url)
+                results.append({"tool_call_id": tc["id"], "role": "tool", "content": content[:8000]})
+            except Exception as e:
+                results.append({"tool_call_id": tc["id"], "role": "tool", "content": f"Fetch error: {e}"})
+        return results
 
     def read_messages_from_body(self, body: dict) -> list:
         return body.get("messages", [])
@@ -299,14 +394,17 @@ class Pipeline:
         recall_text = self.build_recall_injection(recall_blocks)
         augmented_messages = self.build_messages(base_messages, recall_text)
 
+        # Inject web_fetch tool so the LLM can use it for research
+        body_with_tools = self._inject_tools(body)
+
         if body.get("stream", False):
             return await self._process_streaming(
-                body, augmented_messages, user_message, reading_content,
+                body_with_tools, augmented_messages, user_message, reading_content,
                 recall_blocks, conversation_id, turn_index,
             )
         else:
             return await self._process_nonstreaming(
-                body, augmented_messages, user_message, reading_content,
+                body_with_tools, augmented_messages, user_message, reading_content,
                 recall_blocks, conversation_id, turn_index,
             )
 
@@ -340,12 +438,13 @@ class Pipeline:
     ):
         splitter = self.ThinkSplitter(self.think_open, self.think_close)
         response_text = ""
-        # Newer llama.cpp parses <think> out of `content` into a separate
-        # `reasoning_content` delta field. Capture both so reasoning blocks are
-        # still created when the tags aren't inline.
         reasoning_content_parts: List[str] = []
         t0 = time.time()
         token_count = 0
+
+        # Tool-call detection state for streaming
+        tool_calls_by_index = {}  # index -> {id, name, arguments}
+        finish_reason = None
 
         async with httpx.AsyncClient() as client:
             payload = {
@@ -361,7 +460,6 @@ class Pipeline:
                 async for line in resp.aiter_lines():
                     if not line.startswith("data: "):
                         continue
-                    yield line.encode() + b"\n\n"
                     data_str = line[6:]
                     if data_str.strip() == "[DONE]":
                         continue
@@ -373,6 +471,27 @@ class Pipeline:
                         self._report_usage(data["usage"])
                     choices = data.get("choices") or []
                     delta_obj = choices[0].get("delta", {}) if choices else {}
+                    fr = choices[0].get("finish_reason") if choices else None
+                    if fr:
+                        finish_reason = fr
+
+                    # Collect streaming tool_calls
+                    delta_tool_calls = delta_obj.get("tool_calls")
+                    if delta_tool_calls:
+                        for tc in delta_tool_calls:
+                            idx = tc.get("index", 0)
+                            if idx not in tool_calls_by_index:
+                                tool_calls_by_index[idx] = {"id": "", "name": "", "arguments": ""}
+                            entry = tool_calls_by_index[idx]
+                            if tc.get("id"):
+                                entry["id"] = tc["id"]
+                            fn = tc.get("function", {})
+                            if fn.get("name"):
+                                entry["name"] = fn["name"]
+                            if fn.get("arguments"):
+                                entry["arguments"] += fn["arguments"]
+                        continue  # don't yield tool_call chunks to client
+
                     rc = delta_obj.get("reasoning_content")
                     if rc:
                         reasoning_content_parts.append(rc)
@@ -382,8 +501,60 @@ class Pipeline:
                     response_text += delta
                     token_count += len(delta.split())
                     splitter.feed(delta)
+                    # Yield content to client as we get it
+                    yield f"data: {json.dumps({'choices': [{'delta': {'content': delta}}]})}\n\n".encode()
 
                 splitter.flush()
+
+        # If LLM called a tool, execute it and continue
+        if tool_calls_by_index:
+            tool_results = await self._handle_tool_calls(
+                augmented_messages,
+                [{"id": tc["id"], "function": {"name": tc["name"], "arguments": tc["arguments"]}}
+                 for tc in tool_calls_by_index.values()]
+            )
+            # Build follow-up messages
+            assistant_msg = {"role": "assistant", "content": response_text or None, "tool_calls": [
+                {"id": tc["id"], "type": "function", "function": {"name": tc["name"], "arguments": tc["arguments"]}}
+                for tc in tool_calls_by_index.values()
+            ]}
+            follow_messages = augmented_messages + [assistant_msg] + tool_results
+
+            # Send follow-up as non-streaming (tool results are typically short)
+            t1 = time.time()
+            async with httpx.AsyncClient() as client:
+                payload = {**body, "messages": self._fit_messages(follow_messages), "stream": False}
+                follow_resp = await client.post(
+                    f"{self.config.reasoning_endpoint}/v1/chat/completions",
+                    json=payload,
+                    timeout=300,
+                )
+                follow_resp.raise_for_status()
+                follow_result = follow_resp.json()
+            elapsed2 = time.time() - t1
+            self._report_usage(follow_result.get("usage") or {})
+
+            follow_message = follow_result.get("choices", [{}])[0].get("message", {})
+            follow_content = follow_message.get("content", "") or ""
+            follow_reasoning = follow_message.get("reasoning_content", "") or ""
+
+            # Yield follow-up content to client
+            if follow_content:
+                yield f"data: {json.dumps({'choices': [{'delta': {'content': follow_content}}]})}\n\n".encode()
+                response_text += follow_content
+                token_count += len(follow_content.split())
+
+            # Merge reasoning
+            if follow_reasoning:
+                reasoning_content_parts.append(follow_reasoning)
+
+            splitter2 = self.ThinkSplitter(self.think_open, self.think_close)
+            splitter2.feed(follow_content)
+            splitter2.flush()
+            splitter.result_parts.extend(splitter2.result_parts)
+
+        # Yield [DONE]
+        yield b"data: [DONE]\n\n"
 
         elapsed = time.time() - t0
         if self.tps_sink:
@@ -424,29 +595,45 @@ class Pipeline:
         conversation_id: str,
         turn_index: int,
     ) -> dict:
-        t0 = time.time()
-        async with httpx.AsyncClient() as client:
-            payload = {**body, "messages": self._fit_messages(augmented_messages), "stream": False}
-            resp = await client.post(
-                f"{self.config.reasoning_endpoint}/v1/chat/completions",
-                json=payload,
-                timeout=300,
-            )
-            resp.raise_for_status()
-            result = resp.json()
-        elapsed = time.time() - t0
+        # Tool-call loop: keep calling the LLM until no more tool_calls (max 5 rounds)
+        messages = list(augmented_messages)
+        for _ in range(5):
+            t0 = time.time()
+            async with httpx.AsyncClient() as client:
+                payload = {**body, "messages": self._fit_messages(messages), "stream": False}
+                resp = await client.post(
+                    f"{self.config.reasoning_endpoint}/v1/chat/completions",
+                    json=payload,
+                    timeout=300,
+                )
+                resp.raise_for_status()
+                result = resp.json()
+            elapsed = time.time() - t0
 
-        self._report_usage(result.get("usage") or {})
+            self._report_usage(result.get("usage") or {})
 
-        usage = result.get("usage") or {}
-        completion_tokens = usage.get("completion_tokens")
-        if completion_tokens is None:
-            content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-            completion_tokens = len(content.split())
-        if self.tps_sink:
-            self.tps_sink(completion_tokens, elapsed)
+            usage = result.get("usage") or {}
+            completion_tokens = usage.get("completion_tokens")
+            if completion_tokens is None:
+                content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                completion_tokens = len(content.split())
+            if self.tps_sink:
+                self.tps_sink(completion_tokens, elapsed)
 
-        message = result.get("choices", [{}])[0].get("message", {})
+            message = result.get("choices", [{}])[0].get("message", {})
+            tool_calls = message.get("tool_calls")
+
+            if not tool_calls:
+                break
+
+            # Execute tool calls and append results
+            tool_results = await self._handle_tool_calls(messages, tool_calls)
+            messages.append(message)
+            messages.extend(tool_results)
+        else:
+            # If loop exhausted, take whatever the LLM gave us
+            pass
+
         response_text = message.get("content", "") or ""
         reasoning_content = message.get("reasoning_content", "") or ""
 

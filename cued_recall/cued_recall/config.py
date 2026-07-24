@@ -18,6 +18,17 @@ class JudgeConfig:
         self.summary_max_tokens: int = d.get("summary_max_tokens", 400)
 
 
+class WebSearchConfig:
+    def __init__(self, d: dict):
+        self.enabled: bool = d.get("enabled", True)
+        # backend: "duckduckgo" (no key), "searxng", "brave", "serper"
+        self.backend: str = d.get("backend", "duckduckgo")
+        self.searxng_url: str = d.get("searxng_url", "")
+        self.api_key: str = d.get("api_key", "")
+        self.max_results: int = d.get("max_results", 5)
+        self.fetch_top_n: int = d.get("fetch_top_n", 0)
+
+
 class ServerConfig:
     def __init__(self, d: dict):
         self.model: str = d.get("model", "")
@@ -48,6 +59,7 @@ class Config:
         self.servers: dict = raw.get("servers", {})
         self.models_dir: str = raw.get("models_dir", "./models")
         self.max_context_tokens: int = raw.get("max_context_tokens", 28000)
+        self.web_search = WebSearchConfig(raw.get("web_search", {}))
 
     def get_server(self, name: str) -> ServerConfig:
         return ServerConfig(self.servers.get(name, {}))
