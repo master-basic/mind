@@ -421,15 +421,33 @@ class Pipeline:
 
     # ---- Tool plumbing ----------------------------------------------------
 
+    # Tools this middleware implements and executes itself. Anything else in a
+    # tool_call belongs to the client (opencode's bash/read/edit/...) and must
+    # be forwarded to it, never executed here.
+    OWN_TOOLS = {"web_fetch", "web_search"}
+
     def _inject_tools(self, body: dict) -> dict:
-        tools = body.get("tools") or []
-        existing_names = {t.get("function", {}).get("name") for t in tools if t.get("type") == "function"}
-        if "web_fetch" not in existing_names:
-            tools.append(WEB_FETCH_TOOL)
+        """Add our web tools -- but only for plain chat clients.
+
+        If the caller supplied its own tools it is an agentic client that
+        executes tools on its side (and already ships its own web fetch and
+        search). Injecting ours there would put tools in the prompt that the
+        client cannot run and that we would have to intercept, so leave an
+        agentic client's tool set exactly as it sent it.
+        """
+        client_tools = body.get("tools") or []
+        if client_tools:
+            return body
+        tools = []
+        tools.append(WEB_FETCH_TOOL)
         ws = getattr(self.config, "web_search", None)
-        if ws and ws.enabled and "web_search" not in existing_names:
+        if ws and ws.enabled:
             tools.append(WEB_SEARCH_TOOL)
         return {**body, "tools": tools}
+
+    @staticmethod
+    def _client_owns_tools(body: dict) -> bool:
+        return bool(body.get("tools"))
 
     async def _handle_tool_calls(self, messages: list, tool_calls: list) -> list:
         if not tool_calls:
@@ -654,12 +672,18 @@ class Pipeline:
         recall_text = self.build_recall_injection(recall_blocks)
         augmented_messages = self.build_messages(base_messages, recall_text)
 
-        # Inject web_fetch / web_search tools so the LLM can research.
+        # Inject web_fetch / web_search tools so the LLM can research. Skipped
+        # when the client brought its own tools (see _inject_tools).
         body_with_tools = self._inject_tools(body)
 
         # Hard rule: for "search"/"latest"/etc. queries, force a web_search on
-        # the first turn instead of trusting the model to decide.
-        force_search = self._should_force_search(user_message)
+        # the first turn instead of trusting the model to decide. Only valid
+        # when we actually injected web_search -- forcing tool_choice for a
+        # tool that isn't in the request would make llama.cpp reject it.
+        force_search = (
+            not self._client_owns_tools(body)
+            and self._should_force_search(user_message)
+        )
 
         if body.get("stream", False):
             return await self._process_streaming(
@@ -857,6 +881,27 @@ class Pipeline:
                     break
 
                 calls = list(tool_calls_by_index.values())
+
+                # Calls for tools we don't implement belong to the client
+                # (opencode's bash/read/edit/...). Forward them and stop:
+                # the client executes them and sends the results back as a
+                # new request. Running them through _handle_tool_calls here
+                # would answer every one with "Unknown tool", which the model
+                # then retries -- burning MAX_TOOL_ROUNDS inference passes and
+                # leaving the client believing no tool was ever called.
+                foreign = [c for c in calls if c["name"] not in self.OWN_TOOLS]
+                if foreign:
+                    for i, c in enumerate(foreign):
+                        yield sse({"tool_calls": [{
+                            "index": i,
+                            "id": c["id"] or f"call_{uuid.uuid4().hex[:8]}",
+                            "type": "function",
+                            "function": {"name": c["name"],
+                                         "arguments": c["arguments"]},
+                        }]})
+                    upstream_finish = "tool_calls"
+                    break
+
                 names = ", ".join(c["name"] for c in calls if c["name"]) or "tool"
                 # Surface activity in the Reasoning panel (not stored as a block).
                 note = f"\n[running {names}…]\n"
@@ -960,6 +1005,13 @@ class Pipeline:
 
             if not tool_calls:
                 break
+
+            # Tools we don't implement belong to the client -- hand the whole
+            # response back untouched so it can run them, instead of replying
+            # "Unknown tool" to itself for MAX rounds. See the streaming path.
+            if any(tc.get("function", {}).get("name") not in self.OWN_TOOLS
+                   for tc in tool_calls):
+                return result
 
             # Execute tool calls and append results
             tool_results = await self._handle_tool_calls(messages, tool_calls)
