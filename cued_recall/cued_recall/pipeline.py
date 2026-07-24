@@ -49,30 +49,45 @@ class Pipeline:
         Oldest middle messages are dropped first. If a single message exceeds
         the limit, it is hard-truncated.
         """
+        def _msg_tokens(m):
+            c = m.get("content", "")
+            if isinstance(c, list):
+                c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+            return len(c.split())
+
+        def _set_content(m, text):
+            c = m.get("content", "")
+            if isinstance(c, list):
+                # Replace text in first text part, drop others
+                new_parts = [{"type": "text", "text": text}]
+                return {**m, "content": new_parts}
+            return {**m, "content": text}
+
         limit = self.config.max_context_tokens
-        total = sum(len(m.get("content", "").split()) for m in messages)
+        total = sum(_msg_tokens(m) for m in messages)
         if total <= limit:
             return messages
 
         result = list(messages)
         # Drop oldest middle messages (between system and latest user) first
         while len(result) > 2 and total > limit:
-            # Find the oldest non-system, non-last-user message
             drop_idx = 1  # skip system at 0
             dropped = result.pop(drop_idx)
-            total -= len(dropped.get("content", "").split())
+            total -= _msg_tokens(dropped)
 
         # If still over, truncate the last user message
         if total > limit and result:
             last = result[-1]
-            content = last.get("content", "")
-            words = content.split()
+            c = last.get("content", "")
+            if isinstance(c, list):
+                c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+            words = c.split()
             excess = total - limit
             if len(words) > excess:
                 truncated = " ".join(words[excess:])
-                result[-1] = {**last, "content": truncated}
+                result[-1] = _set_content(last, truncated)
             else:
-                result[-1] = {**last, "content": ""}
+                result[-1] = _set_content(last, "")
         return result
 
     @staticmethod
