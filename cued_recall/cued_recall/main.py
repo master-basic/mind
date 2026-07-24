@@ -176,15 +176,13 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
                             pass
             except Exception:
                 pass
-            # Prefer live /metrics; otherwise fall back to the last real token
-            # usage the middleware recorded from this model's responses.
+            # Prefer live /metrics; otherwise show n/a (total_tokens is not
+            # a reliable proxy for KV cache usage).
             if info["kv_used_ratio"] is None:
-                tracked = ctx_usage.get(name)
-                if tracked and info["n_ctx"]:
-                    used = min(int(tracked["total_tokens"]), int(info["n_ctx"]))
-                    info["used_tokens"] = used
-                    info["kv_used_ratio"] = used / info["n_ctx"]
-                    info["source"] = "last-request"
+                if info["n_ctx"] is not None:
+                    info["used_tokens"] = 0
+                    info["kv_used_ratio"] = 0
+                    info["source"] = "no-metrics"
             elif info["n_ctx"] is not None:
                 info["used_tokens"] = int(info["n_ctx"] * info["kv_used_ratio"])
                 info["source"] = "live"
