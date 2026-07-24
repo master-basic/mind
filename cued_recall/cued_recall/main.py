@@ -43,6 +43,11 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
     index = VectorIndex(store_path, dim=embed_dim)
     index.open()
 
+    # run.py derives max_context_tokens from the ctx-size it launches with,
+    # but the reasoning server may have been started separately with a
+    # smaller window. Trust the live server over the config file.
+    _clamp_context_budget(cfg)
+
     pipeline = Pipeline(cfg, store, index, embed, wal)
     judge = Judge(cfg, store, index, wal)
     tagger = Tagger(cfg, store, index, wal)
@@ -245,6 +250,66 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
         models = await asyncio.gather(*[probe(n, u) for n, u in targets])
         return {"models": list(models)}
 
+    @app.post("/admin/kv/clear")
+    async def clear_kv_cache():
+        """Erase the llama-server slot KV caches.
+
+        This drops cached prompt prefixes; it does not return VRAM, since the
+        KV buffer is allocated once at model load. Use it to force a clean
+        re-prefill when a slot is holding stale or unwanted context.
+        """
+        import httpx
+
+        targets = [
+            ("reasoning", cfg.reasoning_endpoint),
+            ("judge", cfg.judge_endpoint),
+        ]
+        results = {}
+        for name, base in targets:
+            base = (base or "").rstrip("/")
+            entry = {"cleared": 0, "slots": 0, "error": None}
+            try:
+                async with httpx.AsyncClient(timeout=20) as client:
+                    r = await client.get(base + "/slots")
+                    if r.status_code != 200:
+                        entry["error"] = f"/slots returned {r.status_code}"
+                        results[name] = entry
+                        continue
+                    slots = r.json()
+                    if not isinstance(slots, list):
+                        entry["error"] = "unexpected /slots payload"
+                        results[name] = entry
+                        continue
+                    entry["slots"] = len(slots)
+                    for s in slots:
+                        sid = s.get("id")
+                        if sid is None:
+                            continue
+                        er = await client.post(f"{base}/slots/{sid}?action=erase")
+                        if er.status_code == 200:
+                            entry["cleared"] += 1
+                        elif er.status_code == 501:
+                            # Server started without --slot-save-path.
+                            entry["error"] = (
+                                "server not started with --slot-save-path "
+                                "(restart via run.py to enable)"
+                            )
+                            break
+                        else:
+                            entry["error"] = f"slot {sid}: HTTP {er.status_code}"
+            except Exception as e:
+                entry["error"] = str(e)
+            results[name] = entry
+
+        total = sum(v["cleared"] for v in results.values())
+        wal.write({
+            "event": "admin_kv_clear",
+            "cleared_slots": total,
+            "detail": {k: v["cleared"] for k, v in results.items()},
+            "timestamp": time.time(),
+        })
+        return {"status": "ok", "cleared_slots": total, "servers": results}
+
     admin_router = build_admin_router(index, store, wal, run_judge_pass, tps_ring, embed)
     app.include_router(admin_router)
 
@@ -389,6 +454,36 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
         return JSONResponse(content=result)
 
     return app
+
+
+def _clamp_context_budget(cfg: Config):
+    """Lower max_context_tokens if it exceeds the reasoning server's n_ctx.
+
+    The prompt and the generated reply share one window, so the budget must
+    leave room for the reply as well. Best-effort: if the server can't be
+    probed, keep whatever the config says.
+    """
+    import httpx
+
+    RESERVE_OUTPUT = 4096
+    try:
+        r = httpx.get(cfg.reasoning_endpoint.rstrip("/") + "/props", timeout=5)
+        if r.status_code != 200:
+            return
+        d = r.json()
+        gs = d.get("default_generation_settings", {}) or {}
+        n_ctx = gs.get("n_ctx") or d.get("n_ctx")
+    except Exception:
+        return
+    if not n_ctx:
+        return
+    ceiling = max(2048, int(n_ctx) - RESERVE_OUTPUT)
+    if cfg.max_context_tokens > ceiling:
+        print(
+            f"[WARN] max_context_tokens {cfg.max_context_tokens} exceeds the "
+            f"reasoning server's context ({n_ctx}); clamping to {ceiling}"
+        )
+        cfg.max_context_tokens = ceiling
 
 
 def _detect_embed_dim(embed: EmbeddingClient, cfg: Config) -> int:

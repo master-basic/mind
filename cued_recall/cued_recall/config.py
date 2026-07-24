@@ -101,7 +101,12 @@ class Config:
         ])
         self.servers: dict = raw.get("servers", {})
         self.models_dir: str = raw.get("models_dir", "./models")
-        self.max_context_tokens: int = raw.get("max_context_tokens", 28000)
+        # Prompt budget in real tokens (run.py derives this from the reasoning
+        # server's --ctx-size, leaving room for the reply and tool defs).
+        self.max_context_tokens: int = raw.get("max_context_tokens", 26624)
+        # Multiplier converting whitespace word counts into estimated tokens.
+        # ~1.3 for prose; raise it for code- or CJK-heavy workloads.
+        self.tokens_per_word: float = raw.get("tokens_per_word", 1.3)
         self.web_search = WebSearchConfig(raw.get("web_search", {}))
 
     def get_server(self, name: str) -> ServerConfig:

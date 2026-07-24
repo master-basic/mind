@@ -133,13 +133,19 @@ class Pipeline:
         Oldest middle messages are dropped first. If a single message exceeds
         the limit, it is hard-truncated.
         """
+        # Word count understates real tokens by roughly a third, so a limit
+        # applied to raw word counts lets prompts through that overflow the
+        # server's actual context window. Scale to an estimated token count so
+        # max_context_tokens means what its name says.
+        ratio = self.config.tokens_per_word
+
         def _msg_tokens(m):
             c = m.get("content", "")
             if c is None:  # assistant tool-call messages carry content=None
                 return 0
             if isinstance(c, list):
                 c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
-            return len(c.split())
+            return int(len(c.split()) * ratio)
 
         def _set_content(m, text):
             c = m.get("content", "")
@@ -168,9 +174,11 @@ class Pipeline:
             if isinstance(c, list):
                 c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
             words = c.split()
-            excess = total - limit
-            if len(words) > excess:
-                truncated = " ".join(words[excess:])
+            # `total`/`limit` are token estimates; convert the overshoot back
+            # into words before slicing, rounding up so we never undershoot.
+            excess_words = int((total - limit) / ratio) + 1
+            if len(words) > excess_words:
+                truncated = " ".join(words[excess_words:])
                 result[-1] = _set_content(last, truncated)
             else:
                 result[-1] = _set_content(last, "")

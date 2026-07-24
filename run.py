@@ -506,6 +506,31 @@ def resolve_models(args, storage_root, hf_hub):
     return result
 
 
+# Headroom carved out of the reasoning server's context window.
+#   - the reply itself shares the same window as the prompt
+#   - tool definitions ride along in the request but are not counted by
+#     _fit_messages, and an agentic client's tool set is not small
+RESERVE_OUTPUT_TOKENS = 4096
+RESERVE_TOOLS_TOKENS = 2048
+
+
+def reasoning_ctx_size() -> int:
+    """The --ctx-size this launcher passes to the reasoning server."""
+    extra = SERVER_DEFAULTS["reasoning"]["extra"]
+    for i, a in enumerate(extra):
+        if a == "--ctx-size" and i + 1 < len(extra):
+            try:
+                return int(extra[i + 1])
+            except ValueError:
+                break
+    return 32768
+
+
+def derive_max_context_tokens() -> int:
+    ctx = reasoning_ctx_size()
+    return max(4096, ctx - RESERVE_OUTPUT_TOKENS - RESERVE_TOOLS_TOKENS)
+
+
 def update_config(storage_root, snapshot_path, args):
     import yaml
     # encoding="utf-8" is required: config.yaml holds non-ASCII correction
@@ -516,6 +541,15 @@ def update_config(storage_root, snapshot_path, args):
     config["store_path"] = str(storage_root / "store")
     config["snapshot_path"] = str(snapshot_path)
     config["models_dir"] = str(storage_root / "models")
+    # Keep the prompt budget tied to the context window actually being served,
+    # so the two can't drift apart and overflow.
+    derived = derive_max_context_tokens()
+    if config.get("max_context_tokens") != derived:
+        info(f"max_context_tokens: {derived} "
+             f"(ctx {reasoning_ctx_size()} - {RESERVE_OUTPUT_TOKENS} reply "
+             f"- {RESERVE_TOOLS_TOKENS} tools)")
+    config["max_context_tokens"] = derived
+    config.setdefault("tokens_per_word", 1.3)
     config["listen"] = f"127.0.0.1:{args.middleware_port}"
     config["reasoning_endpoint"] = f"http://127.0.0.1:{args.reasoning_port}"
     config["judge_endpoint"] = f"http://127.0.0.1:{args.judge_port}"
@@ -646,6 +680,16 @@ def main():
             # system RAM so 17-20 GB A3B models run on a 12 GB card.
             extra.append("--cpu-moe")
             info("Reasoning is MoE: adding --cpu-moe (experts in system RAM)")
+        if name in ("reasoning", "judge"):
+            # llama-server rejects every /slots action with 501 unless it was
+            # started with --slot-save-path -- including "erase", which writes
+            # nothing. The flag only unlocks the endpoint; KV state is written
+            # to this directory solely on an explicit action=save, which
+            # nothing here issues, so it stays empty. Required for the admin
+            # page's Clear KV Cache button.
+            slot_dir = storage_root / "slots" / name
+            slot_dir.mkdir(parents=True, exist_ok=True)
+            extra += ["--slot-save-path", str(slot_dir)]
         server_defs.append({
             "name": name,
             "model": model_path,

@@ -94,6 +94,7 @@ tr:hover td { background: #161b22; }
   <button onclick="loadBlocks()">Refresh</button>
   <button class="btn-danger" id="btn-delete" onclick="deleteSelected()" disabled>Delete Selected <span id="sel-count"></span></button>
   <button class="btn-danger" onclick="runJudge()">Run Judge Pass</button>
+  <button class="btn-danger" onclick="clearKv()">Clear KV Cache</button>
   <button onclick="exportBlocks()">Export</button>
   <input type="file" id="import-file" accept="application/json" style="display:none">
   <button onclick="document.getElementById('import-file').click()">Import</button>
@@ -338,6 +339,24 @@ document.getElementById('import-file').addEventListener('change', async function
     e.target.value = '';
   }
 });
+
+async function clearKv() {
+  if (!confirm('Clear the llama-server KV caches?\n\nThis drops cached prompt prefixes, so the next message re-processes its full history (slower for one turn). It does not free VRAM and does not delete any stored memory blocks.')) return;
+  try {
+    const r = await fetch(API + '/admin/kv/clear', { method: 'POST' });
+    const data = await r.json();
+    const lines = [];
+    for (const [name, info] of Object.entries(data.servers || {})) {
+      lines.push(info.error
+        ? `${name}: ${info.error}`
+        : `${name}: cleared ${info.cleared}/${info.slots} slot(s)`);
+    }
+    alert(`KV cache: ${data.cleared_slots || 0} slot(s) cleared\n\n${lines.join('\n')}`);
+    refresh();
+  } catch (e) {
+    alert('Error: ' + e.message);
+  }
+}
 
 async function runJudge() {
   if (!confirm('Force a judge pass? This may take a while.')) return;
