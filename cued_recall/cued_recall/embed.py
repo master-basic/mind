@@ -6,6 +6,7 @@ class EmbeddingClient:
     def __init__(self, endpoint: str):
         self.url = endpoint.rstrip("/") + "/v1/embeddings"
         self._client = httpx.Client(timeout=60)
+        self.usage_sink = None
 
     # Hard safety cap so no single input can exceed the embed model's context
     # and 500 the server. ~16k chars stays well under an 8192-token window even
@@ -23,6 +24,15 @@ class EmbeddingClient:
         resp.raise_for_status()
         data = resp.json()
         vec = data["data"][0]["embedding"]
+        if self.usage_sink:
+            usage = data.get("usage") or {}
+            total = usage.get("total_tokens")
+            if total is None:
+                pt = usage.get("prompt_tokens", 0) or 0
+                ct = usage.get("completion_tokens", 0) or 0
+                total = pt + ct or None
+            if total is not None:
+                self.usage_sink(total)
         norm = sum(x * x for x in vec) ** 0.5
         if norm > 0:
             vec = [x / norm for x in vec]

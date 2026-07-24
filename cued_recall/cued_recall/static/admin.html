@@ -50,6 +50,9 @@ tr:hover td { background: #161b22; }
 .filters button:hover { background: #2ea043; }
 .filters .btn-danger { background: #da3633; }
 .filters .btn-danger:hover { background: #f85149; }
+.chk-cell { width: 32px; text-align: center; }
+.chk { width: 14px; height: 14px; cursor: pointer; accent-color: #58a6ff; }
+#sel-count { font-size: 12px; color: #8b949e; margin-left: 8px; }
 </style>
 </head>
 <body>
@@ -63,6 +66,9 @@ tr:hover td { background: #161b22; }
 
 <h2>Stats</h2>
 <div class="stats-grid" id="stats-grid"></div>
+
+<h2>Tokens / sec</h2>
+<div class="stats-grid" id="tps-grid"></div>
 
 <h2>Blocks</h2>
 <div class="filters">
@@ -81,12 +87,14 @@ tr:hover td { background: #161b22; }
   </select>
   <input type="text" id="filter-conv" placeholder="conversation_id" size="24">
   <button onclick="loadBlocks()">Refresh</button>
+  <button class="btn-danger" id="btn-delete" onclick="deleteSelected()" disabled>Delete Selected <span id="sel-count"></span></button>
   <button class="btn-danger" onclick="runJudge()">Run Judge Pass</button>
 </div>
 
 <div style="overflow-x: auto;">
 <table>
 <thead><tr>
+  <th class="chk-cell"><input type="checkbox" id="sel-all" class="chk" title="Select all"></th>
   <th>block_id</th>
   <th>type</th>
   <th>status</th>
@@ -103,6 +111,13 @@ tr:hover td { background: #161b22; }
 
 <script>
 const API = '';
+const selected = new Set();
+
+function updateSelUI() {
+  const n = selected.size;
+  document.getElementById('sel-count').textContent = n ? `(${n})` : '';
+  document.getElementById('btn-delete').disabled = n === 0;
+}
 
 async function loadServerInfo() {
   try {
@@ -174,6 +189,34 @@ async function loadStats() {
   }
 }
 
+async function loadTps() {
+  try {
+    const r = await fetch(API + '/admin/tps');
+    const data = await r.json();
+    const grid = document.getElementById('tps-grid');
+    grid.innerHTML = '';
+
+    const cards = [
+      { label: 'Avg T/S', value: data.avg_tps || 0 },
+      { label: 'Samples', value: data.count || 0 },
+    ];
+
+    const recent = data.recent || [];
+    if (recent.length) {
+      const last = recent[recent.length - 1];
+      cards.push({ label: 'Last T/S', value: last.tps });
+      cards.push({ label: 'Last Tokens', value: last.tokens });
+      cards.push({ label: 'Last Elapsed', value: last.elapsed + 's' });
+    }
+
+    for (const c of cards) {
+      grid.innerHTML += `<div class="stat-card"><div class="value">${c.value}</div><div class="label">${c.label}</div></div>`;
+    }
+  } catch (e) {
+    document.getElementById('tps-grid').innerHTML = `<div class="stat-card" style="color:#f85149">Error: ${e.message}</div>`;
+  }
+}
+
 async function loadBlocks() {
   const status = document.getElementById('filter-status').value;
   const type = document.getElementById('filter-type').value;
@@ -191,15 +234,17 @@ async function loadBlocks() {
 
     for (const b of data.items || []) {
       const created = new Date(b.created_at * 1000);
+      const checked = selected.has(b.block_id) ? 'checked' : '';
       tbody.innerHTML += `<tr>
-        <td title="${b.block_id}">${b.block_id.slice(0, 8)}..</td>
+        <td class="chk-cell"><input type="checkbox" class="chk" data-id="${b.block_id}" ${checked}></td>
+        <td title="${b.block_id}">${b.block_id}</td>
         <td>${b.type}</td>
         <td><span class="badge badge-${b.status}">${b.status}</span></td>
         <td class="verification-${b.verification}">${b.verification}</td>
         <td>${b.token_count}</td>
         <td>${b.recall_count}</td>
         <td title="${created.toISOString()}">${created.toLocaleString()}</td>
-        <td title="${b.conversation_id || ''}">${(b.conversation_id || '').slice(0, 12)}..</td>
+        <td title="${b.conversation_id || ''}">${b.conversation_id || ''}</td>
         <td>${b.turn_index}</td>
       </tr>`;
     }
@@ -227,11 +272,50 @@ async function runJudge() {
 
 async function refresh() {
   document.getElementById('last-updated').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
-  await Promise.all([loadServerInfo(), loadModels(), loadStats(), loadBlocks()]);
+  await Promise.all([loadServerInfo(), loadModels(), loadStats(), loadTps(), loadBlocks()]);
 }
 
 document.getElementById('filter-status').addEventListener('change', loadBlocks);
 document.getElementById('filter-type').addEventListener('change', loadBlocks);
+
+document.getElementById('sel-all').addEventListener('change', function() {
+  const boxes = document.querySelectorAll('#blocks-tbody .chk');
+  boxes.forEach(cb => {
+    cb.checked = this.checked;
+    const id = cb.dataset.id;
+    if (this.checked) selected.add(id); else selected.delete(id);
+  });
+  updateSelUI();
+});
+
+document.getElementById('blocks-tbody').addEventListener('change', function(e) {
+  if (e.target.classList.contains('chk')) {
+    const id = e.target.dataset.id;
+    if (e.target.checked) selected.add(id); else selected.delete(id);
+    updateSelUI();
+  }
+});
+
+async function deleteSelected() {
+  const ids = [...selected];
+  if (!ids.length) return;
+  if (!confirm(`Delete ${ids.length} block(s)? This cannot be undone.`)) return;
+  try {
+    const r = await fetch(API + '/admin/blocks/delete', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({block_ids: ids}),
+    });
+    const data = await r.json();
+    selected.clear();
+    updateSelUI();
+    document.getElementById('sel-all').checked = false;
+    alert(`Deleted ${data.deleted || 0} block(s)`);
+    loadBlocks();
+  } catch (e) {
+    alert('Error: ' + e.message);
+  }
+}
 
 refresh();
 setInterval(refresh, 5000);

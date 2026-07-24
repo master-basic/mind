@@ -26,6 +26,7 @@ class Judge:
         self.index = index
         self.wal = wal
         self.judge_url = config.judge_endpoint.rstrip("/") + "/v1/chat/completions"
+        self.usage_sink = None
 
     async def run_pass(self, min_age: Optional[float] = None) -> int:
         # Manual runs pass min_age=0 to judge all shelved blocks now; the
@@ -90,6 +91,15 @@ class Judge:
                     .get("message", {})
                     .get("content", "")
                 )
+                if self.usage_sink:
+                    usage = data.get("usage") or {}
+                    total = usage.get("total_tokens")
+                    if total is None:
+                        pt = usage.get("prompt_tokens", 0) or 0
+                        ct = usage.get("completion_tokens", 0) or 0
+                        total = pt + ct or None
+                    if total is not None:
+                        self.usage_sink(total)
         except Exception as e:
             self.wal.write({
                 "event": "judge_error",

@@ -2,10 +2,12 @@ listen: 127.0.0.1:8000
 reasoning_endpoint: http://127.0.0.1:8080
 judge_endpoint: http://127.0.0.1:8081
 embed_endpoint: http://127.0.0.1:8082
-think_tags: ["<think>", "</think>"]
-store_path: /mnt/ramdisk/cued_recall/store
-snapshot_path: /var/lib/cued_recall/snapshots  # MUST be persistent storage, not tmpfs
-models_dir: /mnt/ramdisk/cued_recall/models
+think_tags:
+- <think>
+- </think>
+store_path: r:\cued_recall\store
+snapshot_path: C:\ailab\mind\snapshots
+models_dir: r:\cued_recall\models
 snapshot_interval_min: 15
 block_tokens_reasoning: 8000
 recall:
@@ -18,8 +20,8 @@ judge:
   purge_age_s: 1209600
   summary_max_tokens: 400
 correction_patterns:
-  - "that's wrong"
-  - "doesn't work"
-  - "^no[,.]"
-  - "səhvdir"
-  - "işləmir"
+- that's wrong
+- doesn't work
+- ^no[,.]
+- səhvdir
+- işləmir

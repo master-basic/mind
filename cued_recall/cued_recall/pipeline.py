@@ -40,6 +40,40 @@ class Pipeline:
         self.think_close = config.think_tags[1]
         self.token_sink = None
         self.usage_sink = None
+        self.tps_sink = None
+
+    def _fit_messages(self, messages: list) -> list:
+        """Truncate messages to fit within max_context_tokens.
+
+        Preserves the system message (index 0) and the latest user message.
+        Oldest middle messages are dropped first. If a single message exceeds
+        the limit, it is hard-truncated.
+        """
+        limit = self.config.max_context_tokens
+        total = sum(len(m.get("content", "").split()) for m in messages)
+        if total <= limit:
+            return messages
+
+        result = list(messages)
+        # Drop oldest middle messages (between system and latest user) first
+        while len(result) > 2 and total > limit:
+            # Find the oldest non-system, non-last-user message
+            drop_idx = 1  # skip system at 0
+            dropped = result.pop(drop_idx)
+            total -= len(dropped.get("content", "").split())
+
+        # If still over, truncate the last user message
+        if total > limit and result:
+            last = result[-1]
+            content = last.get("content", "")
+            words = content.split()
+            excess = total - limit
+            if len(words) > excess:
+                truncated = " ".join(words[excess:])
+                result[-1] = {**last, "content": truncated}
+            else:
+                result[-1] = {**last, "content": ""}
+        return result
 
     @staticmethod
     def _usage_total(usage: dict) -> Optional[int]:
@@ -296,10 +330,12 @@ class Pipeline:
         # `reasoning_content` delta field. Capture both so reasoning blocks are
         # still created when the tags aren't inline.
         reasoning_content_parts: List[str] = []
+        t0 = time.time()
+        token_count = 0
 
         async with httpx.AsyncClient() as client:
             payload = {
-                **body, "messages": augmented_messages, "stream": True,
+                **body, "messages": self._fit_messages(augmented_messages), "stream": True,
                 "stream_options": {"include_usage": True},
             }
             async with client.stream(
@@ -330,9 +366,14 @@ class Pipeline:
                     if not delta:
                         continue
                     response_text += delta
+                    token_count += len(delta.split())
                     splitter.feed(delta)
 
                 splitter.flush()
+
+        elapsed = time.time() - t0
+        if self.tps_sink:
+            self.tps_sink(token_count, elapsed)
 
         full_reasoning = (
             "".join(reasoning_content_parts) + "".join(splitter.reasoning_parts)
@@ -369,8 +410,9 @@ class Pipeline:
         conversation_id: str,
         turn_index: int,
     ) -> dict:
+        t0 = time.time()
         async with httpx.AsyncClient() as client:
-            payload = {**body, "messages": augmented_messages, "stream": False}
+            payload = {**body, "messages": self._fit_messages(augmented_messages), "stream": False}
             resp = await client.post(
                 f"{self.config.reasoning_endpoint}/v1/chat/completions",
                 json=payload,
@@ -378,8 +420,17 @@ class Pipeline:
             )
             resp.raise_for_status()
             result = resp.json()
+        elapsed = time.time() - t0
 
         self._report_usage(result.get("usage") or {})
+
+        usage = result.get("usage") or {}
+        completion_tokens = usage.get("completion_tokens")
+        if completion_tokens is None:
+            content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+            completion_tokens = len(content.split())
+        if self.tps_sink:
+            self.tps_sink(completion_tokens, elapsed)
 
         message = result.get("choices", [{}])[0].get("message", {})
         response_text = message.get("content", "") or ""

@@ -9,7 +9,7 @@ from .store import BlockStore
 from .wal import WAL
 
 
-def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_run_fn):
+def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_run_fn, tps_ring: list):
     router = APIRouter(prefix="/admin")
 
     @router.get("/blocks")
@@ -56,6 +56,23 @@ def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_ru
         })
         return {"status": "ok"}
 
+    @router.post("/blocks/delete")
+    async def delete_blocks(body: dict):
+        block_ids = body.get("block_ids", [])
+        if not block_ids:
+            raise HTTPException(status_code=400, detail="no block_ids provided")
+        deleted = 0
+        for bid in block_ids:
+            index.delete_meta(bid)
+            store.delete_file(bid)
+            deleted += 1
+        wal.write({
+            "event": "admin_delete_blocks",
+            "count": deleted,
+            "timestamp": time.time(),
+        })
+        return {"status": "ok", "deleted": deleted}
+
     @router.post("/judge/run")
     async def run_judge():
         # Manual trigger judges all shelved blocks now (ignore the age gate).
@@ -72,5 +89,12 @@ def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_ru
             "msgpack_files": block_files,
             "wal_events": wal_events,
         }
+
+    @router.get("/tps")
+    async def tps():
+        if not tps_ring:
+            return {"recent": [], "avg_tps": 0, "count": 0}
+        avg = sum(e["tps"] for e in tps_ring) / len(tps_ring)
+        return {"recent": tps_ring[-20:], "avg_tps": round(avg, 1), "count": len(tps_ring)}
 
     return router

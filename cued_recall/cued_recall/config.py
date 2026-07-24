@@ -47,6 +47,7 @@ class Config:
         ])
         self.servers: dict = raw.get("servers", {})
         self.models_dir: str = raw.get("models_dir", "./models")
+        self.max_context_tokens: int = raw.get("max_context_tokens", 28000)
 
     def get_server(self, name: str) -> ServerConfig:
         return ServerConfig(self.servers.get(name, {}))

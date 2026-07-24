@@ -82,6 +82,24 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
             pass
 
     pipeline.usage_sink = lambda total: _record_usage("reasoning", total)
+    judge.usage_sink = lambda total: _record_usage("judge", total)
+    embed.usage_sink = lambda total: _record_usage("embed", total)
+
+    # T/S (tokens per second) tracking — ring buffer of recent completions
+    tps_ring = []  # list of {"tokens": int, "elapsed": float, "tps": float, "at": float}
+    TPS_RING_MAX = 50
+
+    def _record_tps(tokens: int, elapsed: float):
+        if tokens <= 0 or elapsed <= 0:
+            return
+        tps = tokens / elapsed
+        tps_ring.append({"tokens": tokens, "elapsed": round(elapsed, 3), "tps": round(tps, 1), "at": time.time()})
+        if len(tps_ring) > TPS_RING_MAX:
+            tps_ring.pop(0)
+
+    pipeline.tps_sink = _record_tps
+    judge.tps_sink = _record_tps
+    embed.tps_sink = _record_tps
 
     from fastapi.responses import HTMLResponse
     import pathlib
@@ -175,7 +193,7 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
         models = await asyncio.gather(*[probe(n, u) for n, u in targets])
         return {"models": list(models)}
 
-    admin_router = build_admin_router(index, store, wal, run_judge_pass)
+    admin_router = build_admin_router(index, store, wal, run_judge_pass, tps_ring)
     app.include_router(admin_router)
 
     snapshot_task = None
