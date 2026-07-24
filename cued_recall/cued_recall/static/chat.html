@@ -157,16 +157,19 @@ function splitThink(text) {
   return { reasoning, answer };
 }
 
-function renderAssistant(bodyEl, fullText) {
+function renderAssistant(bodyEl, fullText, separateReasoning) {
   const { reasoning, answer } = splitThink(fullText);
+  // Reasoning may arrive inline as <think>… or via a separate field.
+  let allReasoning = (separateReasoning || '').trim();
+  if (reasoning) allReasoning = (allReasoning ? allReasoning + '\n' : '') + reasoning;
   bodyEl.innerHTML = '';
-  if (reasoning) {
+  if (allReasoning) {
     const d = el('details', 'think');
     d.appendChild(el('summary', null, 'Reasoning'));
-    d.appendChild(el('div', 'think-body', reasoning));
+    d.appendChild(el('div', 'think-body', allReasoning));
     bodyEl.appendChild(d);
   }
-  bodyEl.appendChild(el('div', null, answer || (reasoning ? '' : fullText)));
+  bodyEl.appendChild(el('div', null, answer || (allReasoning ? '' : fullText)));
   $messages.scrollTop = $messages.scrollHeight;
 }
 
@@ -207,6 +210,7 @@ async function send() {
 
   const bodyEl = addMessage('assistant', '…');
   let full = '';
+  let reasoningText = '';
   controller = new AbortController();
   setGenerating(true);
 
@@ -246,18 +250,21 @@ async function send() {
         if (data === '[DONE]') continue;
         try {
           const json = JSON.parse(data);
-          const delta = json.choices?.[0]?.delta?.content || '';
-          if (delta) { full += delta; renderAssistant(bodyEl, full); }
+          const d = json.choices?.[0]?.delta || {};
+          if (d.reasoning_content) reasoningText += d.reasoning_content;
+          if (d.content) full += d.content;
+          if (d.reasoning_content || d.content) renderAssistant(bodyEl, full, reasoningText);
         } catch { /* ignore keep-alives / partials */ }
       }
     }
-    if (!full) renderAssistant(bodyEl, '(no content)');
+    if (!full && !reasoningText) renderAssistant(bodyEl, '(no content)');
+    else renderAssistant(bodyEl, full, reasoningText);
     history.push({ role: 'assistant', content: full });
   } catch (e) {
     if (e.name === 'AbortError') {
       // Stop pressed: keep whatever streamed so far as conversation context.
-      if (full) {
-        renderAssistant(bodyEl, full);
+      if (full || reasoningText) {
+        renderAssistant(bodyEl, full, reasoningText);
         bodyEl.appendChild(el('div', 'stopped-note', '(stopped)'));
         history.push({ role: 'assistant', content: full });
       } else {

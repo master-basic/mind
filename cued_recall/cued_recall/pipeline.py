@@ -41,7 +41,11 @@ class Pipeline:
         self.token_sink = None
 
     async def recall_blocks(self, user_message: str) -> List[Tuple[Block, float]]:
-        embed_vec = await asyncio.to_thread(self.embed.embed, user_message)
+        # Only embed a bounded slice for the recall query: a pasted file can be
+        # far larger than the embed model's context, which would 500 the embed
+        # server (and the whole request).
+        query_text = truncate_tokens(user_message, 1024)
+        embed_vec = await asyncio.to_thread(self.embed.embed, query_text)
         results = await asyncio.to_thread(
             self.index.query,
             embed_vec,
@@ -261,6 +265,10 @@ class Pipeline:
     ):
         splitter = self.ThinkSplitter(self.think_open, self.think_close)
         response_text = ""
+        # Newer llama.cpp parses <think> out of `content` into a separate
+        # `reasoning_content` delta field. Capture both so reasoning blocks are
+        # still created when the tags aren't inline.
+        reasoning_content_parts: List[str] = []
 
         async with httpx.AsyncClient() as client:
             payload = {**body, "messages": augmented_messages, "stream": True}
@@ -281,11 +289,11 @@ class Pipeline:
                         data = json.loads(data_str)
                     except json.JSONDecodeError:
                         continue
-                    delta = (
-                        data.get("choices", [{}])[0]
-                        .get("delta", {})
-                        .get("content", "")
-                    )
+                    delta_obj = data.get("choices", [{}])[0].get("delta", {})
+                    rc = delta_obj.get("reasoning_content")
+                    if rc:
+                        reasoning_content_parts.append(rc)
+                    delta = delta_obj.get("content", "")
                     if not delta:
                         continue
                     response_text += delta
@@ -293,7 +301,9 @@ class Pipeline:
 
                 splitter.flush()
 
-        full_reasoning = "".join(splitter.reasoning_parts)
+        full_reasoning = (
+            "".join(reasoning_content_parts) + "".join(splitter.reasoning_parts)
+        )
         full_result = "".join(splitter.result_parts)
 
         await self._create_blocks(
@@ -336,15 +346,15 @@ class Pipeline:
             resp.raise_for_status()
             result = resp.json()
 
-        response_text = (
-            result.get("choices", [{}])[0].get("message", {}).get("content", "")
-        )
+        message = result.get("choices", [{}])[0].get("message", {})
+        response_text = message.get("content", "") or ""
+        reasoning_content = message.get("reasoning_content", "") or ""
 
         splitter = self.ThinkSplitter(self.think_open, self.think_close)
         splitter.feed(response_text)
         splitter.flush()
 
-        full_reasoning = "".join(splitter.reasoning_parts)
+        full_reasoning = reasoning_content + "".join(splitter.reasoning_parts)
         full_result = "".join(splitter.result_parts)
 
         await self._create_blocks(
