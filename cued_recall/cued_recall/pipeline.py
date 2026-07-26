@@ -414,14 +414,6 @@ class Pipeline:
     def build_messages(self, original_messages: list, recall_text: str) -> list:
         if not recall_text:
             return original_messages
-        # Merge recall into the existing system message rather than creating a
-        # second one — Qwen3.5's template rejects multiple system messages.
-        if original_messages and original_messages[0].get("role") == "system":
-            original_messages[0] = {
-                **original_messages[0],
-                "content": recall_text + "\n\n" + original_messages[0]["content"],
-            }
-            return original_messages
         recall_msg = {"role": "system", "content": recall_text}
         return [recall_msg] + original_messages
 
