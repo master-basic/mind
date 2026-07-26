@@ -83,6 +83,22 @@ tr:hover td { background: #161b22; }
 <h2>Tokens / sec</h2>
 <div class="stats-grid" id="tps-grid"></div>
 
+<h2>Memory health</h2>
+<div class="stats-grid" id="health-grid"></div>
+<div class="note" id="health-note"></div>
+
+<h2>Recall budget — last turns</h2>
+<div id="budget-panel"></div>
+
+<h2>Token distribution</h2>
+<div id="histogram-panel"></div>
+
+<h2>Store growth</h2>
+<div id="growth-panel"></div>
+
+<h2>Most recalled blocks</h2>
+<div id="effectiveness-panel"></div>
+
 <h2>Blocks</h2>
 <div class="filters">
   <select id="filter-status">
@@ -102,6 +118,28 @@ tr:hover td { background: #161b22; }
   <select id="filter-tag">
     <option value="">All tags</option>
   </select>
+  <select id="filter-recall-preset" title="Recall count">
+    <option value="">Any recalls</option>
+    <option value="0-0">Never recalled</option>
+    <option value="1-5">1–5 recalls</option>
+    <option value="1-10">1–10 recalls</option>
+    <option value="6-20">6–20 recalls</option>
+    <option value="21-">21+ recalls</option>
+  </select>
+  <input type="number" id="filter-recall-min" placeholder="min" min="0" size="4" style="width:64px" title="Minimum recalls">
+  <input type="number" id="filter-recall-max" placeholder="max" min="0" size="4" style="width:64px" title="Maximum recalls">
+  <select id="sort-by" title="Sort by">
+    <option value="created_at">newest</option>
+    <option value="token_count">tokens</option>
+    <option value="recall_count">recalls</option>
+    <option value="last_recalled">last recalled</option>
+  </select>
+  <select id="sort-order" title="Sort direction">
+    <option value="desc">desc</option>
+    <option value="asc">asc</option>
+  </select>
+  <button onclick="showDeadWeight()" title="Never recalled, largest first">Dead weight</button>
+  <button onclick="resetFilters()">Reset</button>
   <select id="page-size" title="Rows per page">
     <option value="50">50 / page</option>
     <option value="100" selected>100 / page</option>
@@ -386,6 +424,155 @@ async function loadTps() {
   }
 }
 
+// fetch() does not reject on 4xx/5xx, so a missing endpoint would parse as
+// JSON and render as real-looking zeros. These panels are new, so a middleware
+// still running an older build returns 404 here -- say so instead of showing
+// "0 of 0 tokens" as though the store were empty.
+async function getJSON(path) {
+  const r = await fetch(API + path);
+  if (!r.ok) {
+    throw new Error(r.status === 404
+      ? 'endpoint not available — restart the middleware to load this build'
+      : `HTTP ${r.status}`);
+  }
+  return r.json();
+}
+
+const fmt = n => (n ?? 0).toLocaleString();
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+// Shared bar row used by the histogram and growth panels. Widths are a
+// percentage of the largest row so a single huge block does not flatten
+// everything else into invisibility.
+function barRow(label, value, max, sub, color) {
+  const pct = max > 0 ? Math.max(1, Math.round(100 * value / max)) : 0;
+  return `<div style="display:grid;grid-template-columns:110px 1fr 150px;gap:10px;align-items:center;margin-bottom:4px;">
+    <span style="font-size:11px;color:#8b949e;text-align:right;">${esc(label)}</span>
+    <div class="bar"><span style="width:${pct}%;${color ? 'background:' + color : ''}"></span></div>
+    <span style="font-size:11px;color:#8b949e;">${esc(sub)}</span>
+  </div>`;
+}
+
+async function loadHealth() {
+  try {
+    const d = await getJSON('/admin/stats/recall?top=10');
+    const deadPct = d.tokens ? Math.round(100 * d.never_recalled_tokens / d.tokens) : 0;
+    const cards = [
+      { label: 'Blocks', value: fmt(d.blocks) },
+      { label: 'Tokens stored', value: fmt(d.tokens) },
+      { label: 'Total recalls', value: fmt(d.total_recalls) },
+      { label: 'Never recalled', value: fmt(d.never_recalled_blocks) },
+      { label: 'Dead tokens', value: deadPct + '%' },
+    ];
+    document.getElementById('health-grid').innerHTML = cards.map(c =>
+      `<div class="stat-card"><div class="value">${c.value}</div><div class="label">${c.label}</div></div>`
+    ).join('');
+    document.getElementById('health-note').textContent =
+      `${fmt(d.never_recalled_tokens)} of ${fmt(d.tokens)} tokens have never been recalled` +
+      (deadPct >= 50 ? ' — most of the store is unused; see Dead weight below.' : '.');
+
+    const rows = (d.by_verification || []).map(v =>
+      `<tr><td class="verification-${esc(v.verification)}">${esc(v.verification)}</td>
+       <td>${fmt(v.blocks)}</td><td>${fmt(v.recalls)}</td><td>${fmt(v.tokens)}</td></tr>`).join('');
+    const top = (d.top_recalled || []).map(b =>
+      `<tr><td title="${esc(b.block_id)}">${esc((b.block_id || '').slice(0, 8))}</td>
+       <td>${esc(b.type)}</td>
+       <td class="verification-${esc(b.verification)}">${esc(b.verification)}</td>
+       <td class="gist-cell" title="${esc(b.gist)}">${esc(b.gist)}</td>
+       <td>${fmt(b.recall_count)}</td><td>${fmt(b.token_count)}</td></tr>`).join('');
+    document.getElementById('effectiveness-panel').innerHTML = `
+      <div style="overflow-x:auto"><table>
+        <thead><tr><th>verification</th><th>blocks</th><th>recalls</th><th>tokens</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="4">no data</td></tr>'}</tbody>
+      </table></div>
+      <div class="note" style="margin:8px 0 4px">Blocks marked <span class="verification-corrected">corrected</span> are excluded from recall; a high recall count there is history, not current behaviour.</div>
+      <div style="overflow-x:auto"><table>
+        <thead><tr><th>block_id</th><th>type</th><th>verification</th><th>gist</th><th>recalls</th><th>tokens</th></tr></thead>
+        <tbody>${top || '<tr><td colspan="6">nothing recalled yet</td></tr>'}</tbody>
+      </table></div>`;
+  } catch (e) {
+    document.getElementById('health-note').textContent = 'Error: ' + e.message;
+  }
+}
+
+async function loadHistogram() {
+  try {
+    const d = await getJSON('/admin/stats/distribution');
+    const buckets = d.buckets || [];
+    const max = Math.max(1, ...buckets.map(b => b.blocks));
+    document.getElementById('histogram-panel').innerHTML =
+      buckets.map(b => barRow(b.label + ' tok', b.blocks, max,
+        `${fmt(b.blocks)} blocks · ${fmt(b.tokens)} tok`)).join('') +
+      `<div class="note">Bucket sizes are token counts per block. Weight concentrated in the top bucket means block_tokens_reasoning is not splitting large content.</div>`;
+  } catch (e) {
+    document.getElementById('histogram-panel').innerHTML = `<div class="note">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+async function loadGrowth() {
+  try {
+    const d = await getJSON('/admin/stats/growth?days=30');
+    // Server returns one row per (day, type); fold to a per-day total so the
+    // chart reads as store growth rather than a scatter of types.
+    const byDay = {};
+    for (const row of d.rows || []) {
+      byDay[row.day] = byDay[row.day] || { blocks: 0, tokens: 0, types: {} };
+      byDay[row.day].blocks += row.blocks;
+      byDay[row.day].tokens += row.tokens;
+      byDay[row.day].types[row.type] = row.tokens;
+    }
+    const days = Object.keys(byDay).sort();
+    const max = Math.max(1, ...days.map(k => byDay[k].tokens));
+    document.getElementById('growth-panel').innerHTML = days.length
+      ? days.map(k => barRow(k, byDay[k].tokens, max,
+          `${fmt(byDay[k].blocks)} blocks · ${fmt(byDay[k].tokens)} tok`)).join('') +
+        `<div class="note">Tokens added per day. If this keeps climbing while truncated/purged counts stay flat, the judge is falling behind ingestion.</div>`
+      : '<div class="note">No blocks in the last 30 days.</div>';
+  } catch (e) {
+    document.getElementById('growth-panel').innerHTML = `<div class="note">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+async function loadBudget() {
+  try {
+    const d = await getJSON('/admin/stats/budget?limit=15');
+    const turns = d.turns || [];
+    if (!turns.length) {
+      document.getElementById('budget-panel').innerHTML =
+        '<div class="note">No recall-budget events recorded yet. These are written on each turn once the middleware has been restarted with this build.</div>';
+      return;
+    }
+    const rows = turns.map(t => {
+      const budget = t.budget_tokens || 0;
+      const pct = budget ? Math.min(100, Math.round(100 * t.tokens_used / budget)) : 0;
+      const cls = pct >= 90 ? 'bar hot' : pct >= 70 ? 'bar warn' : 'bar';
+      const when = new Date((t.timestamp || 0) * 1000).toLocaleTimeString();
+      return `<tr>
+        <td>${esc(when)}</td>
+        <td>${fmt(t.candidates)}</td>
+        <td>${fmt(t.admitted)}</td>
+        <td${t.skipped_oversized ? ' class="status-hot"' : ''}>${fmt(t.skipped_oversized)}</td>
+        <td>${fmt(t.skipped_corrected)}</td>
+        <td style="min-width:160px">
+          <div class="${cls}"><span style="width:${pct}%"></span></div>
+          <div class="bar-label"><span>${fmt(t.tokens_used)} / ${fmt(budget)}</span><span>${pct}%</span></div>
+        </td>
+        <td>${t.top_similarity != null ? t.top_similarity.toFixed(3) : '—'}</td>
+      </tr>`;
+    }).join('');
+    document.getElementById('budget-panel').innerHTML = `
+      <div style="overflow-x:auto"><table>
+        <thead><tr><th>time</th><th>candidates</th><th>admitted</th><th>skipped (size)</th>
+        <th>skipped (corrected)</th><th>budget used</th><th>top sim</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
+      <div class="note">Skipped (size) counts blocks that matched but did not fit the remaining budget. Persistently high means recall.budget_tokens is starving the injection, not that the index found nothing.</div>`;
+  } catch (e) {
+    document.getElementById('budget-panel').innerHTML = `<div class="note">Error: ${esc(e.message)}</div>`;
+  }
+}
+
 // Paging state. The table used to request limit=100 with no offset, so only
 // the newest 100 blocks were ever reachable -- the backend has supported
 // limit/offset and returned `total` all along.
@@ -436,6 +623,14 @@ async function loadBlocks() {
   const conv = document.getElementById('filter-conv').value;
   const tag = document.getElementById('filter-tag').value;
   const params = new URLSearchParams({ limit: blocksLimit(), offset: blocksOffset });
+  const rmin = document.getElementById('filter-recall-min').value;
+  const rmax = document.getElementById('filter-recall-max').value;
+  // Sent only when non-empty: "0" is a meaningful bound (never recalled), so
+  // testing truthiness here would silently drop it.
+  if (rmin !== '') params.set('recall_min', rmin);
+  if (rmax !== '') params.set('recall_max', rmax);
+  params.set('sort', document.getElementById('sort-by').value);
+  params.set('order', document.getElementById('sort-order').value);
   if (status) params.set('status', status);
   if (type) params.set('type_', type);
   if (conv) params.set('conversation_id', conv);
@@ -598,6 +793,47 @@ document.getElementById('filter-type').addEventListener('change', reloadFromFirs
 document.getElementById('filter-tag').addEventListener('change', reloadFromFirstPage);
 document.getElementById('page-size').addEventListener('change', reloadFromFirstPage);
 document.getElementById('filter-conv').addEventListener('change', reloadFromFirstPage);
+document.getElementById('sort-by').addEventListener('change', reloadFromFirstPage);
+document.getElementById('sort-order').addEventListener('change', reloadFromFirstPage);
+document.getElementById('filter-recall-min').addEventListener('change', reloadFromFirstPage);
+document.getElementById('filter-recall-max').addEventListener('change', reloadFromFirstPage);
+
+// The preset writes the min/max boxes rather than being a filter of its own,
+// so there is one source of truth and an arbitrary range stays expressible.
+// "21-" means 21 and up: an empty half is an open bound, not zero.
+document.getElementById('filter-recall-preset').addEventListener('change', function() {
+  const [lo, hi] = (this.value || '-').split('-');
+  document.getElementById('filter-recall-min').value = lo ?? '';
+  document.getElementById('filter-recall-max').value = hi ?? '';
+  reloadFromFirstPage();
+});
+
+function resetFilters() {
+  ['filter-status','filter-type','filter-tag','filter-conv',
+   'filter-recall-min','filter-recall-max','filter-recall-preset'].forEach(id => {
+    document.getElementById(id).value = '';
+  });
+  document.getElementById('sort-by').value = 'created_at';
+  document.getElementById('sort-order').value = 'desc';
+  reloadFromFirstPage();
+}
+
+function showDeadWeight() {
+  resetFiltersQuiet();
+  document.getElementById('filter-recall-preset').value = '0-0';
+  document.getElementById('filter-recall-min').value = '0';
+  document.getElementById('filter-recall-max').value = '0';
+  document.getElementById('sort-by').value = 'token_count';
+  document.getElementById('sort-order').value = 'desc';
+  reloadFromFirstPage();
+}
+
+function resetFiltersQuiet() {
+  ['filter-status','filter-type','filter-tag','filter-conv',
+   'filter-recall-min','filter-recall-max','filter-recall-preset'].forEach(id => {
+    document.getElementById(id).value = '';
+  });
+}
 
 document.getElementById('sel-all').addEventListener('change', function() {
   const boxes = document.querySelectorAll('#blocks-tbody .chk');
@@ -638,8 +874,17 @@ async function deleteSelected() {
   }
 }
 
+// The analytics panels run full-table aggregates over index.db, so they are
+// deliberately not on the 5 s loop with the live gauges -- that would put four
+// table scans per 5 s against the same SQLite file the pipeline is writing to.
+async function refreshAnalytics() {
+  await Promise.all([loadHealth(), loadBudget(), loadHistogram(), loadGrowth()]);
+}
+
 refresh();
+refreshAnalytics();
 setInterval(refresh, 5000);
+setInterval(refreshAnalytics, 30000);
 </script>
 </body>
 </html>

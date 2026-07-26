@@ -397,12 +397,20 @@ class Pipeline:
         )
         blocks = []
         total_tokens = 0
+        # Why a candidate did not make it into the prompt was invisible: the
+        # turn log recorded only how many blocks were admitted. Counted here so
+        # the admin panel can show budget pressure -- a high skipped_oversized
+        # against a low admitted count means recall.budget_tokens is starving
+        # the injection rather than the index failing to find anything.
+        skipped_corrected = skipped_missing = skipped_oversized = 0
         for block_id, sim in results:
             meta = await asyncio.to_thread(self.index.get_meta, block_id)
             if meta and meta.get("verification") == "corrected":
+                skipped_corrected += 1
                 continue
             block = await asyncio.to_thread(self.store.get, block_id)
             if block is None:
+                skipped_missing += 1
                 continue
             # Skip, don't stop. A single oversized hit (a pasted document can
             # be several times the budget on its own) used to break the loop
@@ -410,9 +418,25 @@ class Pipeline:
             # even though smaller, equally relevant blocks sat right behind
             # it. Pass over what doesn't fit and keep filling the budget.
             if total_tokens + block.token_count > self.config.recall.budget_tokens:
+                skipped_oversized += 1
                 continue
             total_tokens += block.token_count
             blocks.append((block, sim))
+
+        self.wal.write({
+            "event": "recall_budget",
+            "candidates": len(results),
+            "admitted": len(blocks),
+            "skipped_corrected": skipped_corrected,
+            "skipped_missing": skipped_missing,
+            "skipped_oversized": skipped_oversized,
+            "tokens_used": total_tokens,
+            # Carried per event so a historical turn shows the budget that was
+            # actually in force when it ran.
+            "budget_tokens": self.config.recall.budget_tokens,
+            "top_similarity": round(results[0][1], 4) if results else None,
+            "timestamp": time.time(),
+        })
         return blocks
 
     def build_recall_injection(self, blocks: List[Tuple[Block, float]]) -> str:

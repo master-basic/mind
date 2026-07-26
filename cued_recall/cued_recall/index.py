@@ -2,6 +2,7 @@ import os
 import re
 import shutil
 import threading
+import time
 from pathlib import Path
 from typing import List, Tuple, Optional
 
@@ -178,10 +179,19 @@ class VectorIndex:
             meta["tags"] = [t for t in (meta.get("tags") or "").split(",") if t]
             return meta
 
+    # Whitelist for ORDER BY. The column name cannot be bound as a parameter,
+    # so it is interpolated -- only ever from this set.
+    SORTABLE = {"created_at", "token_count", "recall_count", "last_recalled",
+                "turn_index", "type", "status", "verification"}
+
     def list_meta(self, status: Optional[str] = None,
                   type_: Optional[str] = None,
                   conversation_id: Optional[str] = None,
                   tag: Optional[str] = None,
+                  recall_min: Optional[int] = None,
+                  recall_max: Optional[int] = None,
+                  older_than: Optional[float] = None,
+                  sort: str = "created_at", order: str = "desc",
                   limit: int = 100, offset: int = 0) -> Tuple[List[dict], int]:
         where = []
         params = []
@@ -197,13 +207,27 @@ class VectorIndex:
         if tag:
             where.append("tags LIKE ?")
             params.append(f"%,{tag},%")
+        # COALESCE so blocks written before recall_count defaulted to 0 are
+        # still matched by a "0 recalls" filter instead of dropping out on NULL.
+        if recall_min is not None:
+            where.append("COALESCE(recall_count, 0) >= ?")
+            params.append(recall_min)
+        if recall_max is not None:
+            where.append("COALESCE(recall_count, 0) <= ?")
+            params.append(recall_max)
+        if older_than is not None:
+            where.append("created_at < ?")
+            params.append(older_than)
         clause = " AND ".join(where) if where else "1"
+        sort_col = sort if sort in self.SORTABLE else "created_at"
+        direction = "ASC" if str(order).lower() == "asc" else "DESC"
         with self._lock:
             count = self._conn.execute(
                 f"SELECT COUNT(*) FROM blocks WHERE {clause}", params
             ).fetchone()[0]
             rows = self._conn.execute(
-                f"SELECT * FROM blocks WHERE {clause} ORDER BY created_at DESC "
+                f"SELECT * FROM blocks WHERE {clause} "
+                f"ORDER BY {sort_col} {direction}, block_id {direction} "
                 f"LIMIT ? OFFSET ?",
                 [*params, limit, offset],
             ).fetchall()
@@ -212,6 +236,102 @@ class VectorIndex:
         for item in items:
             item["tags"] = [t for t in (item.get("tags") or "").split(",") if t]
         return items, count
+
+    def growth_by_day(self, days: int = 30) -> List[dict]:
+        """Blocks and tokens created per day, split by type.
+
+        Answers whether the judge is keeping pace with ingestion: if tokens
+        added per day keeps climbing while truncated/purged counts stay flat,
+        the store is growing faster than it is being pruned.
+        """
+        cutoff = time.time() - days * 86400
+        with self._lock:
+            rows = self._conn.execute("""
+                SELECT date(created_at, 'unixepoch') AS day,
+                       type,
+                       COUNT(*) AS blocks,
+                       SUM(COALESCE(token_count, 0)) AS tokens
+                FROM blocks
+                WHERE created_at >= ?
+                GROUP BY day, type
+                ORDER BY day ASC
+            """, (cutoff,)).fetchall()
+        return [{"day": r[0], "type": r[1], "blocks": r[2], "tokens": r[3] or 0}
+                for r in rows]
+
+    # Upper bounds; the last bucket is open-ended.
+    TOKEN_BUCKETS = [64, 256, 1024, 4096, 16384]
+
+    def token_histogram(self) -> List[dict]:
+        """Block count and total tokens per size bucket.
+
+        A median of 32 tokens against blocks of 20,000+ is the signal that
+        block_tokens_reasoning is not splitting large content as expected.
+        """
+        edges = self.TOKEN_BUCKETS
+        buckets = []
+        with self._lock:
+            for i, hi in enumerate(edges):
+                lo = 0 if i == 0 else edges[i - 1]
+                row = self._conn.execute(
+                    "SELECT COUNT(*), SUM(COALESCE(token_count, 0)) FROM blocks "
+                    "WHERE COALESCE(token_count, 0) > ? "
+                    "AND COALESCE(token_count, 0) <= ?", (lo, hi)).fetchone()
+                buckets.append({"label": f"{lo+1}–{hi}", "min": lo + 1, "max": hi,
+                                "blocks": row[0], "tokens": row[1] or 0})
+            row = self._conn.execute(
+                "SELECT COUNT(*), SUM(COALESCE(token_count, 0)) FROM blocks "
+                "WHERE COALESCE(token_count, 0) > ?", (edges[-1],)).fetchone()
+            buckets.append({"label": f">{edges[-1]}", "min": edges[-1] + 1,
+                            "max": None, "blocks": row[0], "tokens": row[1] or 0})
+        return buckets
+
+    def recall_effectiveness(self, top: int = 20) -> dict:
+        """How much of the store is earning its keep.
+
+        `corrected` blocks are the harmful ones: recalled often but contradicted
+        in conversation. `never_recalled` tokens are dead weight -- indexed,
+        embedded, and never once used.
+        """
+        with self._lock:
+            totals = self._conn.execute("""
+                SELECT COUNT(*),
+                       SUM(COALESCE(token_count, 0)),
+                       SUM(CASE WHEN COALESCE(recall_count,0) = 0 THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN COALESCE(recall_count,0) = 0
+                                THEN COALESCE(token_count,0) ELSE 0 END),
+                       SUM(COALESCE(recall_count, 0))
+                FROM blocks
+            """).fetchone()
+            by_verification = self._conn.execute("""
+                SELECT COALESCE(verification, 'unknown'),
+                       COUNT(*),
+                       SUM(COALESCE(recall_count, 0)),
+                       SUM(COALESCE(token_count, 0))
+                FROM blocks GROUP BY 1
+            """).fetchall()
+            cols = [d[1] for d in self._conn.execute("PRAGMA table_info(blocks)")]
+            top_rows = self._conn.execute("""
+                SELECT * FROM blocks
+                WHERE COALESCE(recall_count, 0) > 0
+                ORDER BY recall_count DESC, token_count DESC LIMIT ?
+            """, (top,)).fetchall()
+        top_items = [dict(zip(cols, r)) for r in top_rows]
+        for item in top_items:
+            item["tags"] = [t for t in (item.get("tags") or "").split(",") if t]
+        return {
+            "blocks": totals[0] or 0,
+            "tokens": totals[1] or 0,
+            "never_recalled_blocks": totals[2] or 0,
+            "never_recalled_tokens": totals[3] or 0,
+            "total_recalls": totals[4] or 0,
+            "by_verification": [
+                {"verification": r[0], "blocks": r[1],
+                 "recalls": r[2] or 0, "tokens": r[3] or 0}
+                for r in by_verification
+            ],
+            "top_recalled": top_items,
+        }
 
     def update_status(self, block_id: str, status: str):
         with self._lock:

@@ -21,18 +21,57 @@ def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_ru
         type_: Optional[str] = None,
         conversation_id: Optional[str] = None,
         tag: Optional[str] = None,
+        recall_min: Optional[int] = None,
+        recall_max: Optional[int] = None,
+        older_than_days: Optional[float] = None,
+        sort: str = "created_at",
+        order: str = "desc",
         limit: int = 100,
         offset: int = 0,
     ):
+        older_than = (time.time() - older_than_days * 86400
+                      if older_than_days else None)
         items, total = index.list_meta(
             status=status,
             type_=type_,
             conversation_id=conversation_id,
             tag=tag,
+            recall_min=recall_min,
+            recall_max=recall_max,
+            older_than=older_than,
+            sort=sort,
+            order=order,
             limit=limit,
             offset=offset,
         )
-        return {"total": total, "items": items, "limit": limit, "offset": offset}
+        # Echo the sort that was actually applied, not the raw request: an
+        # unknown column falls back to created_at, and reflecting the input
+        # would tell the caller a sort happened that did not.
+        return {"total": total, "items": items, "limit": limit, "offset": offset,
+                "sort": sort if sort in VectorIndex.SORTABLE else "created_at",
+                "order": "asc" if str(order).lower() == "asc" else "desc"}
+
+    @router.get("/stats/growth")
+    async def stats_growth(days: int = 30):
+        return {"days": days, "rows": index.growth_by_day(days=days)}
+
+    @router.get("/stats/distribution")
+    async def stats_distribution():
+        return {"buckets": index.token_histogram()}
+
+    @router.get("/stats/recall")
+    async def stats_recall(top: int = 20):
+        return index.recall_effectiveness(top=top)
+
+    @router.get("/stats/budget")
+    async def stats_budget(limit: int = 50):
+        """Recent per-turn recall budget decisions, newest first."""
+        # The budget travels on each event rather than being read from config
+        # here: the router has no config handle, and a historical turn should
+        # show the budget that was actually in force when it ran.
+        events = [e for e in wal.read_all()
+                  if e.get("event") == "recall_budget"]
+        return {"turns": list(reversed(events[-limit:]))}
 
     @router.get("/tags")
     async def list_tags():
