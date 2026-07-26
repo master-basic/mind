@@ -124,6 +124,7 @@ class Pipeline:
         self.token_sink = None
         self.usage_sink = None
         self.tps_sink = None
+        self.chat_sink = None
         self.tagger = None
 
     @staticmethod
@@ -1291,6 +1292,11 @@ class Pipeline:
                 len(full_reasoning.split()) + len(full_result.split())
             )
 
+        # Plain transcript for the history sidebar. Blocks can't serve this:
+        # they are split, summarised, and eventually purged by the judge.
+        if self.chat_sink:
+            self.chat_sink(conversation_id, user_message, full_result)
+
         self.wal.write({
             "event": "turn_completed",
             "conversation_id": conversation_id,
@@ -1403,6 +1409,11 @@ class Pipeline:
             self.token_sink(
                 len(full_reasoning.split()) + len(full_result.split())
             )
+
+        # Plain transcript for the history sidebar. Blocks can't serve this:
+        # they are split, summarised, and eventually purged by the judge.
+        if self.chat_sink:
+            self.chat_sink(conversation_id, user_message, full_result)
 
         self.wal.write({
             "event": "turn_completed",

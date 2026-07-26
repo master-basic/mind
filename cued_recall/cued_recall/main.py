@@ -7,9 +7,12 @@ import uuid
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, Request
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
+from .chats import ChatStore
 from .config import Config
 from .embed import EmbeddingClient
 from .index import VectorIndex
@@ -44,6 +47,8 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
     wal.open()
 
     store = BlockStore(store_path)
+    chats = ChatStore(store_path)
+    chats.open()
     embed = EmbeddingClient(cfg.embed_endpoint)
 
     # The vector index dimension MUST match the embedding model's output
@@ -128,6 +133,21 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
     pipeline.tps_sink = _record_tps
     judge.tps_sink = _record_tps
     embed.tps_sink = _record_tps
+
+    def _record_chat(conversation_id, user_text, assistant_text):
+        # Never let transcript bookkeeping break a turn that already succeeded.
+        try:
+            source = "chat" if str(conversation_id).startswith("chat-") else "api"
+            chats.record_turn(conversation_id, user_text, assistant_text, source)
+        except Exception as e:
+            wal.write({
+                "event": "chat_record_error",
+                "conversation_id": conversation_id,
+                "error": f"{type(e).__name__}: {e}",
+                "timestamp": time.time(),
+            })
+
+    pipeline.chat_sink = _record_chat
 
     from fastapi.responses import HTMLResponse
     import pathlib
@@ -260,6 +280,39 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
         models = await asyncio.gather(*[probe(n, u) for n, u in targets])
         return {"models": list(models)}
 
+    @app.get("/chats")
+    async def list_chats(limit: int = 100, offset: int = 0,
+                         source: Optional[str] = None):
+        items, total = await asyncio.to_thread(
+            chats.list_conversations, limit, offset, source
+        )
+        return {"total": total, "items": items, "limit": limit, "offset": offset}
+
+    @app.get("/chats/{conversation_id}")
+    async def get_chat(conversation_id: str):
+        messages = await asyncio.to_thread(chats.get_messages, conversation_id)
+        if not messages:
+            raise HTTPException(status_code=404, detail="conversation not found")
+        return {"conversation_id": conversation_id, "messages": messages}
+
+    @app.patch("/chats/{conversation_id}")
+    async def rename_chat(conversation_id: str, body: dict):
+        title = (body or {}).get("title", "")
+        if not title:
+            raise HTTPException(status_code=400, detail="title required")
+        if not await asyncio.to_thread(chats.rename, conversation_id, title):
+            raise HTTPException(status_code=404, detail="conversation not found")
+        return {"status": "ok"}
+
+    @app.delete("/chats/{conversation_id}")
+    async def delete_chat(conversation_id: str):
+        # Deletes the transcript only. Memory blocks derived from the
+        # conversation survive -- forgetting the chat is not the same as
+        # forgetting what was learned in it.
+        if not await asyncio.to_thread(chats.delete, conversation_id):
+            raise HTTPException(status_code=404, detail="conversation not found")
+        return {"status": "ok", "blocks_kept": True}
+
     @app.get("/admin/system")
     async def admin_system():
         """GPU / CPU telemetry for the host and each server process.
@@ -359,6 +412,7 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
         if snapshot.exists() and not any(store.blocks_dir.iterdir()):
             store.restore(snapshot)
             index.restore(snapshot)
+            chats.restore(snapshot)
 
         # Shelve any 'hot' blocks left over from previous sessions so they
         # become recallable. The per-turn logic only shelves a turn when the
@@ -373,7 +427,8 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
                 try:
                     await asyncio.wait_for(
                         asyncio.get_event_loop().run_in_executor(
-                            None, _take_snapshot, store, index, snapshot_path
+                            None, _take_snapshot, store, index, snapshot_path,
+                            chats
                         ),
                         timeout=300,
                     )
@@ -420,10 +475,11 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
             snapshot_task.cancel()
         if hot_sweep_task:
             hot_sweep_task.cancel()
-        _take_snapshot(store, index, snapshot_path)
+        _take_snapshot(store, index, snapshot_path, chats)
         wal.close()
         embed.close()
         index.close()
+        chats.close()
 
     def _derive_conversation(body: dict):
         import hashlib
@@ -580,7 +636,8 @@ def _shelve_leftover_hot(store: BlockStore, index: VectorIndex, wal: WAL):
         })
 
 
-def _take_snapshot(store: BlockStore, index: VectorIndex, snapshot_path: Path):
+def _take_snapshot(store: BlockStore, index: VectorIndex, snapshot_path: Path,
+                   chats: 'ChatStore' = None):
     import shutil
     import tempfile
 
@@ -588,6 +645,8 @@ def _take_snapshot(store: BlockStore, index: VectorIndex, snapshot_path: Path):
     try:
         store.snapshot(tmp)
         index.snapshot(tmp)
+        if chats is not None:
+            chats.snapshot(tmp)
         latest = snapshot_path / "latest"
         if latest.exists():
             _rmtree_win32(latest)
