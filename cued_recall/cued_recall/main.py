@@ -635,11 +635,23 @@ def _clamp_context_budget(cfg: Config):
         d = r.json()
         gs = d.get("default_generation_settings", {}) or {}
         n_ctx = gs.get("n_ctx") or d.get("n_ctx")
+        # --ctx-size is the TOTAL window, divided among parallel slots, and a
+        # request only ever gets one slot. /props and /slots both report the
+        # undivided figure, so trusting it overstated the usable context by the
+        # slot count: at 61,440 across 4 slots a request could really use
+        # 15,360, and the budget was set near 47,000. run.py pins -np 1, but a
+        # server started by hand may not.
+        slots = int(d.get("total_slots") or 1) or 1
     except Exception:
         return
     if not n_ctx:
         return
-    ceiling = max(2048, int(n_ctx) - RESERVE_OUTPUT)
+    per_slot = max(1, int(n_ctx) // slots)
+    if slots > 1:
+        print(f"[WARN] reasoning server has {slots} slots sharing {int(n_ctx)} "
+              f"tokens; a request can use {per_slot}. Start it with -np 1 to "
+              f"give one request the whole window.")
+    ceiling = max(2048, per_slot - RESERVE_OUTPUT)
     if cfg.max_context_tokens > ceiling:
         print(
             f"[WARN] max_context_tokens {cfg.max_context_tokens} exceeds the "

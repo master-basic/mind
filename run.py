@@ -110,9 +110,17 @@ MODEL_MANIFEST = [
 #   reasoning: weights + 32K KV cache on GPU (no --no-kv-offload) -> fastest.
 #   judge:     fully on CPU (-ngl 0) to free VRAM for the reasoning KV.
 #   embed:     weights on GPU, KV/context in RAM (--no-kv-offload).
+# -np 1 is load-bearing, not a tuning knob. llama.cpp splits --ctx-size across
+# parallel slots and this build defaults to 4, so a 61,440-token context gave
+# each request only 15,360 -- measured: 15k prompts succeeded, 16k returned
+# "Context size has been exceeded". Meanwhile the prompt budget is derived from
+# the full --ctx-size, so the middleware aimed at ~47k and overshot the real
+# slot on every substantial turn, while a small direct query to the same server
+# answered fine. This is a single-user stack: one slot with the whole window is
+# what the VRAM sizing already assumes, and costs nothing.
 SERVER_DEFAULTS = {
-    "reasoning": {"port": 8080, "extra": ["--ctx-size", "32768", "--n-gpu-layers", "99", "--metrics", "--jinja"]},
-    "judge":     {"port": 8081, "extra": ["--ctx-size", "8192", "--n-gpu-layers", "0", "--metrics"]},
+    "reasoning": {"port": 8080, "extra": ["--ctx-size", "32768", "--n-gpu-layers", "99", "--metrics", "--jinja", "-np", "1"]},
+    "judge":     {"port": 8081, "extra": ["--ctx-size", "8192", "--n-gpu-layers", "0", "--metrics", "-np", "1"]},
     # Embeddings need the whole sequence in one micro-batch; the default
     # --ubatch-size (512) makes any input over ~512 tokens 500. Match batch
     # sizes to the context so larger inputs embed instead of erroring.

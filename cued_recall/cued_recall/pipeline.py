@@ -262,14 +262,41 @@ class Pipeline:
 
         result = list(messages)
         sizes = list(per_msg)
-        # Drop oldest middle messages (between system and latest user) first.
+
+        def _newest_user(msgs):
+            """Index of the last real user turn, or None.
+
+            A user message whose whole content is a <tool_response> does not
+            count -- the chat template applies the same test when deciding
+            whether a query exists.
+            """
+            for i in range(len(msgs) - 1, -1, -1):
+                if msgs[i].get("role") != "user":
+                    continue
+                text = Pipeline._msg_text(msgs[i]).strip()
+                if text.startswith("<tool_response>") and text.endswith("</tool_response>"):
+                    continue
+                return i
+            return None
+
+        # Drop oldest middle messages first. This loop always claimed to keep
+        # everything "between system and latest user", but nothing enforced the
+        # user half: only index 0 and the final message were protected. In a
+        # long agent session the user turns sit in the middle while the tail is
+        # assistant/tool traffic, so trimming could remove every user message --
+        # and the template then raises "No user query found in messages.",
+        # which llama.cpp returns as a 400 that kills the turn. Only reachable
+        # once trimming actually started removing things (see SHRINK_MARGIN).
         # Sizes are popped in lockstep so the running total stays on the same
         # scale as `total` -- which may have been replaced by an exact
         # server-side count above.
         while len(result) > 2 and total > limit:
-            dropped_size = sizes.pop(1)  # skip system at 0
-            result.pop(1)
-            total -= dropped_size
+            keep = _newest_user(result)
+            victim = next((j for j in range(1, len(result) - 1) if j != keep), None)
+            if victim is None:
+                break        # only the protected turn is left to give up
+            total -= sizes.pop(victim)
+            result.pop(victim)
 
         # If still over, truncate the last message. Drops from the FRONT,
         # keeping the tail: for a pasted document or a tool result, the end is
