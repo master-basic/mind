@@ -10,6 +10,7 @@ from .config import Config
 from .index import VectorIndex
 from .models import Block, BlockStatus
 from .store import BlockStore
+from .utils import count_tokens
 from .wal import WAL
 
 
@@ -39,6 +40,18 @@ class Judge:
     # model's KV). Generating a few hundred tokens there is slow enough that
     # the old 120 s tripped on the larger blocks.
     TIMEOUT_S = 300
+
+    async def _count_tokens(self, text: str) -> int:
+        """Token count for a rewritten block.
+
+        Measured against the reasoning model's tokenizer, not the judge's: this
+        number is spent from recall.budget_tokens, which is a slice of the
+        reasoning model's context.
+        """
+        return await count_tokens(
+            text, self.config.reasoning_endpoint,
+            self.config.chars_per_token, self.config.tokens_per_word,
+        )
 
     async def _judge_n_ctx(self) -> int:
         """The judge server's context window, probed once and cached."""
@@ -282,7 +295,7 @@ class Judge:
         if action == "truncate" and summary:
             block.text = summary
             block.original_len = block.token_count
-            block.token_count = len(summary.split())
+            block.token_count = await self._count_tokens(summary)
             block.status = BlockStatus.truncated
             await asyncio.to_thread(self.store.put, block)
             await asyncio.to_thread(
@@ -301,7 +314,7 @@ class Judge:
                 if summary:
                     block.text = summary
                     block.original_len = block.token_count
-                    block.token_count = len(summary.split())
+                    block.token_count = await self._count_tokens(summary)
                     block.status = BlockStatus.truncated
                     await asyncio.to_thread(self.store.put, block)
                     await asyncio.to_thread(

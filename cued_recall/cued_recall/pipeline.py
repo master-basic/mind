@@ -52,6 +52,8 @@ from .models import Block, BlockType, BlockStatus, Verification
 from .store import BlockStore
 from .utils import (
     build_stimulus,
+    count_tokens,
+    estimate_tokens,
     matches_correction,
     split_paragraph_boundary,
     truncate_tokens,
@@ -106,6 +108,10 @@ WEB_SEARCH_TOOL = {
 
 
 class Pipeline:
+    # Applied to the retry budget after a context overflow so the re-fitted
+    # prompt is always smaller than the one the server just refused.
+    SHRINK_MARGIN = 0.95
+
     def __init__(
         self,
         config: Config,
@@ -143,11 +149,15 @@ class Pipeline:
         the server a prompt bigger than its window, which is a hard 400 and an
         empty answer; over-counting only costs some trimmed history.
         """
-        if not text:
-            return 0
-        by_chars = len(text) / max(self.config.chars_per_token, 0.1)
-        by_words = len(text.split()) * self.config.tokens_per_word
-        return int(max(by_chars, by_words))
+        return estimate_tokens(text, self.config.chars_per_token,
+                               self.config.tokens_per_word)
+
+    async def _count_tokens(self, text: str) -> int:
+        """Exact count from the reasoning model's tokenizer, estimate on failure."""
+        return await count_tokens(
+            text, self.config.reasoning_endpoint,
+            self.config.chars_per_token, self.config.tokens_per_word,
+        )
 
     def _payload_overhead_tokens(self, messages: list, body: dict) -> int:
         """Tokens in the request that are NOT message content.
@@ -197,12 +207,19 @@ class Pipeline:
             return None
 
     async def _fit_messages(self, messages: list, body: Optional[dict] = None,
-                            limit: Optional[int] = None) -> list:
+                            limit: Optional[int] = None,
+                            use_exact: bool = True) -> list:
         """Truncate messages to fit the reasoning server's context window.
 
         Preserves the system message (index 0) and the latest user message.
         Oldest middle messages are dropped first. If a single message exceeds
         the limit, it is hard-truncated.
+
+        `use_exact` controls the server-side recount below. It must be off when
+        the caller already expressed `limit` in estimator units (see
+        _refit_after_overflow): the recount replaces `total` with real tokens
+        while `limit` stays on the estimator scale, and comparing the two
+        silently passes a prompt that is over budget.
 
         Accuracy matters here in a way it did not appear to: the previous
         word-count estimator ran ~41% low on real agent traffic (code and
@@ -233,7 +250,7 @@ class Pipeline:
         # Near the limit the estimate is not good enough to bet a hard 400 on.
         # Get the real number and rescale the per-message figures by the same
         # factor so the drop loop below stays consistent with it.
-        if total > limit * self.config.exact_count_threshold:
+        if use_exact and total > limit * self.config.exact_count_threshold:
             exact = await self._exact_prompt_tokens(messages, body)
             if exact is not None and total > 0:
                 scale = exact / total
@@ -317,7 +334,12 @@ class Pipeline:
         real_target = target
         est = sum(self._estimate_tokens(self._msg_text(m)) for m in messages)
         if n_prompt and est:
-            target = max(512, int(target * (est / n_prompt)))
+            # SHRINK_MARGIN keeps the retry strictly smaller than the payload
+            # that was just rejected. Without it the converted budget can land
+            # above `est` -- it did: a 53,525-token prompt was refused and the
+            # retry budget came out at 54,918, so nothing was dropped and the
+            # identical payload went back out and was refused again.
+            target = max(512, int(target * (est / n_prompt) * self.SHRINK_MARGIN))
 
         self.wal.write({
             "event": "context_overflow_retry",
@@ -327,9 +349,14 @@ class Pipeline:
             # in estimator units (what _fit_messages actually compares against).
             "target_real_tokens": real_target,
             "retry_limit_estimator_units": target,
+            "estimator_total": est,
             "timestamp": time.time(),
         })
-        return await self._fit_messages(messages, body, limit=target)
+        # use_exact=False: `target` is in estimator units, and the server-side
+        # recount would put `total` back on the real-token scale, so the two
+        # would no longer be comparable.
+        return await self._fit_messages(messages, body, limit=target,
+                                        use_exact=False)
 
     @staticmethod
     def _usage_total(usage: dict) -> Optional[int]:
@@ -1460,7 +1487,7 @@ class Pipeline:
 
         reasoning_blocks = []
         if full_reasoning:
-            reasoning_blocks = self._split_reasoning(
+            reasoning_blocks = await self._split_reasoning(
                 full_reasoning, conversation_id, turn_index, now
             )
 
@@ -1468,7 +1495,7 @@ class Pipeline:
             type=BlockType.result,
             conversation_id=conversation_id,
             turn_index=turn_index,
-            token_count=len(full_result.split()),
+            token_count=await self._count_tokens(full_result),
             text=full_result,
             stimulus_text=truncate_tokens(full_result, 1024),
             verification=Verification.unknown,
@@ -1482,7 +1509,7 @@ class Pipeline:
                 type=BlockType.reading,
                 conversation_id=conversation_id,
                 turn_index=turn_index,
-                token_count=len(reading_content.split()),
+                token_count=await self._count_tokens(reading_content),
                 text=reading_content,
                 stimulus_text=truncate_tokens(reading_content, 1024),
                 verification=Verification.unknown,
@@ -1517,7 +1544,7 @@ class Pipeline:
                 self.index.increment_recall, block.block_id, now
             )
 
-    def _split_reasoning(
+    async def _split_reasoning(
         self, text: str, conversation_id: str, turn_index: int, now: float
     ) -> List[Block]:
         max_tokens = self.config.block_tokens_reasoning
@@ -1534,7 +1561,7 @@ class Pipeline:
                 status=BlockStatus.hot,
                 conversation_id=conversation_id,
                 turn_index=turn_index,
-                token_count=len(left.split()),
+                token_count=await self._count_tokens(left),
                 text=left,
                 verification=Verification.unknown,
                 created_at=now,

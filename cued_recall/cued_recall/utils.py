@@ -1,6 +1,51 @@
 import re
 from typing import List, Tuple
 
+import httpx
+
+
+def estimate_tokens(text: str, chars_per_token: float = 3.2,
+                    tokens_per_word: float = 1.3) -> int:
+    """Conservative token estimate from character and word counts.
+
+    Takes the larger of the two signals on purpose -- see
+    Pipeline._estimate_tokens, which delegates here.
+    """
+    if not text:
+        return 0
+    by_chars = len(text) / max(chars_per_token, 0.1)
+    by_words = len(text.split()) * tokens_per_word
+    return int(max(by_chars, by_words))
+
+
+async def count_tokens(text: str, endpoint: str, chars_per_token: float = 3.2,
+                       tokens_per_word: float = 1.3, timeout: float = 10) -> int:
+    """Exact token count from the model's own tokenizer.
+
+    Block token counts were `len(text.split())` -- a word count, which measured
+    36 of 36 sampled blocks low (mean 0.77x, worst 0.52x on code and markdown).
+    That understated the admin `tokens` column by 42% in aggregate, and because
+    the same field enforces recall.budget_tokens, a 3,000-token recall budget
+    was really spending closer to 3,900.
+
+    Falls back to the estimator when the server can't be reached, which errs
+    high: a block that reads slightly large only costs some recall budget,
+    whereas reading small is what overran the context in the first place.
+    """
+    if not text:
+        return 0
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(endpoint.rstrip("/") + "/tokenize",
+                                  json={"content": text})
+            if r.status_code == 200:
+                tokens = r.json().get("tokens")
+                if isinstance(tokens, list):
+                    return len(tokens)
+    except (httpx.HTTPError, ValueError, KeyError):
+        pass
+    return estimate_tokens(text, chars_per_token, tokens_per_word)
+
 
 def truncate_tokens(text: str, max_tokens: int) -> str:
     words = text.split()
