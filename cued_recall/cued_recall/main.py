@@ -635,12 +635,13 @@ def _clamp_context_budget(cfg: Config):
         d = r.json()
         gs = d.get("default_generation_settings", {}) or {}
         n_ctx = gs.get("n_ctx") or d.get("n_ctx")
-        # --ctx-size is the TOTAL window, divided among parallel slots, and a
-        # request only ever gets one slot. /props and /slots both report the
-        # undivided figure, so trusting it overstated the usable context by the
-        # slot count: at 61,440 across 4 slots a request could really use
-        # 15,360, and the budget was set near 47,000. run.py pins -np 1, but a
-        # server started by hand may not.
+        # Slots share one KV cache and each keeps its cached prefix, so with
+        # more than one slot the window is contended and a request cannot count
+        # on all of n_ctx -- /props reports the undivided figure regardless.
+        # Dividing by the slot count is not exact (the real ceiling moves with
+        # what the other slots hold) but it is the conservative reading, and
+        # over-trimming only costs history where under-trimming is a hard 400.
+        # run.py pins -np 1; a server started by hand may not.
         slots = int(d.get("total_slots") or 1) or 1
     except Exception:
         return

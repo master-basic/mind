@@ -110,14 +110,21 @@ MODEL_MANIFEST = [
 #   reasoning: weights + 32K KV cache on GPU (no --no-kv-offload) -> fastest.
 #   judge:     fully on CPU (-ngl 0) to free VRAM for the reasoning KV.
 #   embed:     weights on GPU, KV/context in RAM (--no-kv-offload).
-# -np 1 is load-bearing, not a tuning knob. llama.cpp splits --ctx-size across
-# parallel slots and this build defaults to 4, so a 61,440-token context gave
-# each request only 15,360 -- measured: 15k prompts succeeded, 16k returned
-# "Context size has been exceeded". Meanwhile the prompt budget is derived from
-# the full --ctx-size, so the middleware aimed at ~47k and overshot the real
-# slot on every substantial turn, while a small direct query to the same server
-# answered fine. This is a single-user stack: one slot with the whole window is
-# what the VRAM sizing already assumes, and costs nothing.
+# -np 1 is load-bearing, not a tuning knob. This build defaults to 4 slots with
+# a shared KV cache -- the server logs "n_slots = 4, n_ctx_slot = 61440,
+# kv_unified = 'true'". Every slot advertises the whole window, but they draw
+# from one pool and each retains its cached prefix, so four conversations
+# compete for the same 61,440 tokens and the real ceiling for a new request is
+# whatever the others have left. It is not a fixed division: a 16,920-token
+# prompt succeeded on an empty cache, while 16,001 failed later once other
+# slots held context. That dynamic ceiling is invisible from /props and /slots,
+# which both report the undivided figure, and it drops as the server runs --
+# which is what put the admin context bar in the red and made a small direct
+# query succeed while every substantial middleware turn was refused.
+#
+# One slot takes the whole window deterministically: measured after the change,
+# a 60,000-token prompt succeeds where 16,001 had failed. This is a single-user
+# stack, the VRAM sizing already assumes one conversation, and it costs nothing.
 SERVER_DEFAULTS = {
     "reasoning": {"port": 8080, "extra": ["--ctx-size", "32768", "--n-gpu-layers", "99", "--metrics", "--jinja", "-np", "1"]},
     "judge":     {"port": 8081, "extra": ["--ctx-size", "8192", "--n-gpu-layers", "0", "--metrics", "-np", "1"]},
