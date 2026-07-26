@@ -23,6 +23,19 @@ max_context_tokens: 26624
 # Words -> estimated tokens. ~1.3 suits prose; raise it for code-heavy or
 # CJK workloads, where a word costs more tokens.
 tokens_per_word: 1.3
+# Characters -> estimated tokens. The budget estimator takes whichever of
+# these two signals gives the LARGER number, because under-counting overflows
+# the server's window (a hard 400 and an empty reply) while over-counting only
+# trims history early. Character count is the more stable of the two: measured
+# against this stack it varies 2.8 (Azerbaijani) to 4.4 (Python source), where
+# words-per-token varies 1.4 to 4.2.
+chars_per_token: 3.2
+# Held back from the context window for the reply. Must cover a reasoning
+# model's think trace, which is generated before any visible output.
+context_reserve_tokens: 4096
+# Above this fraction of the budget, stop estimating and have the server
+# tokenize the prompt exactly (one ~450 ms call, only near the limit).
+exact_count_threshold: 0.8
 # A one-off message with no follow-up in its conversation would otherwise
 # stay unrecallable forever (normal shelving only fires on the NEXT turn).
 # This is how long to wait before shelving it anyway.

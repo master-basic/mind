@@ -483,12 +483,13 @@ def _clamp_context_budget(cfg: Config):
     """Lower max_context_tokens if it exceeds the reasoning server's n_ctx.
 
     The prompt and the generated reply share one window, so the budget must
-    leave room for the reply as well. Best-effort: if the server can't be
-    probed, keep whatever the config says.
+    leave room for the reply as well -- including a reasoning model's think
+    trace, which precedes any visible output. Best-effort: if the server can't
+    be probed, keep whatever the config says.
     """
     import httpx
 
-    RESERVE_OUTPUT = 4096
+    RESERVE_OUTPUT = cfg.context_reserve_tokens
     try:
         r = httpx.get(cfg.reasoning_endpoint.rstrip("/") + "/props", timeout=5)
         if r.status_code != 200:

@@ -126,26 +126,92 @@ class Pipeline:
         self.tps_sink = None
         self.tagger = None
 
-    def _fit_messages(self, messages: list) -> list:
-        """Truncate messages to fit within max_context_tokens.
+    @staticmethod
+    def _msg_text(m) -> str:
+        c = m.get("content", "")
+        if c is None:  # assistant tool-call messages carry content=None
+            return ""
+        if isinstance(c, list):
+            return " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+        return c if isinstance(c, str) else str(c)
+
+    def _estimate_tokens(self, text: str) -> int:
+        """Conservative token estimate from character and word counts.
+
+        Takes the larger of the two signals on purpose. Under-counting hands
+        the server a prompt bigger than its window, which is a hard 400 and an
+        empty answer; over-counting only costs some trimmed history.
+        """
+        if not text:
+            return 0
+        by_chars = len(text) / max(self.config.chars_per_token, 0.1)
+        by_words = len(text.split()) * self.config.tokens_per_word
+        return int(max(by_chars, by_words))
+
+    def _payload_overhead_tokens(self, messages: list, body: dict) -> int:
+        """Tokens in the request that are NOT message content.
+
+        Tool schemas are the big one: a client like opencode ships a dozen
+        JSON-Schema tool definitions in `body["tools"]`, which the chat
+        template renders into the prompt. The old budget ignored them
+        entirely. Per-message template scaffolding (role headers, turn
+        delimiters) is charged at a flat rate per message.
+        """
+        overhead = len(messages) * 4
+        tools = body.get("tools")
+        if tools:
+            try:
+                overhead += self._estimate_tokens(json.dumps(tools))
+            except (TypeError, ValueError):
+                pass
+        return overhead
+
+    async def _exact_prompt_tokens(self, messages: list, body: dict) -> Optional[int]:
+        """Tokenize the prompt on the server for an exact count.
+
+        Only worth calling near the limit -- /tokenize costs a fixed ~450 ms
+        regardless of input size. Returns None if the server can't be reached,
+        in which case the caller keeps its estimate.
+        """
+        blob = "\n".join(self._msg_text(m) for m in messages)
+        tools = body.get("tools")
+        if tools:
+            try:
+                blob += "\n" + json.dumps(tools)
+            except (TypeError, ValueError):
+                pass
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(
+                    f"{self.config.reasoning_endpoint}/tokenize",
+                    json={"content": blob},
+                )
+                if r.status_code != 200:
+                    return None
+                tokens = r.json().get("tokens")
+                if not isinstance(tokens, list):
+                    return None
+                return len(tokens) + len(messages) * 4
+        except (httpx.HTTPError, ValueError, KeyError):
+            return None
+
+    async def _fit_messages(self, messages: list, body: Optional[dict] = None,
+                            limit: Optional[int] = None) -> list:
+        """Truncate messages to fit the reasoning server's context window.
 
         Preserves the system message (index 0) and the latest user message.
         Oldest middle messages are dropped first. If a single message exceeds
         the limit, it is hard-truncated.
-        """
-        # Word count understates real tokens by roughly a third, so a limit
-        # applied to raw word counts lets prompts through that overflow the
-        # server's actual context window. Scale to an estimated token count so
-        # max_context_tokens means what its name says.
-        ratio = self.config.tokens_per_word
 
-        def _msg_tokens(m):
-            c = m.get("content", "")
-            if c is None:  # assistant tool-call messages carry content=None
-                return 0
-            if isinstance(c, list):
-                c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
-            return int(len(c.split()) * ratio)
+        Accuracy matters here in a way it did not appear to: the previous
+        word-count estimator ran ~41% low on real agent traffic (code and
+        markdown), so a 40k-token prompt measured as 24k, sailed under the
+        budget untouched, and the server rejected the request outright. Three
+        defenses now: a conservative estimate, an exact server-side count when
+        that estimate lands near the limit, and -- in the callers -- a retry
+        driven by the server's own token count if it still overflows.
+        """
+        body = body or {}
 
         def _set_content(m, text):
             c = m.get("content", "")
@@ -155,33 +221,52 @@ class Pipeline:
                 return {**m, "content": new_parts}
             return {**m, "content": text}
 
-        limit = self.config.max_context_tokens
-        total = sum(_msg_tokens(m) for m in messages)
+        if limit is None:
+            limit = self.config.max_context_tokens
+        overhead = self._payload_overhead_tokens(messages, body)
+        limit = max(512, limit - overhead)
+
+        per_msg = [self._estimate_tokens(self._msg_text(m)) for m in messages]
+        total = sum(per_msg)
+
+        # Near the limit the estimate is not good enough to bet a hard 400 on.
+        # Get the real number and rescale the per-message figures by the same
+        # factor so the drop loop below stays consistent with it.
+        if total > limit * self.config.exact_count_threshold:
+            exact = await self._exact_prompt_tokens(messages, body)
+            if exact is not None and total > 0:
+                scale = exact / total
+                per_msg = [int(t * scale) for t in per_msg]
+                total = exact
+
         if total <= limit:
             return messages
 
         result = list(messages)
-        # Drop oldest middle messages (between system and latest user) first
+        sizes = list(per_msg)
+        # Drop oldest middle messages (between system and latest user) first.
+        # Sizes are popped in lockstep so the running total stays on the same
+        # scale as `total` -- which may have been replaced by an exact
+        # server-side count above.
         while len(result) > 2 and total > limit:
-            drop_idx = 1  # skip system at 0
-            dropped = result.pop(drop_idx)
-            total -= _msg_tokens(dropped)
+            dropped_size = sizes.pop(1)  # skip system at 0
+            result.pop(1)
+            total -= dropped_size
 
-        # If still over, truncate the last user message
+        # If still over, truncate the last message. Drops from the FRONT,
+        # keeping the tail: for a pasted document or a tool result, the end is
+        # usually the part being asked about.
         if total > limit and result:
             last = result[-1]
-            c = last.get("content", "") or ""
-            if isinstance(c, list):
-                c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
-            words = c.split()
-            # `total`/`limit` are token estimates; convert the overshoot back
-            # into words before slicing, rounding up so we never undershoot.
-            excess_words = int((total - limit) / ratio) + 1
-            if len(words) > excess_words:
-                truncated = " ".join(words[excess_words:])
-                result[-1] = _set_content(last, truncated)
-            else:
-                result[-1] = _set_content(last, "")
+            text = self._msg_text(last)
+            last_tokens = sizes[-1] if sizes else self._estimate_tokens(text)
+            if text and last_tokens > 0:
+                keep_tokens = max(0, last_tokens - (total - limit))
+                # Convert the token allowance back into characters at this
+                # message's own measured density, rounding down so we never
+                # leave more than the budget allows.
+                keep_chars = int(len(text) * (keep_tokens / last_tokens))
+                result[-1] = _set_content(last, text[len(text) - keep_chars:])
 
         # Trimming can orphan a `tool` result whose preceding assistant
         # tool_calls message was dropped, which llama.cpp rejects. Drop any
@@ -189,6 +274,61 @@ class Pipeline:
         while len(result) > 1 and result[1].get("role") == "tool":
             result.pop(1)
         return result
+
+    @staticmethod
+    def _parse_upstream_error(raw: str) -> dict:
+        """Pull the useful bits out of a llama.cpp error body.
+
+        A context overflow reports the numbers we need to recover:
+        {"error":{"code":400,"type":"exceed_context_size_error",
+                  "n_prompt_tokens":37245,"n_ctx":32768,"message":"..."}}
+        """
+        out = {"message": (raw or "")[:300], "overflow": False,
+               "n_prompt_tokens": None, "n_ctx": None}
+        try:
+            err = (json.loads(raw) or {}).get("error") or {}
+        except (json.JSONDecodeError, TypeError):
+            return out
+        if err.get("message"):
+            out["message"] = str(err["message"])[:300]
+        npt, nctx = err.get("n_prompt_tokens"), err.get("n_ctx")
+        if err.get("type") == "exceed_context_size_error" or (npt and nctx):
+            out["overflow"] = True
+            out["n_prompt_tokens"] = npt
+            out["n_ctx"] = nctx
+        return out
+
+    async def _refit_after_overflow(self, messages: list, body: dict,
+                                    info: dict) -> list:
+        """Re-trim using the server's own token count.
+
+        The last line of defence. Whatever the estimator believed, the server
+        has now stated exactly how many tokens the prompt was and how many it
+        can take, so scale the budget by the ratio it just reported.
+        """
+        n_ctx = info.get("n_ctx") or 0
+        n_prompt = info.get("n_prompt_tokens") or 0
+        reserve = self.config.context_reserve_tokens
+        target = max(512, int(n_ctx) - reserve) if n_ctx else self.config.max_context_tokens
+
+        # Express the target in whatever units the estimator uses, via the
+        # ratio between its estimate and the server's real count.
+        real_target = target
+        est = sum(self._estimate_tokens(self._msg_text(m)) for m in messages)
+        if n_prompt and est:
+            target = max(512, int(target * (est / n_prompt)))
+
+        self.wal.write({
+            "event": "context_overflow_retry",
+            "n_prompt_tokens": n_prompt,
+            "n_ctx": n_ctx,
+            # Two scales: the real token target, and that same target expressed
+            # in estimator units (what _fit_messages actually compares against).
+            "target_real_tokens": real_target,
+            "retry_limit_estimator_units": target,
+            "timestamp": time.time(),
+        })
+        return await self._fit_messages(messages, body, limit=target)
 
     @staticmethod
     def _usage_total(usage: dict) -> Optional[int]:
@@ -927,19 +1067,65 @@ class Pipeline:
                 round_content = ""
                 tool_fallback_filter = self.ToolCallFallbackFilter()
                 reasoning_fallback_filter = self.ToolCallFallbackFilter()
-                payload = {
-                    **body, "messages": self._fit_messages(messages), "stream": True,
-                    "stream_options": {"include_usage": True},
-                }
-                # Hard rule: force web_search on the first round only.
-                if force_search and _round == 0:
-                    payload["tool_choice"] = self._force_search_choice()
-                async with client.stream(
-                    "POST",
-                    f"{self.config.reasoning_endpoint}/v1/chat/completions",
-                    json=payload,
-                    timeout=300,
-                ) as resp:
+                fitted = await self._fit_messages(messages, body)
+
+                # An upstream failure here used to be invisible. The old code
+                # went straight to `async for line in resp.aiter_lines()` with
+                # no status check, and llama.cpp reports errors as a plain JSON
+                # body -- which never starts with "data: ", so every line was
+                # skipped by the SSE filter. The round then ended with no
+                # content and no tool calls, and the client received a
+                # perfectly well-formed EMPTY stream. Check the status, retry
+                # once on a context overflow using the server's own token
+                # count, and otherwise surface the error to the client.
+                resp = None
+                stream_error = None
+                for attempt in range(2):
+                    payload = {
+                        **body, "messages": fitted, "stream": True,
+                        "stream_options": {"include_usage": True},
+                    }
+                    # Hard rule: force web_search on the first round only.
+                    if force_search and _round == 0:
+                        payload["tool_choice"] = self._force_search_choice()
+                    r = await client.send(
+                        client.build_request(
+                            "POST",
+                            f"{self.config.reasoning_endpoint}/v1/chat/completions",
+                            json=payload,
+                            timeout=300,
+                        ),
+                        stream=True,
+                    )
+                    if r.status_code == 200:
+                        resp = r
+                        break
+                    await r.aread()
+                    await r.aclose()
+                    info = self._parse_upstream_error(r.text)
+                    self.wal.write({
+                        "event": "upstream_error",
+                        "status": r.status_code,
+                        "overflow": info["overflow"],
+                        "message": info["message"],
+                        "round": _round,
+                        "attempt": attempt,
+                        "timestamp": time.time(),
+                    })
+                    if info["overflow"] and attempt == 0:
+                        fitted = await self._refit_after_overflow(
+                            messages, body, info
+                        )
+                        continue
+                    stream_error = f"HTTP {r.status_code}: {info['message']}"
+                    break
+
+                if stream_error:
+                    yield sse({"content": f"\n\n[upstream model error - {stream_error}]"})
+                    upstream_finish = "stop"
+                    break
+
+                try:
                     async for line in resp.aiter_lines():
                         if not line.startswith("data: "):
                             continue
@@ -1027,6 +1213,8 @@ class Pipeline:
                     if rc_trailing:
                         reasoning_content_parts.append(rc_trailing)
                         yield sse({"reasoning_content": rc_trailing})
+                finally:
+                    await resp.aclose()
 
                 # No tools requested -> this was the final answer.
                 if not tool_calls_by_index:
@@ -1129,15 +1317,38 @@ class Pipeline:
         for _round in range(5):
             t0 = time.time()
             async with httpx.AsyncClient() as client:
-                payload = {**body, "messages": self._fit_messages(messages), "stream": False}
-                # Hard rule: force web_search on the first round only.
-                if force_search and _round == 0:
-                    payload["tool_choice"] = self._force_search_choice()
-                resp = await client.post(
-                    f"{self.config.reasoning_endpoint}/v1/chat/completions",
-                    json=payload,
-                    timeout=300,
-                )
+                fitted = await self._fit_messages(messages, body)
+                # Same overflow recovery as the streaming path: retry once
+                # against the token count the server itself reported before
+                # giving up and raising.
+                for attempt in range(2):
+                    payload = {**body, "messages": fitted, "stream": False}
+                    # Hard rule: force web_search on the first round only.
+                    if force_search and _round == 0:
+                        payload["tool_choice"] = self._force_search_choice()
+                    resp = await client.post(
+                        f"{self.config.reasoning_endpoint}/v1/chat/completions",
+                        json=payload,
+                        timeout=300,
+                    )
+                    if resp.status_code == 200:
+                        break
+                    info = self._parse_upstream_error(resp.text)
+                    self.wal.write({
+                        "event": "upstream_error",
+                        "status": resp.status_code,
+                        "overflow": info["overflow"],
+                        "message": info["message"],
+                        "round": _round,
+                        "attempt": attempt,
+                        "timestamp": time.time(),
+                    })
+                    if info["overflow"] and attempt == 0:
+                        fitted = await self._refit_after_overflow(
+                            messages, body, info
+                        )
+                        continue
+                    break
                 resp.raise_for_status()
                 result = resp.json()
             elapsed = time.time() - t0

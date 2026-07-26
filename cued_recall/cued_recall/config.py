@@ -122,8 +122,24 @@ class Config:
         # server's --ctx-size, leaving room for the reply and tool defs).
         self.max_context_tokens: int = raw.get("max_context_tokens", 26624)
         # Multiplier converting whitespace word counts into estimated tokens.
-        # ~1.3 for prose; raise it for code- or CJK-heavy workloads.
+        # ~1.3 for prose; raise it for code- or CJK-heavy workloads. Kept as
+        # one of two signals -- see chars_per_token.
         self.tokens_per_word: float = raw.get("tokens_per_word", 1.3)
+        # Characters per token. Measured against this stack's tokenizer, this
+        # ranges 2.8 (Azerbaijani) to 4.4 (Python source) where words-per-token
+        # ranges 1.4 to 4.2 -- i.e. character count is roughly twice as stable
+        # a predictor as word count. The budget estimator takes whichever of
+        # the two signals is LARGER, because under-counting overflows the
+        # server's window (a hard 400) while over-counting only trims early.
+        self.chars_per_token: float = raw.get("chars_per_token", 3.2)
+        # Tokens held back from the server's window for the reply. Reasoning
+        # models emit long think traces before any visible answer, so this
+        # needs to cover the thinking too, not just the final message.
+        self.context_reserve_tokens: int = raw.get("context_reserve_tokens", 4096)
+        # When the estimate lands above this fraction of the budget, stop
+        # guessing and ask the server to tokenize the prompt exactly. Costs one
+        # ~450 ms round trip, and only on prompts near the limit.
+        self.exact_count_threshold: float = raw.get("exact_count_threshold", 0.8)
         self.web_search = WebSearchConfig(raw.get("web_search", {}))
 
     def get_server(self, name: str) -> ServerConfig:
