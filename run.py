@@ -29,6 +29,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent.resolve()
 CONFIG_PATH = ROOT / "cued_recall" / "config.yaml"
+LOG_DIR = ROOT / "logs"
 DEFAULT_TMPFS = Path("/mnt/ramdisk/cued_recall")
 TMPFS_SIZE = "64G"
 
@@ -895,13 +896,28 @@ def start_server(llama_bin, name, model_path, port, extra):
     args = [llama_bin, "-m", model_path, "--port", str(port), "--host", "127.0.0.1"]
     if extra:
         args.extend(extra)
-    info(f"Starting {name} on port {port}...")
-    return subprocess.Popen(
+    # Output goes to a file, not a PIPE. Nothing ever read that pipe, so once
+    # the OS buffer filled (tens of KB -- a few hundred requests) the next
+    # write by llama-server would block forever and freeze the server with no
+    # log to show for it. A file also means there IS a server-side log to read
+    # when a slot wedges; the middleware's own log only shows the timeout.
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = LOG_DIR / f"{name}.log"
+    log_file = open(log_path, "a", encoding="utf-8", errors="replace")
+    log_file.write(f"\n=== {name} started {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                   f"on port {port} ===\n")
+    log_file.flush()
+    info(f"Starting {name} on port {port} (log: {log_path})...")
+    proc = subprocess.Popen(
         args,
-        stdout=subprocess.PIPE,
+        stdout=log_file,
         stderr=subprocess.STDOUT,
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
+    # Keep the handle alive for the process's lifetime: if it were collected,
+    # the fd would close under a still-running child.
+    proc._log_file = log_file
+    return proc
 
 
 def ensure_config_exists():

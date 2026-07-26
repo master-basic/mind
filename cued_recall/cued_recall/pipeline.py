@@ -1167,15 +1167,40 @@ class Pipeline:
                     # Hard rule: force web_search on the first round only.
                     if force_search and _round == 0:
                         payload["tool_choice"] = self._force_search_choice()
-                    r = await client.send(
-                        client.build_request(
-                            "POST",
-                            f"{self.config.reasoning_endpoint}/v1/chat/completions",
-                            json=payload,
-                            timeout=300,
-                        ),
-                        stream=True,
-                    )
+                    try:
+                        r = await client.send(
+                            client.build_request(
+                                "POST",
+                                f"{self.config.reasoning_endpoint}/v1/chat/completions",
+                                json=payload,
+                                timeout=300,
+                            ),
+                            stream=True,
+                        )
+                    except httpx.HTTPError as e:
+                        # Only HTTP *status* failures were handled here. A
+                        # transport failure -- a wedged llama.cpp slot never
+                        # answers, so the read times out waiting for response
+                        # headers -- escaped this generator, killed the
+                        # StreamingResponse mid-flight, and reached the client
+                        # as a dropped connection with a traceback in the log.
+                        # Report it the way a status failure is reported.
+                        # str() on an httpx timeout is empty, hence the type
+                        # name (see Judge._judge_block for the same trap).
+                        detail = str(e) or type(e).__name__
+                        self.wal.write({
+                            "event": "upstream_transport_error",
+                            "error": f"{type(e).__name__}: {detail}",
+                            "round": _round,
+                            "attempt": attempt,
+                            "timestamp": time.time(),
+                        })
+                        stream_error = (
+                            f"{type(e).__name__} talking to the reasoning "
+                            f"server ({detail}). It may be wedged -- /slots "
+                            f"will hang too if so."
+                        )
+                        break
                     if r.status_code == 200:
                         resp = r
                         break
@@ -1437,11 +1462,31 @@ class Pipeline:
                     # Hard rule: force web_search on the first round only.
                     if force_search and _round == 0:
                         payload["tool_choice"] = self._force_search_choice()
-                    resp = await client.post(
-                        f"{self.config.reasoning_endpoint}/v1/chat/completions",
-                        json=payload,
-                        timeout=300,
-                    )
+                    try:
+                        resp = await client.post(
+                            f"{self.config.reasoning_endpoint}/v1/chat/completions",
+                            json=payload,
+                            timeout=300,
+                        )
+                    except httpx.HTTPError as e:
+                        # Same exposure as the streaming path: only status
+                        # failures were handled, so a wedged server surfaced as
+                        # an unhandled transport exception. Record it before it
+                        # leaves, so the WAL shows a deadlock rather than
+                        # nothing at all.
+                        detail = str(e) or type(e).__name__
+                        self.wal.write({
+                            "event": "upstream_transport_error",
+                            "error": f"{type(e).__name__}: {detail}",
+                            "round": _round,
+                            "attempt": attempt,
+                            "streaming": False,
+                            "timestamp": time.time(),
+                        })
+                        raise RuntimeError(
+                            f"reasoning server unreachable: {type(e).__name__}"
+                            f" ({detail})"
+                        ) from e
                     if resp.status_code == 200:
                         break
                     info = self._parse_upstream_error(resp.text)

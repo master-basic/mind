@@ -3,6 +3,9 @@ run_settings.txt
 data/
 models/
 snapshots/
+# llama-server stdout/stderr, one file per server (see start_server).
+logs/
+run_output.txt
 # Machine-specific: real store_path/snapshot_path live here. Never commit
 # someone's local ramdisk drive letter or absolute path for the next clone
 # to accidentally inherit. cued_recall/config.example.yaml is the template.
