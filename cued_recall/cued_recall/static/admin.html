@@ -194,6 +194,17 @@ function fmtBytes(n) {
   return Math.round(n / 1024) + ' KB';
 }
 
+function fmtUptime(s) {
+  if (s == null) return '—';
+  s = Math.floor(s);
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600);
+  const m = Math.floor(s % 3600 / 60), sec = s % 60;
+  if (d) return `${d}d ${h}h`;
+  if (h) return `${h}h ${m}m`;
+  if (m) return `${m}m ${sec}s`;
+  return `${sec}s`;
+}
+
 function barFor(ratio) {
   const pct = Math.round(ratio * 1000) / 10;
   const cls = pct >= 90 ? 'hot' : (pct >= 70 ? 'warn' : '');
@@ -255,6 +266,16 @@ async function loadSystem() {
       gpuGrid.innerHTML += `<div class="stat-card"><div class="value">${h.cpu_percent}%</div><div class="label">Host CPU (${h.cpu_count || '?'} threads)</div></div>`;
     }
 
+    // --- stack uptime (when run.py launched the servers, not OS uptime) ---
+    if (data.uptime_s != null) {
+      const started = data.launched_at ? new Date(data.launched_at * 1000) : null;
+      gpuGrid.innerHTML += `
+        <div class="stat-card">
+          <div class="value">${fmtUptime(data.uptime_s)}</div>
+          <div class="label" title="${started ? started.toISOString() : ''}">Uptime — since ${started ? started.toLocaleString() : '?'}</div>
+        </div>`;
+    }
+
     // --- per-model breakdown ---
     const procs = data.processes || {};
     let estTotal = 0;
@@ -278,6 +299,7 @@ async function loadSystem() {
           <div class="proc-row"><span title="Resident set size. For GPU-resident models this includes memory-mapped GGUF pages, so it is not purely CPU RAM in use.">RSS</span><b>${fmtBytes(p.rss_bytes)}</b></div>
           <div class="proc-row"><span>CPU</span><b>${p.cpu_percent != null ? p.cpu_percent + '%' : '—'}</b></div>
           <div class="proc-row"><span>threads / ctx</span><b>${p.num_threads != null ? p.num_threads : '—'} / ${p.n_ctx != null ? p.n_ctx.toLocaleString() : '—'}</b></div>
+          <div class="proc-row"><span>uptime</span><b>${fmtUptime(p.uptime_s)}</b></div>
         </div>`;
     }
 

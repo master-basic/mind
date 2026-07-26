@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import signal
 import time
 import uuid
@@ -24,6 +25,14 @@ from fastapi.staticfiles import StaticFiles
 
 
 def create_app(config_path: str = "config.yaml") -> FastAPI:
+    # run.py exports the moment the whole stack was started; model loading
+    # happens before this process exists, so falling back to "now" would
+    # under-report uptime by however long the GGUFs took to load.
+    try:
+        launched_at = float(os.environ["CUED_RECALL_LAUNCHED_AT"])
+    except (KeyError, ValueError):
+        launched_at = time.time()
+
     cfg = Config(config_path)
     store_path = Path(cfg.store_path)
     snapshot_path = Path(cfg.snapshot_path)
@@ -271,6 +280,8 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
         except Exception as e:
             # Never 500: the admin page polls this every 5 s.
             return {"gpus": [], "processes": {}, "host": {}, "error": str(e)}
+        data["launched_at"] = launched_at
+        data["uptime_s"] = time.time() - launched_at
         return data
 
     @app.post("/admin/kv/clear")

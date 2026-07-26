@@ -21,6 +21,7 @@ import time
 import signal
 import subprocess
 import shutil
+import struct
 import json
 import platform
 import argparse
@@ -164,6 +165,9 @@ def parse_args():
                    help="Force --cpu-moe for the reasoning server (auto-detected for A3B/MoE models)")
 
     g = p.add_argument_group("Port overrides")
+    g.add_argument("--reasoning-ctx", metavar="N|auto", default="auto",
+                   help="Reasoning context size. 'auto' (default) sizes it from "
+                        "free VRAM and the model's KV cost; pass a number to pin it")
     g.add_argument("--reasoning-port", type=int, default=8080, help="Reasoning model port (default: 8080)")
     g.add_argument("--judge-port",     type=int, default=8081, help="Judge model port (default: 8081)")
     g.add_argument("--embed-port",     type=int, default=8082, help="Embedding model port (default: 8082)")
@@ -526,12 +530,316 @@ def reasoning_ctx_size() -> int:
     return 32768
 
 
-def derive_max_context_tokens() -> int:
-    ctx = reasoning_ctx_size()
+def derive_max_context_tokens(ctx=None) -> int:
+    ctx = ctx or reasoning_ctx_size()
     return max(4096, ctx - RESERVE_OUTPUT_TOKENS - RESERVE_TOOLS_TOKENS)
 
 
-def update_config(storage_root, snapshot_path, args):
+# --------------------------------------------------------------------------
+# Context autosizing
+#
+# llama.cpp reserves the whole KV cache at load time, so --ctx-size is a VRAM
+# decision, not a quality knob: too high and the model fails to load, too low
+# and long conversations get truncated. Both numbers needed to size it right
+# are knowable before launch -- how much VRAM is free (nvidia-smi) and how many
+# bytes a token of KV costs (the GGUF header) -- so compute it instead of
+# shipping one hardcoded value tuned for one card.
+# --------------------------------------------------------------------------
+
+# Per GPU process: CUDA context, cuBLAS workspaces, compute buffers. Measured
+# at roughly 300-500 MiB for llama.cpp; take the high end.
+CUDA_OVERHEAD_MIB = 500
+# Left unallocated. This is a desktop GPU: a browser opening a video or a game
+# launching can swing VRAM by a gigabyte, and llama.cpp cannot give KV back
+# once allocated -- it would be the desktop that fails, or the next model load.
+# Percentage-based so it scales with the card rather than being tuned to 12 GB.
+VRAM_SAFETY_FRACTION = 0.10
+VRAM_SAFETY_MIN_MIB = 1024
+# Below this a context is too small to be useful; better to fail loudly.
+MIN_AUTO_CTX = 8192
+_GGUF_SIMPLE = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i",
+                6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d"}
+
+
+def read_gguf_metadata(path, limit_keys=400) -> dict:
+    """Parse the GGUF key/value header. Returns {} on any problem.
+
+    Only the header is read -- the tensor data (gigabytes) is never touched.
+    """
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != b"GGUF":
+                return {}
+            struct.unpack("<I", f.read(4))          # version
+            struct.unpack("<Q", f.read(8))          # tensor count
+            n_kv, = struct.unpack("<Q", f.read(8))
+
+            def rd_str():
+                n, = struct.unpack("<Q", f.read(8))
+                return f.read(n).decode("utf-8", "replace")
+
+            def rd_val(t):
+                if t == 8:
+                    return rd_str()
+                if t == 9:  # array
+                    et, = struct.unpack("<I", f.read(4))
+                    n, = struct.unpack("<Q", f.read(8))
+                    return [rd_val(et) for _ in range(n)]
+                fmt = _GGUF_SIMPLE.get(t)
+                if fmt is None:
+                    raise ValueError(f"unknown gguf type {t}")
+                return struct.unpack(fmt, f.read(struct.calcsize(fmt)))[0]
+
+            md = {}
+            for _ in range(min(n_kv, limit_keys)):
+                k = rd_str()
+                t, = struct.unpack("<I", f.read(4))
+                md[k] = rd_val(t)
+            return md
+    except (OSError, struct.error, ValueError, UnicodeDecodeError):
+        return {}
+
+
+def kv_bytes_per_token(md: dict) -> int:
+    """KV cache cost of one token, from the model's own header.
+
+    The naive formula (every layer keeps a KV cache) is wrong for hybrid
+    models. Qwen3.5 for instance sets full_attention_interval=4, meaning only
+    every 4th layer holds a KV cache at all -- the rest are Gated DeltaNet
+    layers carrying a constant-size recurrent state. Ignoring that overstates
+    the cost 4x and would hand back a quarter of the context the card can
+    actually hold. Validated against measurement: this returns 32 KiB/token
+    for Qwen3.5-9B, where loading at 32k/64k/128k measured 1.00/2.04/4.10 GiB.
+    """
+    arch = md.get("general.architecture")
+    if not arch:
+        return 0
+    g = lambda k, d=None: md.get(f"{arch}.{k}", d)
+
+    n_layer = g("block_count") or 0
+    n_kv_heads = g("attention.head_count_kv") or g("attention.head_count") or 0
+    embed = g("embedding_length") or 0
+    n_heads = g("attention.head_count") or 0
+    k_len = g("attention.key_length") or (embed // n_heads if n_heads else 0)
+    v_len = g("attention.value_length") or k_len
+    if not (n_layer and n_kv_heads and k_len):
+        return 0
+
+    # Hybrid attention: only 1 layer in `full_attention_interval` keeps a cache.
+    interval = g("full_attention_interval") or 1
+    full_layers = max(1, n_layer // interval) if interval > 1 else n_layer
+
+    # llama.cpp defaults to f16 K and V.
+    return int(full_layers * n_kv_heads * (k_len + v_len) * 2)
+
+
+def gpu_free_mib():
+    """(free_mib, total_mib, name) for GPU 0, or None when there's no NVIDIA GPU."""
+    try:
+        r = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=memory.total,memory.used,name",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        if r.returncode != 0 or not r.stdout.strip():
+            return None
+        total_s, used_s, name = [p.strip() for p in
+                                 r.stdout.strip().splitlines()[0].split(",")]
+        total, used = int(float(total_s)), int(float(used_s))
+        return max(0, total - used), total, name
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None
+
+
+def port_in_use(port: int) -> bool:
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.3)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def autosize_reasoning_ctx(reasoning_path, embed_path=None, gpu_layers=99,
+                           free_mib=None, ports_busy=None):
+    """Pick --ctx-size for the reasoning server from free VRAM and KV cost.
+
+    Returns (ctx, notes) where notes are the lines to show the user. Falls back
+    to the hardcoded default whenever anything can't be determined -- a bad
+    guess here costs a failed model load, so every unknown resolves toward the
+    known-good value.
+    """
+    notes = []
+    default = reasoning_ctx_size()
+
+    gpu = gpu_free_mib()
+    if gpu is None:
+        return default, ["no NVIDIA GPU detected; keeping default ctx"]
+    measured_free, total_mib, gpu_name = gpu
+    if free_mib is None:
+        free_mib = measured_free
+
+    # A previous instance still holding the GPU makes "free VRAM" meaningless:
+    # its weights and KV read as used, so the budget comes out negative and we
+    # would size down to nothing. Its ports would collide on launch anyway.
+    if ports_busy is None:
+        ports_busy = port_in_use(SERVER_DEFAULTS["reasoning"]["port"])
+    if ports_busy:
+        return default, [
+            "reasoning port already in use -- another instance is holding the "
+            f"GPU, so free VRAM can't be read; keeping default ctx {default:,}"
+        ]
+
+    if not reasoning_path or not os.path.exists(reasoning_path):
+        # Normal on a --dry-run before the first download.
+        return default, [f"reasoning model not on disk yet; showing default ctx {default:,}"]
+
+    md = read_gguf_metadata(reasoning_path)
+    per_token = kv_bytes_per_token(md)
+    if not per_token:
+        return default, ["could not read KV geometry from the GGUF; keeping default ctx"]
+
+    arch = md.get("general.architecture", "?")
+    trained_ctx = md.get(f"{arch}.context_length") or default
+
+    # Everything that must fit alongside the KV cache.
+    weights_mib = 0
+    if gpu_layers and gpu_layers > 0:
+        try:
+            weights_mib = os.path.getsize(reasoning_path) // (1024 * 1024)
+        except OSError:
+            pass
+    embed_mib = 0
+    if embed_path:
+        try:
+            embed_mib = os.path.getsize(embed_path) // (1024 * 1024)
+        except OSError:
+            pass
+
+    # Two GPU-resident llama.cpp processes (reasoning + embed), each paying
+    # its own CUDA context.
+    overhead = CUDA_OVERHEAD_MIB * (2 if embed_path else 1)
+    safety = max(VRAM_SAFETY_MIN_MIB, int(total_mib * VRAM_SAFETY_FRACTION))
+    budget_mib = free_mib - weights_mib - embed_mib - overhead - safety
+
+    notes.append(f"{gpu_name}: {free_mib:,} MiB free of {total_mib:,} MiB")
+    notes.append(
+        f"reserving {weights_mib:,} weights + {embed_mib:,} embed "
+        f"+ {overhead} CUDA + {safety} safety = "
+        f"{budget_mib:,} MiB for KV"
+    )
+
+    if budget_mib <= 0:
+        # Not a context problem: the weights alone don't fit. Say so, because
+        # no --ctx-size will rescue this and the default we fall back to will
+        # fail to load just the same.
+        notes.append(
+            f"the weights alone exceed free VRAM by {-budget_mib:,} MiB -- "
+            "the model will not fit on the GPU. Free VRAM, or run it on the "
+            "CPU with --reasoning-cpu-moe (MoE) or a smaller quant."
+        )
+        notes.append(f"keeping default ctx {default:,}")
+        return default, notes
+
+    ctx = int(budget_mib * 1024 * 1024 // per_token)
+    ctx = (ctx // 4096) * 4096                       # llama.cpp likes round numbers
+    ctx = min(ctx, int(trained_ctx))                 # never exceed what it was trained for
+    kib = per_token / 1024
+    notes.append(
+        f"KV costs {kib:.0f} KiB/token "
+        f"({max(1, (md.get(arch + '.block_count') or 1) // (md.get(arch + '.full_attention_interval') or 1))}"
+        f"/{md.get(arch + '.block_count')} layers hold a cache)"
+    )
+
+    if ctx < MIN_AUTO_CTX:
+        notes.append(f"computed ctx {ctx:,} below the {MIN_AUTO_CTX:,} floor; "
+                     f"keeping default {default:,}")
+        return default, notes
+    if ctx >= int(trained_ctx):
+        notes.append(f"capped at the model's trained context ({int(trained_ctx):,})")
+    return ctx, notes
+
+
+def set_arg(extra: list, flag: str, value: str) -> list:
+    """Replace flag's value in an argv list, appending the pair if absent."""
+    out = list(extra)
+    for i, a in enumerate(out):
+        if a == flag and i + 1 < len(out):
+            out[i + 1] = value
+            return out
+    return out + [flag, value]
+
+
+def get_arg(extra: list, flag: str, default=None):
+    for i, a in enumerate(extra):
+        if a == flag and i + 1 < len(extra):
+            return extra[i + 1]
+    return default
+
+
+def resolve_reasoning_ctx(args, models) -> int:
+    """Decide the reasoning context size and explain the decision."""
+    default = reasoning_ctx_size()
+    raw = str(getattr(args, "reasoning_ctx", "auto") or "auto").strip().lower()
+
+    if raw not in ("auto", ""):
+        try:
+            pinned = int(raw)
+        except ValueError:
+            warn(f"--reasoning-ctx {raw!r} is not a number or 'auto'; using {default:,}")
+            return default
+        info(f"Reasoning ctx: {pinned:,} (pinned via --reasoning-ctx)")
+        return pinned
+
+    gpu_layers = 0 if args.reasoning_cpu_moe else 99
+    ctx, notes = autosize_reasoning_ctx(
+        models.get("reasoning"), models.get("embed"), gpu_layers=gpu_layers
+    )
+    info(f"Reasoning ctx: {ctx:,} (auto)")
+    for n in notes:
+        print(f"         {n}")
+    if ctx != default:
+        print(f"         pin a different value with --reasoning-ctx N")
+    return ctx
+
+
+def print_launch_plan(server_defs, launched_at):
+    """Show what is about to start, before it starts.
+
+    Until now the launcher printed per-model 'ready' lines scattered through
+    the download/copy flow and a final banner of ports, so the one question
+    worth answering at a glance -- which model, on which device, with how much
+    context -- had no single place to look.
+    """
+    print()
+    print("=" * 72)
+    print(f"  Launch plan - {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(launched_at))}")
+    print("=" * 72)
+    print(f"  {'server':<10} {'port':>5}  {'device':<10} {'ctx':>8}  model")
+    print("  " + "-" * 68)
+    for sd in server_defs:
+        extra = sd["extra"]
+        ngl = get_arg(extra, "--n-gpu-layers", "0")
+        ctx = get_arg(extra, "--ctx-size", "-")
+        try:
+            ctx = f"{int(ctx):,}"
+        except (TypeError, ValueError):
+            pass
+        if "--cpu-moe" in extra:
+            device = "GPU+MoE"
+        elif str(ngl) == "0":
+            device = "CPU"
+        elif "--no-kv-offload" in extra:
+            device = "GPU/KV-RAM"
+        else:
+            device = "GPU"
+        print(f"  {sd['name']:<10} {sd['port']:>5}  {device:<10} {ctx:>8}  "
+              f"{Path(sd['model']).name}")
+    print("=" * 72)
+    print()
+
+
+def update_config(storage_root, snapshot_path, args, reasoning_ctx=None):
     import yaml
     # encoding="utf-8" is required: config.yaml holds non-ASCII correction
     # patterns (e.g. Azerbaijani). Without it, Windows' default codepage
@@ -543,10 +851,11 @@ def update_config(storage_root, snapshot_path, args):
     config["models_dir"] = str(storage_root / "models")
     # Keep the prompt budget tied to the context window actually being served,
     # so the two can't drift apart and overflow.
-    derived = derive_max_context_tokens()
+    ctx = reasoning_ctx or reasoning_ctx_size()
+    derived = derive_max_context_tokens(ctx)
     if config.get("max_context_tokens") != derived:
-        info(f"max_context_tokens: {derived} "
-             f"(ctx {reasoning_ctx_size()} - {RESERVE_OUTPUT_TOKENS} reply "
+        info(f"max_context_tokens: {derived:,} "
+             f"(ctx {ctx:,} - {RESERVE_OUTPUT_TOKENS} reply "
              f"- {RESERVE_TOOLS_TOKENS} tools)")
     config["max_context_tokens"] = derived
     config.setdefault("tokens_per_word", 1.3)
@@ -611,7 +920,9 @@ def main():
     os.chdir(ROOT)
     args = parse_args()
 
+    launched_at = time.time()
     print("=== Cued Recall Memory Middleware ===")
+    print(f"    launched {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(launched_at))}")
     print()
 
     ensure_config_exists()
@@ -641,15 +952,10 @@ def main():
     snapshot_path = resolve_snapshot_path(args)
     models = resolve_models(args, storage_root, hf_hub)
 
-    if args.dry_run:
-        print()
-        info("Dry run complete. No changes made.")
-        return
-
-    if not models:
+    if not models and not args.dry_run:
         die("No models resolved. Use --download-to, --models-cache, or explicit --*-model paths")
 
-    update_config(storage_root, snapshot_path, args)
+    reasoning_ctx = resolve_reasoning_ctx(args, models)
 
     skip_map = {
         "reasoning": args.skip_reasoning,
@@ -675,6 +981,8 @@ def main():
         model_path = models[name]
         defaults = SERVER_DEFAULTS[name]
         extra = list(defaults["extra"])
+        if name == "reasoning":
+            extra = set_arg(extra, "--ctx-size", str(reasoning_ctx))
         if name == "reasoning" and (args.reasoning_cpu_moe or is_moe_model(Path(model_path).name)):
             # MoE: keep router/attention/KV on GPU, park expert tensors in
             # system RAM so 17-20 GB A3B models run on a 12 GB card.
@@ -697,8 +1005,16 @@ def main():
             "extra": extra,
         })
 
-    if not server_defs:
+    if not server_defs and not args.dry_run:
         die("No servers to start")
+
+    print_launch_plan(server_defs, launched_at)
+
+    if args.dry_run:
+        info("Dry run complete. No changes made.")
+        return
+
+    update_config(storage_root, snapshot_path, args, reasoning_ctx)
 
     processes = []
     try:
@@ -707,15 +1023,43 @@ def main():
             processes.append((sd["name"], proc, sd["port"]))
 
         info("Waiting for servers...")
-        for name, proc, port in processes:
-            wait_for_server(name, port, proc)
+        for i, (name, proc, port) in enumerate(processes):
+            if wait_for_server(name, port, proc):
+                continue
+            # An autosized context is an estimate: VRAM can be taken by
+            # another app between measuring and loading, and the KV formula
+            # carries a few percent of slack. Rather than leave the stack
+            # half-up, halve the context and try once more -- the failure mode
+            # this recovers from is always "KV didn't fit".
+            sd = next((s for s in server_defs if s["name"] == name), None)
+            if sd is None or name != "reasoning":
+                continue
+            old_ctx = int(get_arg(sd["extra"], "--ctx-size", "0") or 0)
+            new_ctx = (old_ctx // 2 // 4096) * 4096
+            if old_ctx <= MIN_AUTO_CTX or new_ctx < MIN_AUTO_CTX:
+                continue
+            warn(f"{name} failed to start at ctx {old_ctx:,}; "
+                 f"retrying at {new_ctx:,}")
+            sd["extra"] = set_arg(sd["extra"], "--ctx-size", str(new_ctx))
+            retry = start_server(llama_bin, name, sd["model"], port, sd["extra"])
+            processes[i] = (name, retry, port)
+            if wait_for_server(name, port, retry):
+                # The prompt budget was written from the ctx that just failed.
+                update_config(storage_root, snapshot_path, args, new_ctx)
+                info(f"recovered at ctx {new_ctx:,}; "
+                     f"pin it with --reasoning-ctx {new_ctx}")
 
         info("Starting middleware...")
+        # The middleware starts seconds-to-minutes after the launcher (model
+        # loads come first), so its own process start time is not when the
+        # stack came up. Hand it the real figure for the admin page.
+        mw_env = {**os.environ, "CUED_RECALL_LAUNCHED_AT": str(launched_at)}
         middleware = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "cued_recall.main:create_app",
              "--factory", "--host", "127.0.0.1", "--port", str(args.middleware_port),
              "--log-level", "info"],
             cwd=str(ROOT / "cued_recall"),
+            env=mw_env,
         )
         processes.append(("middleware", middleware, args.middleware_port))
 

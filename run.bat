@@ -13,7 +13,16 @@ setlocal enabledelayedexpansion
 REM Remembered answers from the last interactive run live here
 set "SETTINGS_FILE=%~dp0run_settings.txt"
 
+REM %DATE%/%TIME% are locale-formatted and unsortable; WMIC/PowerShell give a
+REM stable YYYY-MM-DD HH:MM:SS. Fall back to the raw locale values if neither
+REM is available, so a missing WMIC never stops the launcher.
+set "LAUNCH_TS="
+for /f %%t in ('powershell -NoProfile -Command "Get-Date -Format \"yyyy-MM-dd_HH:mm:ss\"" 2^>nul') do set "LAUNCH_TS=%%t"
+if defined LAUNCH_TS set "LAUNCH_TS=!LAUNCH_TS:_= !"
+if not defined LAUNCH_TS set "LAUNCH_TS=%DATE% %TIME%"
+
 echo === Cued Recall Memory Middleware ===
+echo     launched !LAUNCH_TS!
 echo.
 
 REM Check Python >= 3.11
