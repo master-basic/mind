@@ -37,17 +37,25 @@ class Tagger:
         endpoint = config.tagger.endpoint or config.judge_endpoint
         self.tagger_url = endpoint.rstrip("/") + "/v1/chat/completions"
         self.usage_sink = None
+        # Tagging is fire-and-forget, one task per block, and shelving arrives
+        # in batches (idle sweeps, startup). Unbounded, that stampedes a small
+        # CPU-bound model: a third of all tag calls were timing out. Let a
+        # couple through at a time and make the rest wait rather than fail.
+        self._slots = asyncio.Semaphore(2)
 
     async def tag_block(self, block: Block):
         if not self.config.tagger.enabled:
             return
         try:
-            gist, tags = await self._call_model(block)
+            async with self._slots:
+                gist, tags = await self._call_model(block)
         except Exception as e:
             self.wal.write({
                 "event": "tagger_error",
                 "block_id": block.block_id,
-                "error": str(e),
+                # str() on an httpx timeout is "", which made every one of
+                # those failures unreadable in the log.
+                "error": f"{type(e).__name__}: {e}",
                 "timestamp": time.time(),
             })
             return
@@ -83,7 +91,9 @@ class Tagger:
             f"Context (what was asked):\n{block.stimulus_text[:1500]}\n\n"
             f"Content:\n{block.text[:2000]}"
         )
-        async with httpx.AsyncClient(timeout=60) as client:
+        # A 1.5B judge model on CPU can take a while under load; the previous
+        # 60 s was tight enough that queued calls tripped it routinely.
+        async with httpx.AsyncClient(timeout=180) as client:
             resp = await client.post(
                 self.tagger_url,
                 json={
