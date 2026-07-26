@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from cued_recall.config import Config          # noqa: E402
 from cued_recall.store import BlockStore       # noqa: E402
-from cued_recall.utils import count_tokens     # noqa: E402
+from cued_recall.utils import count_tokens, count_tokens_exact  # noqa: E402
 
 
 async def main() -> int:
@@ -48,11 +48,7 @@ async def main() -> int:
     # Fail early and loudly: silently falling back to the estimator for every
     # block would write 40%-high numbers across the whole store, which is a
     # worse state than the word counts we are replacing.
-    probe = await count_tokens("token count probe", endpoint,
-                               cfg.chars_per_token, cfg.tokens_per_word)
-    estimated = await count_tokens("token count probe", "http://0.0.0.0:1",
-                                   cfg.chars_per_token, cfg.tokens_per_word)
-    if probe == estimated:
+    if await count_tokens_exact("token count probe", endpoint) is None:
         print(f"[ERROR] tokenizer at {endpoint} is not answering -- every block "
               f"would fall back to the estimator. Start the reasoning server "
               f"and re-run.", file=sys.stderr)

@@ -1083,8 +1083,15 @@ class Pipeline:
             "role_sent": False,
         }
         upstream_finish = None
+        # An agent client decides when to auto-compact from the usage it sees.
+        # This stream reported none: usage arrived from llama.cpp, went to the
+        # admin metrics sink, and was dropped. opencode therefore believed the
+        # conversation cost nothing, never compacted, and let it grow until
+        # _fit_messages silently truncated history or the server refused the
+        # prompt outright.
+        usage_acc = {"prompt_tokens": 0, "completion_tokens": 0}
 
-        def sse(delta: dict, finish_reason=None) -> bytes:
+        def sse(delta: dict, finish_reason=None, usage=None) -> bytes:
             # OpenAI sends role on the first delta of the message.
             if delta and not env["role_sent"]:
                 delta = {"role": "assistant", **delta}
@@ -1100,6 +1107,8 @@ class Pipeline:
                     "finish_reason": finish_reason,
                 }],
             }
+            if usage:
+                chunk["usage"] = usage
             return f"data: {json.dumps(chunk)}\n\n".encode()
 
         # Multi-round tool loop: stream each model turn to the client; if it
@@ -1184,6 +1193,16 @@ class Pipeline:
                             continue
                         if data.get("usage"):
                             self._report_usage(data["usage"])
+                            u = data["usage"]
+                            # Prompt tokens are the LAST round's context
+                            # occupancy, not a sum: every tool round re-sends
+                            # the whole conversation, so adding them up would
+                            # report several times the real context use.
+                            if u.get("prompt_tokens"):
+                                usage_acc["prompt_tokens"] = u["prompt_tokens"]
+                            usage_acc["completion_tokens"] += (
+                                u.get("completion_tokens") or 0
+                            )
                         # Adopt upstream's id/model so the stream we emit is
                         # consistent with what actually generated it.
                         if data.get("id") and _round == 0:
@@ -1315,7 +1334,24 @@ class Pipeline:
         # OpenAI-compatible clients use this -- not [DONE] -- to finalize the
         # assembled message; without it the stream ends with no completion
         # signal and the client can drop everything it accumulated.
-        yield sse({}, finish_reason=upstream_finish or "stop")
+        usage_out = None
+        if usage_acc["prompt_tokens"] or usage_acc["completion_tokens"]:
+            usage_out = {
+                "prompt_tokens": usage_acc["prompt_tokens"],
+                "completion_tokens": usage_acc["completion_tokens"],
+                "total_tokens": (usage_acc["prompt_tokens"]
+                                 + usage_acc["completion_tokens"]),
+            }
+        # Carried on the finish_reason chunk rather than only in the
+        # empty-choices chunk below, so a client that stops reading at
+        # finish_reason still gets the numbers it needs to decide on
+        # compaction.
+        yield sse({}, finish_reason=upstream_finish or "stop", usage=usage_out)
+        # The OpenAI-spec placement: a final chunk with no choices, sent only
+        # when the client actually asked for usage, since a client that did
+        # not ask may index choices[0] unconditionally.
+        if usage_out and (body.get("stream_options") or {}).get("include_usage"):
+            yield (f"data: {json.dumps({'id': env['id'], 'object': 'chat.completion.chunk', 'created': env['created'], 'model': env['model'], 'choices': [], 'usage': usage_out})}\n\n").encode()
         yield b"data: [DONE]\n\n"
 
         elapsed = time.time() - t0

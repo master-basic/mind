@@ -102,6 +102,12 @@ tr:hover td { background: #161b22; }
   <select id="filter-tag">
     <option value="">All tags</option>
   </select>
+  <select id="page-size" title="Rows per page">
+    <option value="50">50 / page</option>
+    <option value="100" selected>100 / page</option>
+    <option value="250">250 / page</option>
+    <option value="500">500 / page</option>
+  </select>
   <button onclick="loadBlocks()">Refresh</button>
   <button class="btn-danger" id="btn-delete" onclick="deleteSelected()" disabled>Delete Selected <span id="sel-count"></span></button>
   <button class="btn-danger" onclick="runJudge()">Run Judge Pass</button>
@@ -129,6 +135,14 @@ tr:hover td { background: #161b22; }
 </tr></thead>
 <tbody id="blocks-tbody"></tbody>
 </table>
+</div>
+
+<div id="blocks-pager" style="display:flex;align-items:center;gap:12px;margin-top:10px;">
+  <button id="page-first" onclick="gotoPage(0)">&laquo; First</button>
+  <button id="page-prev" onclick="stepPage(-1)">&lsaquo; Prev</button>
+  <span id="page-status" style="color:#8b949e;font-size:13px;"></span>
+  <button id="page-next" onclick="stepPage(1)">Next &rsaquo;</button>
+  <button id="page-last" onclick="gotoPage(-1)">Last &raquo;</button>
 </div>
 
 <script>
@@ -372,20 +386,74 @@ async function loadTps() {
   }
 }
 
+// Paging state. The table used to request limit=100 with no offset, so only
+// the newest 100 blocks were ever reachable -- the backend has supported
+// limit/offset and returned `total` all along.
+let blocksOffset = 0;
+let blocksTotal = 0;
+// Clicking Next faster than the fetch returns let an earlier response land
+// after a later one and paint a stale page. Only the newest request may
+// render.
+let blocksRequestSeq = 0;
+
+function blocksLimit() {
+  return parseInt(document.getElementById('page-size').value, 10) || 100;
+}
+
+function stepPage(dir) {
+  const next = blocksOffset + dir * blocksLimit();
+  if (next < 0 || next >= blocksTotal) return;
+  blocksOffset = next;
+  loadBlocks();
+}
+
+function gotoPage(which) {
+  // -1 means the last page: floor to a whole number of pages so the final
+  // page fills from a page boundary rather than showing a ragged tail.
+  const lim = blocksLimit();
+  blocksOffset = which === -1 ? Math.max(0, Math.floor((blocksTotal - 1) / lim) * lim) : 0;
+  loadBlocks();
+}
+
+function updatePager(shown) {
+  const lim = blocksLimit();
+  const first = blocksTotal === 0 ? 0 : blocksOffset + 1;
+  const last = blocksOffset + shown;
+  document.getElementById('page-status').textContent =
+    blocksTotal === 0 ? 'no blocks'
+      : `${first.toLocaleString()}–${last.toLocaleString()} of ${blocksTotal.toLocaleString()}`;
+  const atStart = blocksOffset === 0;
+  const atEnd = blocksOffset + lim >= blocksTotal;
+  document.getElementById('page-first').disabled = atStart;
+  document.getElementById('page-prev').disabled = atStart;
+  document.getElementById('page-next').disabled = atEnd;
+  document.getElementById('page-last').disabled = atEnd;
+}
+
 async function loadBlocks() {
   const status = document.getElementById('filter-status').value;
   const type = document.getElementById('filter-type').value;
   const conv = document.getElementById('filter-conv').value;
   const tag = document.getElementById('filter-tag').value;
-  const params = new URLSearchParams({ limit: 100 });
+  const params = new URLSearchParams({ limit: blocksLimit(), offset: blocksOffset });
   if (status) params.set('status', status);
   if (type) params.set('type_', type);
   if (conv) params.set('conversation_id', conv);
   if (tag) params.set('tag', tag);
 
+  const seq = ++blocksRequestSeq;
   try {
     const r = await fetch(API + '/admin/blocks?' + params);
     const data = await r.json();
+    if (seq !== blocksRequestSeq) return;   // superseded by a later click
+    blocksTotal = data.total || 0;
+    // A filter change can leave the offset past the end of the new result
+    // set, which would render an empty table on a non-empty filter. Walk back
+    // to the last page that has rows and re-fetch.
+    if (blocksOffset > 0 && !(data.items || []).length && blocksTotal > 0) {
+      blocksOffset = Math.max(0, Math.floor((blocksTotal - 1) / blocksLimit()) * blocksLimit());
+      return loadBlocks();
+    }
     const tbody = document.getElementById('blocks-tbody');
     tbody.innerHTML = '';
 
@@ -410,10 +478,12 @@ async function loadBlocks() {
     }
 
     if (!data.items?.length) {
-      tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;color:#484f58;padding:24px;">No blocks found</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="12" style="text-align:center;color:#484f58;padding:24px;">No blocks found</td></tr>';
     }
+    updatePager((data.items || []).length);
   } catch (e) {
-    document.getElementById('blocks-tbody').innerHTML = `<tr><td colspan="11" style="color:#f85149">Error: ${e.message}</td></tr>`;
+    if (seq !== blocksRequestSeq) return;
+    document.getElementById('blocks-tbody').innerHTML = `<tr><td colspan="12" style="color:#f85149">Error: ${e.message}</td></tr>`;
   }
   loadTagFilter();
 }
@@ -520,9 +590,14 @@ async function refresh() {
   await Promise.all([loadServerInfo(), loadModels(), loadSystem(), loadStats(), loadTps(), loadBlocks()]);
 }
 
-document.getElementById('filter-status').addEventListener('change', loadBlocks);
-document.getElementById('filter-type').addEventListener('change', loadBlocks);
-document.getElementById('filter-tag').addEventListener('change', loadBlocks);
+// Any change to what is being listed puts you back on page 1 -- staying on
+// page 4 of a filter that now has two pages would show an empty table.
+function reloadFromFirstPage() { blocksOffset = 0; loadBlocks(); }
+document.getElementById('filter-status').addEventListener('change', reloadFromFirstPage);
+document.getElementById('filter-type').addEventListener('change', reloadFromFirstPage);
+document.getElementById('filter-tag').addEventListener('change', reloadFromFirstPage);
+document.getElementById('page-size').addEventListener('change', reloadFromFirstPage);
+document.getElementById('filter-conv').addEventListener('change', reloadFromFirstPage);
 
 document.getElementById('sel-all').addEventListener('change', function() {
   const boxes = document.querySelectorAll('#blocks-tbody .chk');

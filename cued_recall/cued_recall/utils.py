@@ -34,6 +34,23 @@ async def count_tokens(text: str, endpoint: str, chars_per_token: float = 3.2,
     """
     if not text:
         return 0
+    exact = await count_tokens_exact(text, endpoint, timeout)
+    if exact is not None:
+        return exact
+    return estimate_tokens(text, chars_per_token, tokens_per_word)
+
+
+async def count_tokens_exact(text: str, endpoint: str,
+                             timeout: float = 10) -> "int | None":
+    """Token count from the server, or None if it could not be reached.
+
+    Separate from count_tokens so a caller can tell a real count from a
+    fallback. The backfill needs that distinction: quietly writing estimator
+    values across the whole store would be worse than the word counts it is
+    replacing.
+    """
+    if not text:
+        return 0
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.post(endpoint.rstrip("/") + "/tokenize",
@@ -44,7 +61,7 @@ async def count_tokens(text: str, endpoint: str, chars_per_token: float = 3.2,
                     return len(tokens)
     except (httpx.HTTPError, ValueError, KeyError):
         pass
-    return estimate_tokens(text, chars_per_token, tokens_per_word)
+    return None
 
 
 def truncate_tokens(text: str, max_tokens: int) -> str:
