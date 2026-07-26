@@ -38,9 +38,9 @@ TMPFS_SIZE = "64G"
 REASONING_CATALOG = [
     {
         "num": 1,
-        "label": "Qwen3-8B (default, censored)          5.0 GB  dense, full GPU",
-        "repo": "Qwen/Qwen3-8B-GGUF",
-        "file": "Qwen3-8B-Q4_K_M.gguf",
+        "label": "Qwen3.5-9B (default)                  6.6 GB  dense, full GPU",
+        "repo": "unsloth/Qwen3.5-9B-GGUF",
+        "file": "Qwen3.5-9B-Q5_K_M.gguf",
         "moe": False,
     },
     {
