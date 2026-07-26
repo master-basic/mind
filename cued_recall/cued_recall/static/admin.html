@@ -41,6 +41,12 @@ tr:hover td { background: #161b22; }
 .badge-shelved { background: #58a6ff20; color: #58a6ff; border: 1px solid #58a6ff40; }
 .badge-truncated { background: #a371f720; color: #a371f7; border: 1px solid #a371f740; }
 .badge-purged { background: #f8514920; color: #f85149; border: 1px solid #f8514940; }
+.badge-gpu { background: #3fb95020; color: #3fb950; border: 1px solid #3fb95040; }
+.badge-cpu { background: #58a6ff20; color: #58a6ff; border: 1px solid #58a6ff40; }
+.badge-off { background: #8b949e20; color: #8b949e; border: 1px solid #8b949e40; }
+.proc-row { display: flex; justify-content: space-between; font-size: 11px; color: #8b949e; margin-top: 3px; }
+.proc-row b { color: #c9d1d9; font-weight: 500; }
+.note { font-size: 11px; color: #484f58; margin: -8px 0 12px; }
 #last-updated { font-size: 11px; color: #484f58; margin-bottom: 16px; }
 .server-info { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px; margin-bottom: 16px; font-size: 12px; }
 .server-info span { color: #8b949e; }
@@ -65,6 +71,11 @@ tr:hover td { background: #161b22; }
 
 <h2>Models — context usage</h2>
 <div class="models-grid" id="models-grid"></div>
+
+<h2>GPU / System</h2>
+<div class="stats-grid" id="gpu-grid"></div>
+<div class="models-grid" id="proc-grid"></div>
+<div class="note" id="gpu-note"></div>
 
 <h2>Stats</h2>
 <div class="stats-grid" id="stats-grid"></div>
@@ -173,6 +184,117 @@ async function loadModels() {
     }
   } catch (e) {
     grid.innerHTML = `<div class="model-card" style="color:#f85149">Error: ${e.message}</div>`;
+  }
+}
+
+function fmtBytes(n) {
+  if (n == null) return '—';
+  if (n >= 1073741824) return (n / 1073741824).toFixed(2) + ' GB';
+  if (n >= 1048576) return Math.round(n / 1048576) + ' MB';
+  return Math.round(n / 1024) + ' KB';
+}
+
+function barFor(ratio) {
+  const pct = Math.round(ratio * 1000) / 10;
+  const cls = pct >= 90 ? 'hot' : (pct >= 70 ? 'warn' : '');
+  return { pct, cls };
+}
+
+async function loadSystem() {
+  const gpuGrid = document.getElementById('gpu-grid');
+  const procGrid = document.getElementById('proc-grid');
+  try {
+    const r = await fetch(API + '/admin/system');
+    const data = await r.json();
+    gpuGrid.innerHTML = '';
+    procGrid.innerHTML = '';
+
+    if (data.error) {
+      gpuGrid.innerHTML = `<div class="stat-card" style="color:#d29922">${data.error}</div>`;
+    }
+
+    // --- device-level GPU cards ---
+    for (const g of data.gpus || []) {
+      if (g.memory_used_ratio != null) {
+        const { pct, cls } = barFor(g.memory_used_ratio);
+        gpuGrid.innerHTML += `
+          <div class="stat-card">
+            <div class="value">${pct}%</div>
+            <div class="label">VRAM — ${g.name}</div>
+            <div class="bar ${cls}" style="margin-top:8px"><span style="width:${Math.min(pct,100)}%"></span></div>
+            <div class="bar-label"><span>${g.memory_used_mb} MB</span><span>of ${g.memory_total_mb} MB</span></div>
+          </div>`;
+      }
+      if (g.util_gpu_pct != null) {
+        gpuGrid.innerHTML += `<div class="stat-card"><div class="value">${g.util_gpu_pct}%</div><div class="label">GPU utilization</div></div>`;
+      }
+      if (g.util_mem_pct != null) {
+        gpuGrid.innerHTML += `<div class="stat-card"><div class="value">${g.util_mem_pct}%</div><div class="label">Memory bus utilization</div></div>`;
+      }
+      if (g.temperature_c != null) {
+        gpuGrid.innerHTML += `<div class="stat-card"><div class="value">${g.temperature_c}°C</div><div class="label">GPU temperature</div></div>`;
+      }
+    }
+    if (!(data.gpus || []).length && !data.error) {
+      gpuGrid.innerHTML += '<div class="stat-card" style="color:#8b949e"><div class="label">No NVIDIA GPU detected (nvidia-smi unavailable)</div></div>';
+    }
+
+    // --- host RAM / CPU ---
+    const h = data.host || {};
+    if (h.ram_used_ratio != null) {
+      const { pct, cls } = barFor(h.ram_used_ratio);
+      gpuGrid.innerHTML += `
+        <div class="stat-card">
+          <div class="value">${pct}%</div>
+          <div class="label">Host RAM</div>
+          <div class="bar ${cls}" style="margin-top:8px"><span style="width:${Math.min(pct,100)}%"></span></div>
+          <div class="bar-label"><span>${fmtBytes(h.ram_used_bytes)}</span><span>of ${fmtBytes(h.ram_total_bytes)}</span></div>
+        </div>`;
+    }
+    if (h.cpu_percent != null) {
+      gpuGrid.innerHTML += `<div class="stat-card"><div class="value">${h.cpu_percent}%</div><div class="label">Host CPU (${h.cpu_count || '?'} threads)</div></div>`;
+    }
+
+    // --- per-model breakdown ---
+    const procs = data.processes || {};
+    let estTotal = 0;
+    for (const [name, p] of Object.entries(procs)) {
+      if (p.vram_est_bytes) estTotal += p.vram_est_bytes;
+      const dev = p.device || (p.up ? 'off' : 'off');
+      const devLabel = p.device ? p.device.toUpperCase() : (p.up ? 'n/a' : 'down');
+      const vramLine = p.device === 'gpu'
+        ? `<div class="proc-row"><span title="Per-process VRAM cannot be measured on this driver (nvidia-smi reports N/A for GeForce cards under Windows WDDM). This is the GGUF weight size, which excludes the KV cache.">VRAM (est.)</span><b>${fmtBytes(p.vram_est_bytes)}</b></div>`
+        : '';
+      const kvNote = p.no_kv_offload ? ' <span style="color:#484f58">KV in RAM</span>' : '';
+      procGrid.innerHTML += `
+        <div class="model-card">
+          <div class="head">
+            <span class="dot ${p.up ? 'up' : ''}"></span>
+            <span class="name">${name}</span>
+            <span class="sub"><span class="badge badge-${dev}">${devLabel}</span></span>
+          </div>
+          <div class="meta">${p.model_path ? p.model_path.replace(/\\/g,'/').split('/').pop() : (p.up ? 'port ' + p.port : 'not running')}${kvNote}</div>
+          ${vramLine}
+          <div class="proc-row"><span title="Resident set size. For GPU-resident models this includes memory-mapped GGUF pages, so it is not purely CPU RAM in use.">RSS</span><b>${fmtBytes(p.rss_bytes)}</b></div>
+          <div class="proc-row"><span>CPU</span><b>${p.cpu_percent != null ? p.cpu_percent + '%' : '—'}</b></div>
+          <div class="proc-row"><span>threads / ctx</span><b>${p.num_threads != null ? p.num_threads : '—'} / ${p.n_ctx != null ? p.n_ctx.toLocaleString() : '—'}</b></div>
+        </div>`;
+    }
+
+    // Show the estimate against the real device figure rather than hiding the
+    // gap -- the difference is KV cache plus everything else on the GPU.
+    const gpu0 = (data.gpus || [])[0];
+    if (gpu0 && gpu0.memory_used_mb != null && estTotal) {
+      const gap = gpu0.memory_used_mb - Math.round(estTotal / 1048576);
+      document.getElementById('gpu-note').textContent =
+        `Model weights on GPU total ~${fmtBytes(estTotal)} (estimated from GGUF size); `
+        + `device reports ${gpu0.memory_used_mb} MB in use — the ~${gap} MB difference is KV cache, CUDA context, and other applications.`;
+    } else {
+      document.getElementById('gpu-note').textContent = '';
+    }
+  } catch (e) {
+    gpuGrid.innerHTML = `<div class="stat-card" style="color:#f85149">Error: ${e.message}</div>`;
+    procGrid.innerHTML = '';
   }
 }
 
@@ -373,7 +495,7 @@ async function runJudge() {
 
 async function refresh() {
   document.getElementById('last-updated').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
-  await Promise.all([loadServerInfo(), loadModels(), loadStats(), loadTps(), loadBlocks()]);
+  await Promise.all([loadServerInfo(), loadModels(), loadSystem(), loadStats(), loadTps(), loadBlocks()]);
 }
 
 document.getElementById('filter-status').addEventListener('change', loadBlocks);

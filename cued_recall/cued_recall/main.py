@@ -17,6 +17,7 @@ from .models import BlockStatus
 from .pipeline import Pipeline
 from .router import build_admin_router
 from .store import BlockStore
+from .sysinfo import snapshot as system_snapshot
 from .tagger import Tagger
 from .wal import WAL
 from fastapi.staticfiles import StaticFiles
@@ -249,6 +250,28 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
 
         models = await asyncio.gather(*[probe(n, u) for n, u in targets])
         return {"models": list(models)}
+
+    @app.get("/admin/system")
+    async def admin_system():
+        """GPU / CPU telemetry for the host and each server process.
+
+        Kept separate from /admin/models so a probing failure degrades to one
+        empty panel instead of taking the context-usage cards down with it.
+        Both probes block (subprocess + psutil), hence the thread.
+        """
+        port_map = {
+            "reasoning": _endpoint_port(cfg.reasoning_endpoint),
+            "judge": _endpoint_port(cfg.judge_endpoint),
+            "embed": _endpoint_port(cfg.embed_endpoint),
+            "middleware": _endpoint_port(cfg.listen),
+        }
+        port_map = {k: v for k, v in port_map.items() if v}
+        try:
+            data = await asyncio.to_thread(system_snapshot, port_map)
+        except Exception as e:
+            # Never 500: the admin page polls this every 5 s.
+            return {"gpus": [], "processes": {}, "host": {}, "error": str(e)}
+        return data
 
     @app.post("/admin/kv/clear")
     async def clear_kv_cache():
@@ -484,6 +507,20 @@ def _clamp_context_budget(cfg: Config):
             f"reasoning server's context ({n_ctx}); clamping to {ceiling}"
         )
         cfg.max_context_tokens = ceiling
+
+
+def _endpoint_port(value: str) -> int:
+    """Port out of an endpoint string.
+
+    Handles both the endpoint form ("http://127.0.0.1:8080") and the listen
+    form ("127.0.0.1:8000"). Returns 0 when there's no parseable port, which
+    the caller filters out.
+    """
+    try:
+        tail = str(value or "").rsplit(":", 1)[-1]
+        return int(tail.split("/")[0])
+    except (ValueError, AttributeError):
+        return 0
 
 
 def _detect_embed_dim(embed: EmbeddingClient, cfg: Config) -> int:
