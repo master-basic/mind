@@ -70,6 +70,7 @@ tr:hover td { background: #161b22; }
 <div id="last-updated"></div>
 
 <h2>Models — context usage</h2>
+<div id="wedge-banner"></div>
 <div class="models-grid" id="models-grid"></div>
 
 <h2>GPU / System</h2>
@@ -454,6 +455,57 @@ function barRow(label, value, max, sub, color) {
   </div>`;
 }
 
+// Wedge state. A lost llama.cpp slot leaves /health answering while the
+// inference queue blocks forever, so the page can look fine while nothing
+// works. Surface it, and offer the only thing that actually recovers it --
+// clearing the KV cache cannot, since that call goes through /slots, which is
+// precisely what is blocked.
+let restartInFlight = false;
+
+async function loadWedge() {
+  const el = document.getElementById('wedge-banner');
+  try {
+    const d = await getJSON('/admin/wedge');
+    if (!d.any_wedged) {
+      const unreachable = Object.entries(d.servers || {})
+        .filter(([, v]) => v.queue === 'unreachable').map(([k]) => k);
+      el.innerHTML = unreachable.length
+        ? `<div class="note" style="color:#d29922">Not reachable: ${esc(unreachable.join(', '))}</div>`
+        : '';
+      return;
+    }
+    const wedged = Object.entries(d.servers).filter(([, v]) => v.wedged).map(([k]) => k);
+    el.innerHTML = `
+      <div class="model-card" style="border-color:#f85149;margin-bottom:12px">
+        <div class="head">
+          <span class="dot"></span>
+          <span class="name">${esc(wedged.join(', '))} wedged</span>
+        </div>
+        <div class="meta">Answering /health but the inference queue is blocked — requests will hang until the process is restarted. Clearing the KV cache will not help: that call goes through /slots, which is what is blocked.</div>
+        ${wedged.map(n => `<button class="btn-danger" style="background:#da3633;color:#fff;border:none;border-radius:4px;padding:4px 12px;cursor:pointer;font-size:12px;margin-right:6px" onclick="restartServer('${esc(n)}')">Restart ${esc(n)}</button>`).join('')}
+        ${d.restart_supported ? '' : '<div class="note" style="margin-top:8px">Launcher not supervising — restart run.bat manually.</div>'}
+      </div>`;
+  } catch (e) {
+    el.innerHTML = `<div class="note">Wedge check unavailable: ${esc(e.message)}</div>`;
+  }
+}
+
+async function restartServer(name) {
+  if (restartInFlight) return;
+  if (!confirm(`Restart the ${name} server?\n\nThis aborts anything currently generating and the model reload takes up to a minute.`)) return;
+  restartInFlight = true;
+  try {
+    const r = await fetch(API + '/admin/server/restart?name=' + encodeURIComponent(name), { method: 'POST' });
+    const d = await r.json();
+    alert(r.ok ? (d.note || 'Restart requested.')
+               : `Could not request restart: ${d.detail || r.status}`);
+  } catch (e) {
+    alert('Could not request restart: ' + e.message);
+  } finally {
+    restartInFlight = false;
+  }
+}
+
 async function loadHealth() {
   try {
     const d = await getJSON('/admin/stats/recall?top=10');
@@ -782,7 +834,7 @@ async function runJudge() {
 
 async function refresh() {
   document.getElementById('last-updated').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
-  await Promise.all([loadServerInfo(), loadModels(), loadSystem(), loadStats(), loadTps(), loadBlocks()]);
+  await Promise.all([loadServerInfo(), loadModels(), loadSystem(), loadStats(), loadTps(), loadBlocks(), loadWedge()]);
 }
 
 // Any change to what is being listed puts you back on page 1 -- staying on

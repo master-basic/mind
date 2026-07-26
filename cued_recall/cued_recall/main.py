@@ -397,6 +397,77 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
         })
         return {"status": "ok", "cleared_slots": total, "servers": results}
 
+    @app.get("/admin/wedge")
+    async def wedge_status():
+        """Is a llama server's inference queue blocked?
+
+        A lost slot leaves the process alive and the HTTP threads answering,
+        while everything that goes through the inference queue blocks forever.
+        /health and /props never touch that queue, so "health fast, slots
+        hanging" is the signature. Timeouts are short because this is polled.
+        """
+        import httpx
+
+        targets = [
+            ("reasoning", cfg.reasoning_endpoint),
+            ("judge", cfg.judge_endpoint),
+        ]
+        out = {}
+        for name, base in targets:
+            base = (base or "").rstrip("/")
+            entry = {"health": False, "queue": "unknown", "wedged": False}
+            try:
+                async with httpx.AsyncClient() as client:
+                    h = await client.get(base + "/health", timeout=2)
+                    entry["health"] = h.status_code == 200
+                    if entry["health"]:
+                        try:
+                            # Any reply means the queue is moving; a 501 from a
+                            # server without slot support still counts.
+                            await client.get(base + "/slots", timeout=4)
+                            entry["queue"] = "ok"
+                        except httpx.HTTPError:
+                            entry["queue"] = "blocked"
+                            entry["wedged"] = True
+            except httpx.HTTPError as e:
+                entry["queue"] = "unreachable"
+                entry["error"] = str(e) or type(e).__name__
+            out[name] = entry
+        return {"servers": out,
+                "any_wedged": any(v["wedged"] for v in out.values()),
+                "restart_supported": bool(os.environ.get("CUED_RECALL_RESTART_FILE"))}
+
+    @app.post("/admin/server/restart")
+    async def request_server_restart(name: str = "reasoning"):
+        """Ask the launcher to restart a llama server.
+
+        The restart is performed by run.py, not here: it owns the process
+        handles, and a restart from this side would orphan a multi-GB process
+        when the launcher exits. Clearing the KV cache is not an alternative --
+        /admin/kv/clear reaches the server through /slots, which is exactly
+        what a wedge blocks.
+        """
+        path = os.environ.get("CUED_RECALL_RESTART_FILE")
+        if not path:
+            raise HTTPException(
+                status_code=503,
+                detail="No launcher supervising this middleware "
+                       "(start the stack with run.py to enable restarts).",
+            )
+        if name not in ("reasoning", "judge", "embed"):
+            raise HTTPException(status_code=400, detail=f"unknown server '{name}'")
+        try:
+            p = Path(path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(name, encoding="utf-8")
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"could not signal launcher: {e}")
+        wal.write({"event": "admin_server_restart", "server": name,
+                   "timestamp": time.time()})
+        return {"status": "requested", "server": name,
+                "note": "The launcher picks this up within ~15s; the model "
+                        "then reloads, which takes up to a minute."}
+
     admin_router = build_admin_router(index, store, wal, run_judge_pass, tps_ring, embed)
     app.include_router(admin_router)
 

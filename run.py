@@ -25,6 +25,7 @@ import struct
 import json
 import platform
 import argparse
+import threading
 from pathlib import Path
 
 ROOT = Path(__file__).parent.resolve()
@@ -874,6 +875,144 @@ def update_config(storage_root, snapshot_path, args, reasoning_ctx=None):
                   allow_unicode=True, sort_keys=False)
 
 
+# --------------------------------------------------------------------------
+# Wedge watchdog
+#
+# A llama.cpp slot can be lost while the process stays alive: the HTTP threads
+# keep answering, but everything routed through the inference queue blocks
+# forever at 0% CPU. /health and /props are served without touching the queue,
+# so they stay fast -- that split IS the signature, and it is what makes this
+# detectable at all.
+#
+# Clearing the KV cache cannot recover it: /admin/kv/clear reaches the server
+# through GET /slots and POST /slots/{id}?action=erase, both queue tasks, so
+# the cure blocks on the disease. Restarting the process is the only fix, and
+# it belongs here because this is what owns the handles -- a restart from
+# anywhere else orphans a multi-GB process when the launcher exits.
+# --------------------------------------------------------------------------
+
+# Healthy, /slots answered in 0.03-0.67 s even under load. Ten seconds is a
+# wide margin, and three consecutive strikes means ~45 s of a blocked queue
+# before anything is killed -- a restart aborts whatever is generating, so the
+# bar to act is deliberately high.
+WEDGE_SLOTS_TIMEOUT = 10
+WEDGE_STRIKES = 3
+WATCHDOG_INTERVAL = 15
+RESTART_REQUEST = LOG_DIR / "restart-request"
+
+
+class ServerSupervisor:
+    """Watches the llama servers and restarts one that has wedged."""
+
+    def __init__(self, llama_bin, server_defs, processes):
+        self.llama_bin = llama_bin
+        self.defs = {sd["name"]: sd for sd in server_defs}
+        self.processes = processes          # shared list of (name, proc, port)
+        self.strikes = {}
+        self.lock = threading.Lock()
+        # Names mid-restart. The main loop treats any exited child as a reason
+        # to bring the whole stack down, and a reload takes tens of seconds --
+        # without this, a watchdog restart would look like a crash and shut
+        # everything off.
+        self.restarting = set()
+        self.stop = threading.Event()
+
+    def is_restarting(self, name):
+        with self.lock:
+            return name in self.restarting
+
+    def _probe(self, port):
+        """Return 'ok', 'wedged', or 'down' for one server."""
+        import httpx
+        try:
+            h = httpx.get(f"http://127.0.0.1:{port}/health", timeout=3)
+            if h.status_code != 200:
+                return "down"
+        except Exception:
+            return "down"
+        try:
+            # Any status counts as alive -- a server without slot support
+            # answers 501, which is a reply and therefore not a wedge.
+            httpx.get(f"http://127.0.0.1:{port}/slots",
+                      timeout=WEDGE_SLOTS_TIMEOUT)
+            return "ok"
+        except Exception:
+            return "wedged"
+
+    def restart(self, name, reason):
+        sd = self.defs.get(name)
+        if sd is None:
+            warn(f"cannot restart unknown server '{name}'")
+            return False
+        with self.lock:
+            if name in self.restarting:
+                return False
+            self.restarting.add(name)
+        try:
+            warn(f"restarting {name}: {reason}")
+            idx = next((i for i, (n, _, _) in enumerate(self.processes)
+                        if n == name), None)
+            if idx is None:
+                return False
+            _, proc, port = self.processes[idx]
+            if proc.poll() is None:
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                                   capture_output=True)
+                else:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+            old_log = getattr(proc, "_log_file", None)
+            if old_log:
+                try:
+                    old_log.close()
+                except Exception:
+                    pass
+            fresh = start_server(self.llama_bin, name, sd["model"], port, sd["extra"])
+            self.processes[idx] = (name, fresh, port)
+            ok = wait_for_server(name, port, fresh)
+            info(f"{name} {'restarted' if ok else 'did NOT come back'}")
+            self.strikes[name] = 0
+            return ok
+        finally:
+            with self.lock:
+                self.restarting.discard(name)
+
+    def _check_requests(self):
+        """Honour a restart asked for by the admin page."""
+        try:
+            if not RESTART_REQUEST.exists():
+                return
+            wanted = RESTART_REQUEST.read_text(encoding="utf-8").strip() or "reasoning"
+            RESTART_REQUEST.unlink()
+        except OSError:
+            return
+        for name in [n.strip() for n in wanted.split(",") if n.strip()]:
+            self.restart(name, "requested from the admin page")
+
+    def watch(self):
+        while not self.stop.wait(WATCHDOG_INTERVAL):
+            self._check_requests()
+            for name, proc, port in list(self.processes):
+                if name == "middleware" or self.is_restarting(name):
+                    continue
+                if proc.poll() is not None:
+                    continue            # a dead child is the main loop's job
+                state = self._probe(port)
+                if state == "wedged":
+                    n = self.strikes.get(name, 0) + 1
+                    self.strikes[name] = n
+                    warn(f"{name}: /health ok but /slots blocked "
+                         f"({n}/{WEDGE_STRIKES})")
+                    if n >= WEDGE_STRIKES:
+                        self.restart(name, "inference queue blocked")
+                else:
+                    self.strikes[name] = 0
+
+
 def wait_for_server(name, port, proc, timeout=120):
     import httpx
     for attempt in range(timeout // 2):
@@ -1074,7 +1213,11 @@ def main():
         # The middleware starts seconds-to-minutes after the launcher (model
         # loads come first), so its own process start time is not when the
         # stack came up. Hand it the real figure for the admin page.
-        mw_env = {**os.environ, "CUED_RECALL_LAUNCHED_AT": str(launched_at)}
+        mw_env = {**os.environ, "CUED_RECALL_LAUNCHED_AT": str(launched_at),
+                  # How the admin page asks for a restart. Absent when the
+                  # middleware is started on its own, and the endpoint says so
+                  # rather than pretending it worked.
+                  "CUED_RECALL_RESTART_FILE": str(RESTART_REQUEST)}
         middleware = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "cued_recall.main:create_app",
              "--factory", "--host", "127.0.0.1", "--port", str(args.middleware_port),
@@ -1102,19 +1245,37 @@ def main():
         signal.signal(signal.SIGINT, shutdown)
         signal.signal(signal.SIGTERM, shutdown)
 
+        supervisor = ServerSupervisor(llama_bin, server_defs, processes)
+        threading.Thread(target=supervisor.watch, daemon=True).start()
+        info(f"Wedge watchdog active (probe every {WATCHDOG_INTERVAL}s, "
+             f"restart after {WEDGE_STRIKES} blocked probes)")
+
         while True:
             time.sleep(3)
-            for name, proc, _ in processes:
+            # A server being replaced is briefly absent by design; only an
+            # unplanned exit should bring the stack down.
+            for name, proc, _ in list(processes):
+                if supervisor.is_restarting(name):
+                    continue
                 rc = proc.poll()
                 if rc is not None:
                     warn(f"{name} exited with code {rc}")
-            if any(proc.poll() is not None for _, proc, _ in processes):
+            if any(proc.poll() is not None and not supervisor.is_restarting(name)
+                   for name, proc, _ in list(processes)):
                 time.sleep(1)
-                break
+                # Re-check: the watchdog may have swapped in a live process
+                # during that pause, in which case nothing actually died.
+                if any(proc.poll() is not None and not supervisor.is_restarting(name)
+                       for name, proc, _ in list(processes)):
+                    break
 
     except KeyboardInterrupt:
         info("Shutting down...")
     finally:
+        try:
+            supervisor.stop.set()
+        except NameError:
+            pass          # failed before the watchdog was started
         for name, proc, port in reversed(processes):
             if proc.poll() is None:
                 info(f"Stopping {name} (port {port})...")
