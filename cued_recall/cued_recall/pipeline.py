@@ -412,8 +412,26 @@ class Pipeline:
         return "\n".join(parts)
 
     def build_messages(self, original_messages: list, recall_text: str) -> list:
+        """Put the recall note in front of the conversation.
+
+        Folded into the client's own system message rather than prepended as a
+        second one. Qwen3.5's chat template renders messages[0] as the system
+        block and then raises 'System message must be at the beginning.' on any
+        later system message, which llama.cpp reports as a 400 -- so an agent
+        CLI like opencode, which always ships its own system prompt, failed
+        every turn that recalled anything. Merging also keeps _fit_messages
+        honest: it protects index 0 and drops from index 1 first, so a separate
+        recall message at 0 meant the client's system prompt was the first
+        thing discarded when a long session overflowed the context.
+        """
         if not recall_text:
             return original_messages
+        first = original_messages[0] if original_messages else None
+        if first and first.get("role") == "system":
+            client_text = self._extract_text(first.get("content"))
+            merged = {**first, "content": (recall_text + "\n\n" + client_text
+                                           if client_text else recall_text)}
+            return [merged] + original_messages[1:]
         recall_msg = {"role": "system", "content": recall_text}
         return [recall_msg] + original_messages
 
