@@ -236,9 +236,14 @@ class Pipeline:
             block = await asyncio.to_thread(self.store.get, block_id)
             if block is None:
                 continue
+            # Skip, don't stop. A single oversized hit (a pasted document can
+            # be several times the budget on its own) used to break the loop
+            # on the first iteration, returning zero memories for the turn
+            # even though smaller, equally relevant blocks sat right behind
+            # it. Pass over what doesn't fit and keep filling the budget.
+            if total_tokens + block.token_count > self.config.recall.budget_tokens:
+                continue
             total_tokens += block.token_count
-            if total_tokens > self.config.recall.budget_tokens:
-                break
             blocks.append((block, sim))
         return blocks
 
@@ -603,19 +608,38 @@ class Pipeline:
         return ""
 
     def get_reading_content(self, body: dict) -> str:
+        """Long-form material the user supplied on THIS turn.
+
+        Scoped to the newest user message for two reasons. Scanning every
+        role swept up the client's own system prompt -- agent CLIs ship
+        multi-thousand-word prompts -- and archived it as a memory once per
+        turn. Scanning every turn's history re-archived the same pasted
+        document on each subsequent turn of the conversation, so one paste
+        became a block per turn thereafter. Neither is user knowledge worth
+        recalling, and both crowd the vector index with near-duplicates.
+        """
         messages = self.read_messages_from_body(body)
+        last_user = None
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                last_user = msg
+                break
+        if last_user is None:
+            return ""
+
         reading_parts = []
-        for msg in messages:
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                for part in content:
-                    if (
-                        part.get("type") == "text"
-                        and len(part.get("text", "").split()) > 200
-                    ):
-                        reading_parts.append(part["text"])
-            elif isinstance(content, str) and len(content.split()) > 200:
-                reading_parts.append(content)
+        content = last_user.get("content", "")
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if (
+                    part.get("type") == "text"
+                    and len(part.get("text", "").split()) > 200
+                ):
+                    reading_parts.append(part["text"])
+        elif isinstance(content, str) and len(content.split()) > 200:
+            reading_parts.append(content)
         return "\n\n".join(reading_parts)
 
     async def forward_stream(
