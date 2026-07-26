@@ -116,7 +116,7 @@ SERVER_DEFAULTS = {
     # sizes to the context so larger inputs embed instead of erroring.
     "embed":     {"port": 8082, "extra": ["--embedding", "--ctx-size", "8192",
                                           "--batch-size", "8192", "--ubatch-size", "8192",
-                                          "--n-gpu-layers", "99", "--no-kv-offload", "--metrics"]},
+                                          "--n-gpu-layers", "0", "--no-kv-offload", "--metrics"]},
 }
 
 
@@ -555,6 +555,11 @@ CUDA_OVERHEAD_MIB = 500
 # Percentage-based so it scales with the card rather than being tuned to 12 GB.
 VRAM_SAFETY_FRACTION = 0.10
 VRAM_SAFETY_MIN_MIB = 1024
+# Headroom for transient GPU allocations during inference (attention scores,
+# CUDA kernel scratch buffers, tensor parallelism intermediates). These are
+# allocated per-inference and freed after, but must fit alongside the model
+# weights and pre-allocated KV cache or the CUDA context stalls.
+TRANSIENT_BUF_MIB = 512
 # Below this a context is too small to be useful; better to fail loudly.
 MIN_AUTO_CTX = 8192
 _GGUF_SIMPLE = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i",
@@ -720,12 +725,12 @@ def autosize_reasoning_ctx(reasoning_path, embed_path=None, gpu_layers=99,
     # its own CUDA context.
     overhead = CUDA_OVERHEAD_MIB * (2 if embed_path else 1)
     safety = max(VRAM_SAFETY_MIN_MIB, int(total_mib * VRAM_SAFETY_FRACTION))
-    budget_mib = free_mib - weights_mib - embed_mib - overhead - safety
+    budget_mib = free_mib - weights_mib - embed_mib - overhead - safety - TRANSIENT_BUF_MIB
 
     notes.append(f"{gpu_name}: {free_mib:,} MiB free of {total_mib:,} MiB")
     notes.append(
         f"reserving {weights_mib:,} weights + {embed_mib:,} embed "
-        f"+ {overhead} CUDA + {safety} safety = "
+        f"+ {overhead} CUDA + {safety} safety + {TRANSIENT_BUF_MIB} transient = "
         f"{budget_mib:,} MiB for KV"
     )
 
