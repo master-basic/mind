@@ -226,6 +226,7 @@ async function loadServerInfo() {
     const data = await r.json();
     document.getElementById('server-info').innerHTML =
       `<span>status</span> ${data.status} &nbsp; <span>store</span> ${data.store}`;
+    if (data.hot_shelve_timeout_s) setBlocksCadence(data.hot_shelve_timeout_s);
   } catch (e) {
     document.getElementById('server-info').textContent = 'Error: ' + e.message;
   }
@@ -959,14 +960,32 @@ async function deleteSelected() {
 // tabs. The memory panels run full-table aggregates over index.db against the
 // same SQLite file the pipeline is writing to, so keeping them off the fast
 // loop was always necessary; now they also stop entirely unless you are
-// looking at them. Blocks is `every: 0` -- an interactive table with filters,
-// selection and paging should not re-render under the cursor, and it already
-// has a Refresh button plus a reload on every filter change.
+// looking at them. Blocks tracks hot_shelve_timeout_s instead of a round
+// number: a block's status flips hot -> shelved that long after its last
+// message, which makes it the liveliest column on the page, not the least.
+// The 15000 here is only a placeholder until the first /health reply lands --
+// setBlocksCadence corrects it from the server so the two cannot drift.
 const TABS = {
   live:   { every: 5000,  load: () => Promise.all([loadModels(), loadSystem(), loadStats(), loadTps()]) },
   memory: { every: 30000, load: () => Promise.all([loadHealth(), loadBudget(), loadHistogram(), loadGrowth()]) },
-  blocks: { every: 0,     load: () => loadBlocks() },
+  blocks: {
+    every: 15000,
+    load: () => loadBlocks(),
+    // Re-rendering the tbody mid-operation is the one genuinely annoying
+    // case: hold a selection or a filter box and the refresh waits rather
+    // than pulling the rows out from under you. Clearing either resumes it.
+    skip: () => selected.size > 0 || !!(document.activeElement && document.activeElement.closest('.filters')),
+  },
 };
+
+// The status column is only as live as the server's shelve clock, so take the
+// cadence from the server rather than hardcoding a second copy of it.
+function setBlocksCadence(seconds) {
+  const ms = Math.max(5000, Number(seconds) * 1000);
+  if (!Number.isFinite(ms) || ms === TABS.blocks.every) return;
+  TABS.blocks.every = ms;
+  if (activeTab === 'blocks') startTabTimer();
+}
 
 let activeTab = 'live';
 let tabTimer = null;
@@ -975,7 +994,12 @@ function startTabTimer() {
   clearInterval(tabTimer);
   tabTimer = null;
   const every = TABS[activeTab].every;
-  if (every) tabTimer = setInterval(() => { if (!document.hidden) TABS[activeTab].load(); }, every);
+  if (!every) return;
+  tabTimer = setInterval(() => {
+    const tab = TABS[activeTab];
+    if (document.hidden || (tab.skip && tab.skip())) return;
+    tab.load();
+  }, every);
 }
 
 function selectTab(name) {

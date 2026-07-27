@@ -157,7 +157,15 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
 
     @app.get("/health")
     async def health():
-        return {"status": "ok", "store": str(store_path)}
+        # hot_shelve_timeout_s rides along because it is the clock the admin
+        # page's Blocks table is really watching: a block's status flips
+        # hot -> shelved that long after its last message, so the table's
+        # refresh cadence should follow this value rather than duplicate it.
+        return {
+            "status": "ok",
+            "store": str(store_path),
+            "hot_shelve_timeout_s": cfg.hot_shelve_timeout_s,
+        }
 
     @app.get("/v1/models")
     async def list_models():
