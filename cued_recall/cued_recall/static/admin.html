@@ -61,16 +61,32 @@ tr:hover td { background: #161b22; }
 #sel-count { font-size: 12px; color: #8b949e; margin-left: 8px; }
 .gist-cell { color: #c9d1d9; max-width: 240px; }
 .tag-badge { display: inline-block; padding: 1px 6px; border-radius: 10px; font-size: 10px; margin: 1px 2px 1px 0; background: #30363d; color: #c9d1d9; border: 1px solid #484f58; white-space: nowrap; }
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid #30363d; margin-bottom: 20px; flex-wrap: wrap; }
+.tabs button { background: none; border: none; border-bottom: 2px solid transparent; margin-bottom: -1px; color: #8b949e; font: inherit; font-size: 13px; padding: 8px 16px; cursor: pointer; }
+.tabs button:hover { color: #c9d1d9; }
+.tabs button[aria-selected="true"] { color: #58a6ff; border-bottom-color: #58a6ff; }
+.tab-panel[hidden] { display: none; }
+.tab-panel > h2:first-child { margin-top: 0; }
 </style>
 </head>
 <body>
 
 <h1>⬡ Cued Recall Middleware</h1>
 <div class="server-info" id="server-info">Connecting...</div>
+<!-- Deliberately outside the tab panels: a wedged inference queue must be
+     visible from wherever you are, not hideable behind an unselected tab. -->
+<div id="wedge-banner"></div>
 <div id="last-updated"></div>
 
+<nav class="tabs" role="tablist">
+  <button role="tab" data-tab="live"   aria-selected="true">Live</button>
+  <button role="tab" data-tab="memory" aria-selected="false">Memory</button>
+  <button role="tab" data-tab="blocks" aria-selected="false">Blocks</button>
+</nav>
+
+<section class="tab-panel" data-tab="live">
+
 <h2>Models — context usage</h2>
-<div id="wedge-banner"></div>
 <div class="models-grid" id="models-grid"></div>
 
 <h2>GPU / System</h2>
@@ -83,6 +99,10 @@ tr:hover td { background: #161b22; }
 
 <h2>Tokens / sec</h2>
 <div class="stats-grid" id="tps-grid"></div>
+
+</section>
+
+<section class="tab-panel" data-tab="memory" hidden>
 
 <h2>Memory health</h2>
 <div class="stats-grid" id="health-grid"></div>
@@ -99,6 +119,10 @@ tr:hover td { background: #161b22; }
 
 <h2>Most recalled blocks</h2>
 <div id="effectiveness-panel"></div>
+
+</section>
+
+<section class="tab-panel" data-tab="blocks" hidden>
 
 <h2>Blocks</h2>
 <div class="filters">
@@ -183,6 +207,8 @@ tr:hover td { background: #161b22; }
   <button id="page-next" onclick="stepPage(1)">Next &rsaquo;</button>
   <button id="page-last" onclick="gotoPage(-1)">Last &raquo;</button>
 </div>
+
+</section>
 
 <script>
 const API = '';
@@ -832,9 +858,11 @@ async function runJudge() {
   }
 }
 
-async function refresh() {
+// server-info and the wedge banner live above the tab strip, so they poll no
+// matter which tab is open -- see the comment on #wedge-banner in the markup.
+async function refreshGlobal() {
   document.getElementById('last-updated').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
-  await Promise.all([loadServerInfo(), loadModels(), loadSystem(), loadStats(), loadTps(), loadBlocks(), loadWedge()]);
+  await Promise.all([loadServerInfo(), loadWedge()]);
 }
 
 // Any change to what is being listed puts you back on page 1 -- staying on
@@ -926,17 +954,65 @@ async function deleteSelected() {
   }
 }
 
-// The analytics panels run full-table aggregates over index.db, so they are
-// deliberately not on the 5 s loop with the live gauges -- that would put four
-// table scans per 5 s against the same SQLite file the pipeline is writing to.
-async function refreshAnalytics() {
-  await Promise.all([loadHealth(), loadBudget(), loadHistogram(), loadGrowth()]);
+// One entry per tab: what to load, and how often while it is the open one.
+// Nothing polls for a panel you cannot see, which is most of the point of the
+// tabs. The memory panels run full-table aggregates over index.db against the
+// same SQLite file the pipeline is writing to, so keeping them off the fast
+// loop was always necessary; now they also stop entirely unless you are
+// looking at them. Blocks is `every: 0` -- an interactive table with filters,
+// selection and paging should not re-render under the cursor, and it already
+// has a Refresh button plus a reload on every filter change.
+const TABS = {
+  live:   { every: 5000,  load: () => Promise.all([loadModels(), loadSystem(), loadStats(), loadTps()]) },
+  memory: { every: 30000, load: () => Promise.all([loadHealth(), loadBudget(), loadHistogram(), loadGrowth()]) },
+  blocks: { every: 0,     load: () => loadBlocks() },
+};
+
+let activeTab = 'live';
+let tabTimer = null;
+
+function startTabTimer() {
+  clearInterval(tabTimer);
+  tabTimer = null;
+  const every = TABS[activeTab].every;
+  if (every) tabTimer = setInterval(() => { if (!document.hidden) TABS[activeTab].load(); }, every);
 }
 
-refresh();
-refreshAnalytics();
-setInterval(refresh, 5000);
-setInterval(refreshAnalytics, 30000);
+function selectTab(name) {
+  if (!TABS[name]) name = 'live';
+  activeTab = name;
+  document.querySelectorAll('.tab-panel').forEach(p => { p.hidden = p.dataset.tab !== name; });
+  document.querySelectorAll('.tabs button').forEach(b => {
+    b.setAttribute('aria-selected', String(b.dataset.tab === name));
+  });
+  try { localStorage.setItem('admin-tab', name); } catch (e) {}
+  if (location.hash.slice(1) !== name) history.replaceState(null, '', '#' + name);
+  startTabTimer();
+  TABS[name].load();   // load on activation, so switching never shows a stale panel
+}
+
+document.querySelectorAll('.tabs button').forEach(b => {
+  b.addEventListener('click', () => selectTab(b.dataset.tab));
+});
+window.addEventListener('hashchange', () => selectTab(location.hash.slice(1)));
+
+// A backgrounded browser tab polls nothing; catch up on the way back in rather
+// than showing a clock that stopped minutes ago.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return;
+  refreshGlobal();
+  TABS[activeTab].load();
+});
+
+// An explicit #hash wins over the remembered tab, so a bookmarked or shared
+// link lands where it says it will.
+let initialTab = location.hash.slice(1);
+if (!TABS[initialTab]) {
+  try { initialTab = localStorage.getItem('admin-tab'); } catch (e) { initialTab = null; }
+}
+refreshGlobal();
+selectTab(TABS[initialTab] ? initialTab : 'live');
+setInterval(() => { if (!document.hidden) refreshGlobal(); }, 5000);
 </script>
 </body>
 </html>
