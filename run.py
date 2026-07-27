@@ -579,21 +579,71 @@ VRAM_SAFETY_MIN_MIB = 1024
 TRANSIENT_BUF_MIB = 512
 # Below this a context is too small to be useful; better to fail loudly.
 MIN_AUTO_CTX = 8192
+# And above this it is too slow to be useful. VRAM stops being the binding
+# constraint once an MoE parks its experts in system RAM: nothing then holds
+# the sizing back from the model's trained context, and the pipeline fills
+# whatever window it is handed with recalled memory, so every turn pays the
+# full prefill rather than just having headroom. Measured at ~385 tok/s on a
+# 4070 with Hermes3.6-35B-A3B, a full window costs 2.8 minutes of prompt
+# processing here against 11.3 minutes at the 262,144 the VRAM math allowed.
+# This is a latency ceiling, not a memory one -- pin --reasoning-ctx N to go
+# past it deliberately.
+MAX_AUTO_CTX = 65536
 _GGUF_SIMPLE = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i",
                 6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d"}
+# ggml_type -> (elements per block, bytes per block). Needed to turn a tensor's
+# shape into its size on disk. An unknown type aborts the whole calculation
+# rather than silently undercounting: undercounting weights inflates the
+# context and costs a failed model load, which is the failure we're avoiding.
+_GGML_TYPE_SIZE = {
+    0:  (1, 4),      # F32
+    1:  (1, 2),      # F16
+    2:  (32, 18),    # Q4_0
+    3:  (32, 20),    # Q4_1
+    6:  (32, 22),    # Q5_0
+    7:  (32, 24),    # Q5_1
+    8:  (32, 34),    # Q8_0
+    9:  (32, 40),    # Q8_1
+    10: (256, 84),   # Q2_K
+    11: (256, 110),  # Q3_K
+    12: (256, 144),  # Q4_K
+    13: (256, 176),  # Q5_K
+    14: (256, 210),  # Q6_K
+    15: (256, 292),  # Q8_K
+    16: (256, 66),   # IQ2_XXS
+    17: (256, 74),   # IQ2_XS
+    18: (256, 98),   # IQ3_XXS
+    19: (256, 50),   # IQ1_S
+    20: (32, 18),    # IQ4_NL
+    21: (256, 110),  # IQ3_S
+    22: (256, 82),   # IQ2_S
+    23: (256, 136),  # IQ4_XS
+    24: (1, 1),      # I8
+    25: (1, 2),      # I16
+    26: (1, 4),      # I32
+    27: (1, 8),      # I64
+    28: (1, 8),      # F64
+    29: (256, 56),   # IQ1_M
+    30: (1, 2),      # BF16
+    34: (256, 54),   # TQ1_0
+    35: (256, 66),   # TQ2_0
+    39: (32, 17),    # MXFP4
+}
 
 
-def read_gguf_metadata(path, limit_keys=400) -> dict:
-    """Parse the GGUF key/value header. Returns {} on any problem.
+def _read_gguf(path, limit_keys=400, want_tensors=False):
+    """Parse the GGUF header. Returns (metadata, tensors), ({}, []) on trouble.
 
     Only the header is read -- the tensor data (gigabytes) is never touched.
+    `tensors` is [(name, n_bytes), ...] and stays empty unless asked for, since
+    filling it means walking all several-hundred tensor descriptors.
     """
     try:
         with open(path, "rb") as f:
             if f.read(4) != b"GGUF":
-                return {}
+                return {}, []
             struct.unpack("<I", f.read(4))          # version
-            struct.unpack("<Q", f.read(8))          # tensor count
+            n_tensors, = struct.unpack("<Q", f.read(8))
             n_kv, = struct.unpack("<Q", f.read(8))
 
             def rd_str():
@@ -612,14 +662,61 @@ def read_gguf_metadata(path, limit_keys=400) -> dict:
                     raise ValueError(f"unknown gguf type {t}")
                 return struct.unpack(fmt, f.read(struct.calcsize(fmt)))[0]
 
+            # The tensor table follows the KV section, so stopping early at
+            # limit_keys would leave the cursor mid-header and make every
+            # tensor descriptor garbage. Read every key when tensors are wanted.
+            n_read = n_kv if want_tensors else min(n_kv, limit_keys)
             md = {}
-            for _ in range(min(n_kv, limit_keys)):
+            for _ in range(n_read):
                 k = rd_str()
                 t, = struct.unpack("<I", f.read(4))
                 md[k] = rd_val(t)
-            return md
+
+            if not want_tensors:
+                return md, []
+
+            tensors = []
+            for _ in range(n_tensors):
+                name = rd_str()
+                n_dims, = struct.unpack("<I", f.read(4))
+                dims = struct.unpack("<%dQ" % n_dims, f.read(8 * n_dims))
+                ttype, = struct.unpack("<I", f.read(4))
+                struct.unpack("<Q", f.read(8))     # offset into the data blob
+                block, per_block = _GGML_TYPE_SIZE.get(ttype, (0, 0))
+                if not block:
+                    raise ValueError(f"unknown ggml type {ttype}")
+                n_elem = 1
+                for d in dims:
+                    n_elem *= d
+                tensors.append((name, n_elem // block * per_block))
+            return md, tensors
     except (OSError, struct.error, ValueError, UnicodeDecodeError):
-        return {}
+        return {}, []
+
+
+def read_gguf_metadata(path, limit_keys=400) -> dict:
+    """Parse the GGUF key/value header. Returns {} on any problem."""
+    return _read_gguf(path, limit_keys)[0]
+
+
+def moe_gpu_weights_mib(path) -> int:
+    """VRAM cost of an MoE's weights once --cpu-moe parks the experts in RAM.
+
+    --cpu-moe overrides the per-expert FFN tensors (ffn_{gate,up,down}_exps) to
+    the CPU and leaves everything else -- attention, router, shared expert,
+    norms, embeddings, output head -- on the GPU. For Hermes3.6-35B-A3B that is
+    1.6 GiB of a 16.2 GiB file, so charging the file size (what a dense model
+    genuinely costs) overstates VRAM tenfold and collapses the KV budget past
+    zero on any consumer card.
+
+    Returns 0 when the tensor table can't be read, so the caller falls back to
+    the file size: pessimistic, costing context but never a failed load.
+    """
+    tensors = _read_gguf(path, want_tensors=True)[1]
+    if not tensors:
+        return 0
+    return int(sum(n for name, n in tensors if "_exps" not in name)
+               // (1024 * 1024))
 
 
 def kv_bytes_per_token(md: dict) -> int:
@@ -683,7 +780,7 @@ def port_in_use(port: int) -> bool:
 
 
 def autosize_reasoning_ctx(reasoning_path, embed_path=None, gpu_layers=99,
-                           free_mib=None, ports_busy=None):
+                           cpu_moe=False, free_mib=None, ports_busy=None):
     """Pick --ctx-size for the reasoning server from free VRAM and KV cost.
 
     Returns (ctx, notes) where notes are the lines to show the user. Falls back
@@ -726,11 +823,22 @@ def autosize_reasoning_ctx(reasoning_path, embed_path=None, gpu_layers=99,
 
     # Everything that must fit alongside the KV cache.
     weights_mib = 0
+    moe_note = None
     if gpu_layers and gpu_layers > 0:
         try:
             weights_mib = os.path.getsize(reasoning_path) // (1024 * 1024)
         except OSError:
             pass
+        if cpu_moe and weights_mib:
+            resident = moe_gpu_weights_mib(reasoning_path)
+            if resident:
+                moe_note = (f"MoE with --cpu-moe: experts stay in system RAM, so "
+                            f"{resident:,} MiB of the {weights_mib:,} MiB file is "
+                            f"VRAM-resident")
+                weights_mib = resident
+            else:
+                moe_note = ("MoE with --cpu-moe, but the tensor table is "
+                            "unreadable; charging the whole file to VRAM")
     embed_mib = 0
     if embed_path:
         try:
@@ -745,6 +853,8 @@ def autosize_reasoning_ctx(reasoning_path, embed_path=None, gpu_layers=99,
     budget_mib = free_mib - weights_mib - embed_mib - overhead - safety - TRANSIENT_BUF_MIB
 
     notes.append(f"{gpu_name}: {free_mib:,} MiB free of {total_mib:,} MiB")
+    if moe_note:
+        notes.append(moe_note)
     notes.append(
         f"reserving {weights_mib:,} weights + {embed_mib:,} embed "
         f"+ {overhead} CUDA + {safety} safety + {TRANSIENT_BUF_MIB} transient = "
@@ -766,6 +876,9 @@ def autosize_reasoning_ctx(reasoning_path, embed_path=None, gpu_layers=99,
     ctx = int(budget_mib * 1024 * 1024 // per_token)
     ctx = (ctx // 4096) * 4096                       # llama.cpp likes round numbers
     ctx = min(ctx, int(trained_ctx))                 # never exceed what it was trained for
+    hit_trained = ctx >= int(trained_ctx)
+    hit_latency = ctx > MAX_AUTO_CTX
+    ctx = min(ctx, MAX_AUTO_CTX)
     kib = per_token / 1024
     notes.append(
         f"KV costs {kib:.0f} KiB/token "
@@ -777,7 +890,10 @@ def autosize_reasoning_ctx(reasoning_path, embed_path=None, gpu_layers=99,
         notes.append(f"computed ctx {ctx:,} below the {MIN_AUTO_CTX:,} floor; "
                      f"keeping default {default:,}")
         return default, notes
-    if ctx >= int(trained_ctx):
+    if hit_latency:
+        notes.append(f"VRAM allowed more; capped at {MAX_AUTO_CTX:,} so a full "
+                     f"window stays a few minutes of prefill, not tens")
+    elif hit_trained:
         notes.append(f"capped at the model's trained context ({int(trained_ctx):,})")
     return ctx, notes
 
@@ -813,9 +929,17 @@ def resolve_reasoning_ctx(args, models) -> int:
         info(f"Reasoning ctx: {pinned:,} (pinned via --reasoning-ctx)")
         return pinned
 
-    gpu_layers = 0 if args.reasoning_cpu_moe else 99
+    # Size for what the launch path will actually run, which differs from a
+    # plain reading of the flags in two ways. --cpu-moe is not -ngl 0: the
+    # server still starts with --n-gpu-layers 99 and only the expert tensors
+    # move off the GPU, so assuming an empty GPU overestimates the context as
+    # badly as charging the whole file underestimates it. And --cpu-moe is
+    # applied to any detected MoE, not only when the flag was passed.
+    model_path = models.get("reasoning")
+    cpu_moe = bool(args.reasoning_cpu_moe or
+                   (model_path and is_moe_model(Path(model_path).name)))
     ctx, notes = autosize_reasoning_ctx(
-        models.get("reasoning"), models.get("embed"), gpu_layers=gpu_layers
+        model_path, models.get("embed"), gpu_layers=99, cpu_moe=cpu_moe
     )
     info(f"Reasoning ctx: {ctx:,} (auto)")
     for n in notes:
