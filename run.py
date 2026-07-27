@@ -268,19 +268,67 @@ def is_moe_model(filename: str) -> bool:
     return "a3b" in low or "moe" in low
 
 
-def save_reasoning_choice(num: int):
-    """Persist REASONING_CHOICE=N into run_settings.txt (KEY=VALUE lines,
-    shared with run.bat) so the next launch skips the menu."""
+def save_settings(**pairs):
+    """Merge KEY=VALUE lines into run_settings.txt, keeping everything else.
+
+    The file is shared with run.bat, which reads every key it finds into
+    SAVED_<KEY>. Keys not named here are left untouched, so the per-model
+    records below survive a launch that used a different model.
+
+    ASCII-only on the way out: run.bat reads with `for /f`, in the console
+    codepage rather than UTF-8.
+    """
     lines = []
     if SETTINGS_FILE.exists():
         try:
             raw = SETTINGS_FILE.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             raw = SETTINGS_FILE.read_text(encoding="cp1252")
+        prefixes = tuple(f"{k}=" for k in pairs)
         lines = [ln for ln in raw.splitlines()
-                 if ln.strip() and not ln.startswith("REASONING_CHOICE=")]
-    lines.append(f"REASONING_CHOICE={num}")
-    SETTINGS_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                 if ln.strip() and not ln.startswith(prefixes)]
+    for key, value in pairs.items():
+        lines.append(f"{key}={value}")
+    SETTINGS_FILE.write_text("\n".join(lines) + "\n",
+                             encoding="ascii", errors="replace")
+
+
+def save_reasoning_choice(num: int):
+    """Persist REASONING_CHOICE=N so the next launch skips the menu."""
+    save_settings(REASONING_CHOICE=num)
+
+
+def remember_launch(args, models, reasoning_ctx):
+    """Record what this launch resolved, for run.bat to show next time.
+
+    run.bat asks "reuse these settings?" before python starts, so all it has to
+    go on is run_settings.txt. It stored REASONING_CHOICE=1 and nothing else,
+    and only this file knows that 1 means Qwen3.5-9B-Q5_K_M.gguf -- hence three
+    blank lines where the model names should be.
+
+    Context size is keyed per model, not stored once. Autosizing gives each
+    model its own window (a 9B dense and a 35B MoE do not land in the same
+    place), so a single figure would go stale the moment the model changed.
+    """
+    def name_of(key):
+        path = models.get(key)
+        return Path(path).name if path else ""
+
+    pairs = {"JUDGE_NAME": name_of("judge"), "EMBED_NAME": name_of("embed")}
+    choice = getattr(args, "reasoning_choice", None)
+    if choice and not args.reasoning_model:
+        pairs[f"MODEL_{choice}_NAME"] = name_of("reasoning")
+        pairs[f"MODEL_{choice}_CTX"] = reasoning_ctx
+    else:
+        # An explicit --reasoning-model has no catalog number to key on.
+        pairs["REASONING_NAME"] = name_of("reasoning")
+        pairs["REASONING_CTX"] = reasoning_ctx
+
+    try:
+        save_settings(**pairs)
+    except OSError as e:
+        # A launch that otherwise worked must not fail over a convenience file.
+        warn(f"Could not record launch details in {SETTINGS_FILE.name}: {e}")
 
 
 def choose_reasoning_model(args):
@@ -1378,6 +1426,11 @@ def main():
         die("No models resolved. Use --download-to, --models-cache, or explicit --*-model paths")
 
     reasoning_ctx, reasoning_n_cpu_moe = resolve_reasoning_ctx(args, models)
+
+    # Everything run.bat wants to show is settled by here: the models are
+    # located and the window is sized.
+    if not args.dry_run:
+        remember_launch(args, models, reasoning_ctx)
 
     skip_map = {
         "reasoning": args.skip_reasoning,

@@ -75,14 +75,30 @@ if "!HAVE_SAVED!"=="1" goto :offer_saved
 goto :ask
 
 :offer_saved
+REM run.py records what it resolved (MODEL_<n>_NAME / MODEL_<n>_CTX per catalog
+REM choice, plus JUDGE_NAME / EMBED_NAME). The choice number is only known at
+REM runtime, so reaching those keys needs a second expansion pass -- that is
+REM what `call set` with %%..%% does. Context is stored per model because each
+REM one autosizes to a different window.
+set "CUR_NAME=!SAVED_REASONING_NAME!"
+set "CUR_CTX=!SAVED_REASONING_CTX!"
+if not "!SAVED_REASONING_CHOICE!"=="" call set "CUR_NAME=%%SAVED_MODEL_!SAVED_REASONING_CHOICE!_NAME%%"
+if not "!SAVED_REASONING_CHOICE!"=="" call set "CUR_CTX=%%SAVED_MODEL_!SAVED_REASONING_CHOICE!_CTX%%"
+
 echo Found settings from your last run:
 echo   llama-server:    !SAVED_LLAMA_BIN!
 echo   Models cache:    !SAVED_MODELS_CACHE!
 echo   Storage path:    !SAVED_STORAGE!
-echo   Reasoning model: !SAVED_REASONING!
-echo   Model choice #:  !SAVED_REASONING_CHOICE!
-echo   Judge model:     !SAVED_JUDGE!
-echo   Embedding model: !SAVED_EMBED!
+echo.
+echo Models it will load:
+if not "!CUR_NAME!"=="" echo   Reasoning:       !CUR_NAME!   [choice !SAVED_REASONING_CHOICE!, ctx !CUR_CTX!]
+if "!CUR_NAME!"=="" echo   Reasoning:       choice #!SAVED_REASONING_CHOICE! - name recorded after the next launch
+if not "!SAVED_JUDGE_NAME!"=="" echo   Judge:           !SAVED_JUDGE_NAME!
+if not "!SAVED_EMBED_NAME!"=="" echo   Embedding:       !SAVED_EMBED_NAME!
+REM Explicit paths override the catalog, so show them when the user set any.
+if not "!SAVED_REASONING!"=="" echo   Reasoning path:  !SAVED_REASONING!
+if not "!SAVED_JUDGE!"=="" echo   Judge path:      !SAVED_JUDGE!
+if not "!SAVED_EMBED!"=="" echo   Embedding path:  !SAVED_EMBED!
 echo.
 set "REUSE=Y"
 set /p "REUSE=Reuse these settings? (Y/n) [Y]: "
@@ -99,6 +115,11 @@ goto :save_and_build
 
 :ask
 REM Each prompt offers the previously saved value as its default (press Enter to keep)
+REM The model-menu choice is not prompted for here, but it still has to survive:
+REM without this, answering "n" above dropped it from the rewrite below and
+REM silently lost the remembered model.
+set "REASONING_CHOICE=!SAVED_REASONING_CHOICE!"
+
 set "LLAMA_BIN=!SAVED_LLAMA_BIN!"
 set /p "LLAMA_BIN=Folder containing llama-server.exe [!SAVED_LLAMA_BIN!] (blank=auto-detect from PATH): "
 if not "!LLAMA_BIN!"=="" if not exist "!LLAMA_BIN!" echo [WARN] Not found: !LLAMA_BIN! - will pass it anyway
@@ -123,6 +144,15 @@ echo.
 echo Proceeding with the selected options...
 echo.
 
+REM The rewrite below starts the file from scratch, which would drop the keys
+REM run.py records (the per-model names and context sizes). They cannot be
+REM listed by name -- MODEL_4_NAME only exists once model 4 has been launched --
+REM so set them aside and append them back afterwards. Matching by prefix means
+REM a new catalog entry needs no change here.
+set "KEEP_FILE=%TEMP%\cued_recall_keep.txt"
+del "%KEEP_FILE%" 2>nul
+if exist "%SETTINGS_FILE%" findstr /B "MODEL_ JUDGE_NAME EMBED_NAME REASONING_NAME REASONING_CTX" "%SETTINGS_FILE%" >"%KEEP_FILE%" 2>nul
+
 REM Remember these answers for next time (redirection first avoids the
 REM trailing-digit stream-number trap; separate echoes avoid a ( ) block
 REM so parentheses in Windows paths can't truncate the write)
@@ -135,6 +165,8 @@ REM so parentheses in Windows paths can't truncate the write)
 REM Preserve the remembered model-menu choice; run.py rewrites it when the
 REM user picks from the menu.
 if not "!REASONING_CHOICE!"=="" (>>"%SETTINGS_FILE%" echo REASONING_CHOICE=!REASONING_CHOICE!)
+if exist "%KEEP_FILE%" type "%KEEP_FILE%" >>"%SETTINGS_FILE%"
+del "%KEEP_FILE%" 2>nul
 
 set "ARGS="
 if not "!LLAMA_BIN!"=="" set "ARGS=!ARGS! --llama-bin !LLAMA_BIN!"
