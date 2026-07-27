@@ -23,6 +23,7 @@ import subprocess
 import shutil
 import struct
 import json
+import re
 import platform
 import argparse
 import threading
@@ -179,7 +180,12 @@ def parse_args():
     g.add_argument("--model-menu", action="store_true",
                    help="Force the reasoning model selection menu even if a choice is saved")
     g.add_argument("--reasoning-cpu-moe", action="store_true",
-                   help="Force --cpu-moe for the reasoning server (auto-detected for A3B/MoE models)")
+                   help="Force MoE expert offload for the reasoning server (auto-detected for A3B/MoE models)")
+    g.add_argument("--reasoning-n-cpu-moe", metavar="N|auto", default="auto",
+                   help="How many layers keep their experts in system RAM. 'auto' "
+                        "(default) spends the VRAM left over after the KV cache on "
+                        "expert layers; pass a number to pin it, or the model's "
+                        "layer count to keep every expert off the GPU")
 
     g = p.add_argument_group("Port overrides")
     g.add_argument("--reasoning-ctx", metavar="N|auto", default="auto",
@@ -719,6 +725,36 @@ def moe_gpu_weights_mib(path) -> int:
                // (1024 * 1024))
 
 
+def moe_expert_layer_mib(path) -> list:
+    """Expert-tensor cost of each layer, in MiB, indexed by layer number.
+
+    --cpu-moe is all or nothing: it parks every expert tensor in system RAM,
+    which is what makes a 16.6 GiB model fit on a 12 GiB card, and then leaves
+    whatever VRAM the weights and KV did not claim sitting idle. --n-cpu-moe N
+    keeps only the first N layers' experts on the CPU, so sizing N needs the
+    per-layer cost rather than the total. They are not uniform -- this model's
+    layers run 330 to 560 MiB depending on how each was quantized.
+
+    Returns [] when the tensor table can't be read or the layers aren't
+    numbered as expected, which sends the caller back to plain --cpu-moe.
+    """
+    tensors = _read_gguf(path, want_tensors=True)[1]
+    if not tensors:
+        return []
+    per_layer = {}
+    for name, nbytes in tensors:
+        if "_exps" not in name:
+            continue
+        m = re.match(r"blk\.(\d+)\.", name)
+        if not m:
+            return []
+        idx = int(m.group(1))
+        per_layer[idx] = per_layer.get(idx, 0) + nbytes
+    if not per_layer or set(per_layer) != set(range(max(per_layer) + 1)):
+        return []
+    return [per_layer[i] / (1024 * 1024) for i in range(max(per_layer) + 1)]
+
+
 def kv_bytes_per_token(md: dict) -> int:
     """KV cache cost of one token, from the model's own header.
 
@@ -780,20 +816,27 @@ def port_in_use(port: int) -> bool:
 
 
 def autosize_reasoning_ctx(reasoning_path, embed_path=None, gpu_layers=99,
-                           cpu_moe=False, free_mib=None, ports_busy=None):
-    """Pick --ctx-size for the reasoning server from free VRAM and KV cost.
+                           cpu_moe=False, pinned_ctx=None,
+                           free_mib=None, ports_busy=None):
+    """Plan the reasoning server's VRAM: context size, then the MoE split.
 
-    Returns (ctx, notes) where notes are the lines to show the user. Falls back
-    to the hardcoded default whenever anything can't be determined -- a bad
-    guess here costs a failed model load, so every unknown resolves toward the
+    One pool of memory, so one decision: the KV cache is sized first (it sets
+    how long a conversation can get), and whatever is left over is spent on
+    expert layers rather than left idle. Pass `pinned_ctx` to fix the window
+    and size only the split around it.
+
+    Returns (ctx, n_cpu_moe, notes), where n_cpu_moe is None for "use plain
+    --cpu-moe" and notes are the lines to show the user. Falls back to the
+    hardcoded default whenever anything can't be determined -- a bad guess
+    here costs a failed model load, so every unknown resolves toward the
     known-good value.
     """
     notes = []
-    default = reasoning_ctx_size()
+    default = pinned_ctx or reasoning_ctx_size()
 
     gpu = gpu_free_mib()
     if gpu is None:
-        return default, ["no NVIDIA GPU detected; keeping default ctx"]
+        return default, None, ["no NVIDIA GPU detected; keeping default ctx"]
     measured_free, total_mib, gpu_name = gpu
     if free_mib is None:
         free_mib = measured_free
@@ -804,19 +847,19 @@ def autosize_reasoning_ctx(reasoning_path, embed_path=None, gpu_layers=99,
     if ports_busy is None:
         ports_busy = port_in_use(SERVER_DEFAULTS["reasoning"]["port"])
     if ports_busy:
-        return default, [
+        return default, None, [
             "reasoning port already in use -- another instance is holding the "
             f"GPU, so free VRAM can't be read; keeping default ctx {default:,}"
         ]
 
     if not reasoning_path or not os.path.exists(reasoning_path):
         # Normal on a --dry-run before the first download.
-        return default, [f"reasoning model not on disk yet; showing default ctx {default:,}"]
+        return default, None, [f"reasoning model not on disk yet; showing default ctx {default:,}"]
 
     md = read_gguf_metadata(reasoning_path)
     per_token = kv_bytes_per_token(md)
     if not per_token:
-        return default, ["could not read KV geometry from the GGUF; keeping default ctx"]
+        return default, None, ["could not read KV geometry from the GGUF; keeping default ctx"]
 
     arch = md.get("general.architecture", "?")
     trained_ctx = md.get(f"{arch}.context_length") or default
@@ -832,13 +875,12 @@ def autosize_reasoning_ctx(reasoning_path, embed_path=None, gpu_layers=99,
         if cpu_moe and weights_mib:
             resident = moe_gpu_weights_mib(reasoning_path)
             if resident:
-                moe_note = (f"MoE with --cpu-moe: experts stay in system RAM, so "
-                            f"{resident:,} MiB of the {weights_mib:,} MiB file is "
-                            f"VRAM-resident")
+                moe_note = (f"MoE: experts can be offloaded, so only {resident:,} MiB "
+                            f"of the {weights_mib:,} MiB file has to be VRAM-resident")
                 weights_mib = resident
             else:
-                moe_note = ("MoE with --cpu-moe, but the tensor table is "
-                            "unreadable; charging the whole file to VRAM")
+                moe_note = ("MoE, but the tensor table is unreadable; "
+                            "charging the whole file to VRAM")
     embed_mib = 0
     if embed_path:
         try:
@@ -871,15 +913,19 @@ def autosize_reasoning_ctx(reasoning_path, embed_path=None, gpu_layers=99,
             "CPU with --reasoning-cpu-moe (MoE) or a smaller quant."
         )
         notes.append(f"keeping default ctx {default:,}")
-        return default, notes
+        return default, None, notes
 
-    ctx = int(budget_mib * 1024 * 1024 // per_token)
-    ctx = (ctx // 4096) * 4096                       # llama.cpp likes round numbers
-    ctx = min(ctx, int(trained_ctx))                 # never exceed what it was trained for
-    hit_trained = ctx >= int(trained_ctx)
-    hit_latency = ctx > MAX_AUTO_CTX
-    ctx = min(ctx, MAX_AUTO_CTX)
     kib = per_token / 1024
+    if pinned_ctx:
+        ctx = pinned_ctx
+        hit_trained = hit_latency = False
+    else:
+        ctx = int(budget_mib * 1024 * 1024 // per_token)
+        ctx = (ctx // 4096) * 4096                   # llama.cpp likes round numbers
+        ctx = min(ctx, int(trained_ctx))             # never exceed what it was trained for
+        hit_trained = ctx >= int(trained_ctx)
+        hit_latency = ctx > MAX_AUTO_CTX
+        ctx = min(ctx, MAX_AUTO_CTX)
     notes.append(
         f"KV costs {kib:.0f} KiB/token "
         f"({max(1, (md.get(arch + '.block_count') or 1) // (md.get(arch + '.full_attention_interval') or 1))}"
@@ -889,13 +935,60 @@ def autosize_reasoning_ctx(reasoning_path, embed_path=None, gpu_layers=99,
     if ctx < MIN_AUTO_CTX:
         notes.append(f"computed ctx {ctx:,} below the {MIN_AUTO_CTX:,} floor; "
                      f"keeping default {default:,}")
-        return default, notes
+        return default, None, notes
     if hit_latency:
         notes.append(f"VRAM allowed more; capped at {MAX_AUTO_CTX:,} so a full "
                      f"window stays a few minutes of prefill, not tens")
     elif hit_trained:
         notes.append(f"capped at the model's trained context ({int(trained_ctx):,})")
-    return ctx, notes
+
+    n_cpu_moe, moe_notes = _plan_expert_split(
+        reasoning_path, cpu_moe, budget_mib, ctx, per_token
+    )
+    notes.extend(moe_notes)
+    return ctx, n_cpu_moe, notes
+
+
+def _plan_expert_split(reasoning_path, cpu_moe, budget_mib, ctx, per_token):
+    """Decide --n-cpu-moe N from the VRAM the KV cache did not claim.
+
+    Capping the context stops short of using the card: once the window is
+    chosen, the KV cache has a fixed size and everything left over in the
+    budget is idle. Spend it on expert layers, which is what generation is
+    actually bandwidth-bound on -- reading them from VRAM instead of across
+    PCIe is the difference the spare memory can buy.
+
+    --n-cpu-moe keeps the FIRST N layers on the CPU, so the GPU takes the
+    tail; N is the smallest value whose tail still fits. Returns
+    (n_cpu_moe, notes), with None meaning "fall back to plain --cpu-moe".
+    """
+    if not cpu_moe:
+        return None, []
+    sizes = moe_expert_layer_mib(reasoning_path)
+    if not sizes:
+        return None, ["could not read per-layer expert sizes; keeping --cpu-moe"]
+
+    kv_mib = ctx * per_token / (1024 * 1024)
+    spare = budget_mib - kv_mib
+    n_layers = len(sizes)
+
+    # Walk down from "everything on CPU" and stop at the last layer that fits.
+    n = n_layers
+    on_gpu = 0.0
+    while n > 0 and on_gpu + sizes[n - 1] <= spare:
+        on_gpu += sizes[n - 1]
+        n -= 1
+
+    if n == n_layers:
+        return None, [
+            f"{spare:,.0f} MiB spare after KV -- not enough for even one "
+            f"expert layer ({min(sizes):,.0f} MiB); keeping --cpu-moe"
+        ]
+    total_experts = sum(sizes)
+    note = (f"{spare:,.0f} MiB spare after {kv_mib:,.0f} MiB of KV: "
+            f"--n-cpu-moe {n} puts {n_layers - n}/{n_layers} expert layers "
+            f"({on_gpu:,.0f} of {total_experts:,.0f} MiB) on the GPU")
+    return n, [note]
 
 
 def set_arg(extra: list, flag: str, value: str) -> list:
@@ -915,19 +1008,35 @@ def get_arg(extra: list, flag: str, default=None):
     return default
 
 
-def resolve_reasoning_ctx(args, models) -> int:
-    """Decide the reasoning context size and explain the decision."""
+def del_arg(extra: list, flag: str) -> list:
+    """Remove a flag and the value that follows it from an argv list."""
+    out, skip = [], False
+    for a in extra:
+        if skip:
+            skip = False
+            continue
+        if a == flag:
+            skip = True
+            continue
+        out.append(a)
+    return out
+
+
+def resolve_reasoning_ctx(args, models):
+    """Decide the context size and the MoE expert split; explain both.
+
+    Returns (ctx, n_cpu_moe), where n_cpu_moe is None for plain --cpu-moe.
+    """
     default = reasoning_ctx_size()
     raw = str(getattr(args, "reasoning_ctx", "auto") or "auto").strip().lower()
 
+    pinned = None
     if raw not in ("auto", ""):
         try:
             pinned = int(raw)
         except ValueError:
             warn(f"--reasoning-ctx {raw!r} is not a number or 'auto'; using {default:,}")
-            return default
-        info(f"Reasoning ctx: {pinned:,} (pinned via --reasoning-ctx)")
-        return pinned
+            pinned = default
 
     # Size for what the launch path will actually run, which differs from a
     # plain reading of the flags in two ways. --cpu-moe is not -ngl 0: the
@@ -938,15 +1047,27 @@ def resolve_reasoning_ctx(args, models) -> int:
     model_path = models.get("reasoning")
     cpu_moe = bool(args.reasoning_cpu_moe or
                    (model_path and is_moe_model(Path(model_path).name)))
-    ctx, notes = autosize_reasoning_ctx(
-        model_path, models.get("embed"), gpu_layers=99, cpu_moe=cpu_moe
+    ctx, n_cpu_moe, notes = autosize_reasoning_ctx(
+        model_path, models.get("embed"), gpu_layers=99, cpu_moe=cpu_moe,
+        pinned_ctx=pinned,
     )
-    info(f"Reasoning ctx: {ctx:,} (auto)")
+
+    # An explicit --reasoning-n-cpu-moe overrides the computed split, the same
+    # way --reasoning-ctx overrides the computed window.
+    raw_moe = str(getattr(args, "reasoning_n_cpu_moe", "auto") or "auto").strip().lower()
+    if raw_moe not in ("auto", ""):
+        try:
+            n_cpu_moe = int(raw_moe)
+            notes.append(f"expert split pinned via --reasoning-n-cpu-moe {n_cpu_moe}")
+        except ValueError:
+            warn(f"--reasoning-n-cpu-moe {raw_moe!r} is not a number or 'auto'; autosizing")
+
+    info(f"Reasoning ctx: {ctx:,} ({'pinned' if pinned else 'auto'})")
     for n in notes:
         print(f"         {n}")
-    if ctx != default:
+    if not pinned and ctx != default:
         print(f"         pin a different value with --reasoning-ctx N")
-    return ctx
+    return ctx, n_cpu_moe
 
 
 def print_launch_plan(server_defs, launched_at):
@@ -973,6 +1094,8 @@ def print_launch_plan(server_defs, launched_at):
             pass
         if "--cpu-moe" in extra:
             device = "GPU+MoE"
+        elif "--n-cpu-moe" in extra:
+            device = f"GPU+MoE{get_arg(extra, '--n-cpu-moe', '')}"
         elif str(ngl) == "0":
             device = "CPU"
         elif "--no-kv-offload" in extra:
@@ -1254,7 +1377,7 @@ def main():
     if not models and not args.dry_run:
         die("No models resolved. Use --download-to, --models-cache, or explicit --*-model paths")
 
-    reasoning_ctx = resolve_reasoning_ctx(args, models)
+    reasoning_ctx, reasoning_n_cpu_moe = resolve_reasoning_ctx(args, models)
 
     skip_map = {
         "reasoning": args.skip_reasoning,
@@ -1283,10 +1406,18 @@ def main():
         if name == "reasoning":
             extra = set_arg(extra, "--ctx-size", str(reasoning_ctx))
         if name == "reasoning" and (args.reasoning_cpu_moe or is_moe_model(Path(model_path).name)):
-            # MoE: keep router/attention/KV on GPU, park expert tensors in
-            # system RAM so 17-20 GB A3B models run on a 12 GB card.
-            extra.append("--cpu-moe")
-            info("Reasoning is MoE: adding --cpu-moe (experts in system RAM)")
+            # MoE: keep router/attention/KV on GPU and park expert tensors in
+            # system RAM so 17-20 GB A3B models run on a 12 GB card. Only the
+            # experts that do not fit go to RAM -- see _plan_expert_split.
+            if reasoning_n_cpu_moe is None:
+                extra.append("--cpu-moe")
+                info("Reasoning is MoE: adding --cpu-moe (all experts in system RAM)")
+            elif reasoning_n_cpu_moe > 0:
+                extra += ["--n-cpu-moe", str(reasoning_n_cpu_moe)]
+                info(f"Reasoning is MoE: adding --n-cpu-moe {reasoning_n_cpu_moe} "
+                     f"(first {reasoning_n_cpu_moe} layers' experts in system RAM)")
+            else:
+                info("Reasoning is MoE but every expert fits in VRAM; no offload")
         if name in ("reasoning", "judge"):
             # llama-server rejects every /slots action with 501 unless it was
             # started with --slot-save-path -- including "erase", which writes
@@ -1325,21 +1456,33 @@ def main():
         for i, (name, proc, port) in enumerate(processes):
             if wait_for_server(name, port, proc):
                 continue
-            # An autosized context is an estimate: VRAM can be taken by
-            # another app between measuring and loading, and the KV formula
-            # carries a few percent of slack. Rather than leave the stack
-            # half-up, halve the context and try once more -- the failure mode
-            # this recovers from is always "KV didn't fit".
+            # Both autosized numbers are estimates: VRAM can be taken by
+            # another app between measuring and loading, and neither the KV
+            # formula nor the expert-layer sum carries much slack. Rather than
+            # leave the stack half-up, give ground and try once more. The
+            # expert split goes first because it is the bigger lever -- it
+            # frees gigabytes of expert weight where halving the window frees
+            # only the KV -- and giving up both at once beats burning a second
+            # restart working out which one was at fault.
             sd = next((s for s in server_defs if s["name"] == name), None)
             if sd is None or name != "reasoning":
                 continue
-            old_ctx = int(get_arg(sd["extra"], "--ctx-size", "0") or 0)
+            retry_extra = sd["extra"]
+            surrendered = []
+            if "--n-cpu-moe" in retry_extra:
+                retry_extra = del_arg(retry_extra, "--n-cpu-moe") + ["--cpu-moe"]
+                surrendered.append("expert split -> --cpu-moe")
+            old_ctx = int(get_arg(retry_extra, "--ctx-size", "0") or 0)
             new_ctx = (old_ctx // 2 // 4096) * 4096
-            if old_ctx <= MIN_AUTO_CTX or new_ctx < MIN_AUTO_CTX:
+            if old_ctx > MIN_AUTO_CTX and new_ctx >= MIN_AUTO_CTX:
+                retry_extra = set_arg(retry_extra, "--ctx-size", str(new_ctx))
+                surrendered.append(f"ctx {old_ctx:,} -> {new_ctx:,}")
+            else:
+                new_ctx = old_ctx
+            if not surrendered:
                 continue
-            warn(f"{name} failed to start at ctx {old_ctx:,}; "
-                 f"retrying at {new_ctx:,}")
-            sd["extra"] = set_arg(sd["extra"], "--ctx-size", str(new_ctx))
+            warn(f"{name} failed to start; retrying ({', '.join(surrendered)})")
+            sd["extra"] = retry_extra
             retry = start_server(llama_bin, name, sd["model"], port, sd["extra"])
             processes[i] = (name, retry, port)
             if wait_for_server(name, port, retry):
