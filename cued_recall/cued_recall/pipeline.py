@@ -111,6 +111,9 @@ class Pipeline:
     # Applied to the retry budget after a context overflow so the re-fitted
     # prompt is always smaller than the one the server just refused.
     SHRINK_MARGIN = 0.95
+    # How far under the limit trimming goes once it has to trim at all. The
+    # gap is deliberate slack: see the comment in _fit_messages.
+    TRIM_TARGET_RATIO = 0.8
 
     def __init__(
         self,
@@ -141,6 +144,42 @@ class Pipeline:
         if isinstance(c, list):
             return " ".join(p.get("text", "") for p in c if isinstance(p, dict))
         return c if isinstance(c, str) else str(c)
+
+    @staticmethod
+    def _newest_user_index(msgs: list):
+        """Index of the last real user turn, or None.
+
+        A user message whose whole content is a <tool_response> does not
+        count -- the chat template applies the same test when deciding
+        whether a query exists. Shared by _fit_messages, which must not trim
+        this turn away, and build_messages, which anchors recall to it.
+        """
+        for i in range(len(msgs) - 1, -1, -1):
+            if msgs[i].get("role") != "user":
+                continue
+            text = Pipeline._msg_text(msgs[i]).strip()
+            if text.startswith("<tool_response>") and text.endswith("</tool_response>"):
+                continue
+            return i
+        return None
+
+    @staticmethod
+    def _prepend_text(msg: dict, prefix: str) -> dict:
+        """Put `prefix` in front of a message's text, structure intact.
+
+        Content may be a plain string or a parts list; for a parts list only
+        the first text part is touched, so images and other non-text parts
+        survive.
+        """
+        c = msg.get("content", "")
+        if isinstance(c, list):
+            parts = list(c)
+            for i, p in enumerate(parts):
+                if isinstance(p, dict) and p.get("type") == "text":
+                    parts[i] = {**p, "text": prefix + p.get("text", "")}
+                    return {**msg, "content": parts}
+            return {**msg, "content": [{"type": "text", "text": prefix}] + parts}
+        return {**msg, "content": prefix + (c if isinstance(c, str) else "")}
 
     def _estimate_tokens(self, text: str) -> int:
         """Conservative token estimate from character and word counts.
@@ -263,21 +302,13 @@ class Pipeline:
         result = list(messages)
         sizes = list(per_msg)
 
-        def _newest_user(msgs):
-            """Index of the last real user turn, or None.
-
-            A user message whose whole content is a <tool_response> does not
-            count -- the chat template applies the same test when deciding
-            whether a query exists.
-            """
-            for i in range(len(msgs) - 1, -1, -1):
-                if msgs[i].get("role") != "user":
-                    continue
-                text = Pipeline._msg_text(msgs[i]).strip()
-                if text.startswith("<tool_response>") and text.endswith("</tool_response>"):
-                    continue
-                return i
-            return None
+        # Trimming rewrites every token after the system prompt, so whatever
+        # turn it happens on pays a full re-prefill. Dropping the bare minimum
+        # to fit means that is every turn once a conversation reaches the
+        # ceiling. Go under by a margin instead and the same single re-prefill
+        # buys several turns of byte-identical prefix. The history given up
+        # early is exactly what the recall store exists to bring back.
+        target = int(limit * self.TRIM_TARGET_RATIO)
 
         # Drop oldest middle messages first. This loop always claimed to keep
         # everything "between system and latest user", but nothing enforced the
@@ -290,8 +321,8 @@ class Pipeline:
         # Sizes are popped in lockstep so the running total stays on the same
         # scale as `total` -- which may have been replaced by an exact
         # server-side count above.
-        while len(result) > 2 and total > limit:
-            keep = _newest_user(result)
+        while len(result) > 2 and total > target:
+            keep = self._newest_user_index(result)
             victim = next((j for j in range(1, len(result) - 1) if j != keep), None)
             if victim is None:
                 break        # only the protected turn is left to give up
@@ -490,28 +521,45 @@ class Pipeline:
         return "\n".join(parts)
 
     def build_messages(self, original_messages: list, recall_text: str) -> list:
-        """Put the recall note in front of the conversation.
+        """Attach the recall note to the newest user message.
 
-        Folded into the client's own system message rather than prepended as a
-        second one. Qwen3.5's chat template renders messages[0] as the system
-        block and then raises 'System message must be at the beginning.' on any
-        later system message, which llama.cpp reports as a 400 -- so an agent
-        CLI like opencode, which always ships its own system prompt, failed
-        every turn that recalled anything. Merging also keeps _fit_messages
-        honest: it protects index 0 and drops from index 1 first, so a separate
-        recall message at 0 meant the client's system prompt was the first
-        thing discarded when a long session overflowed the context.
+        Where this goes is a performance decision, not a formatting one.
+        Recalled blocks are retrieved per query, so they differ from turn to
+        turn. They used to be merged into the front of the client's system
+        message, which meant the first tokens of the prompt changed on every
+        request and invalidated llama.cpp's entire KV prefix behind them.
+        Measured on this stack: 43,345-token prompts re-prefilled from scratch
+        at f_keep 0.12, 107 s of prompt processing per turn to produce a reply
+        that decoded in 1.4 s. Anchoring recall to the last user message leaves
+        the system prompt and the whole conversation history byte-identical
+        between turns, so the cache holds and only the recall block and the new
+        message are prefilled.
+
+        It cannot be a second system message. Qwen3.5's chat template renders
+        messages[0] as the system block and raises 'System message must be at
+        the beginning.' for any later one, which llama.cpp returns as a 400 --
+        that is what used to break agent CLIs like opencode, which always ship
+        their own system prompt. Folding into the user turn sidesteps the rule
+        rather than working around it, and costs nothing in protection:
+        _fit_messages keeps the newest user message, so the recall text is as
+        safe from trimming here as it was at index 0.
         """
         if not recall_text:
             return original_messages
-        first = original_messages[0] if original_messages else None
-        if first and first.get("role") == "system":
-            client_text = self._extract_text(first.get("content"))
-            merged = {**first, "content": (recall_text + "\n\n" + client_text
-                                           if client_text else recall_text)}
-            return [merged] + original_messages[1:]
-        recall_msg = {"role": "system", "content": recall_text}
-        return [recall_msg] + original_messages
+        idx = self._newest_user_index(original_messages)
+        if idx is None:
+            # No user turn to anchor to -- a system-only or tool-only body.
+            # Fall back to the old front-merge rather than drop the recall.
+            first = original_messages[0] if original_messages else None
+            if first and first.get("role") == "system":
+                client_text = self._extract_text(first.get("content"))
+                merged = {**first, "content": (recall_text + "\n\n" + client_text
+                                               if client_text else recall_text)}
+                return [merged] + original_messages[1:]
+            return [{"role": "system", "content": recall_text}] + original_messages
+        out = list(original_messages)
+        out[idx] = self._prepend_text(out[idx], recall_text + "\n\n")
+        return out
 
     @staticmethod
     def _extract_text(content) -> str:
