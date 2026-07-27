@@ -289,7 +289,19 @@ class Pipeline:
         # Near the limit the estimate is not good enough to bet a hard 400 on.
         # Get the real number and rescale the per-message figures by the same
         # factor so the drop loop below stays consistent with it.
-        if use_exact and total > limit * self.config.exact_count_threshold:
+        #
+        # The estimate cannot be trusted to decide when it is itself untrusted:
+        # measured against this tokenizer it runs 24% low on Azerbaijani and 55%
+        # low on base64, and an under-count both inflates the prompt and hides
+        # the fact that it did. So the trigger is a fact rather than a guess --
+        # every token costs at least one byte, so a payload smaller than the
+        # budget in bytes provably cannot exceed it in tokens, and anything
+        # larger is worth 450 ms to measure properly. The configured threshold
+        # stays as a second trigger for a payload that is compact but dense.
+        payload_bytes = sum(len(self._msg_text(m).encode("utf-8", "ignore"))
+                            for m in messages)
+        must_count = payload_bytes >= limit
+        if use_exact and (must_count or total > limit * self.config.exact_count_threshold):
             exact = await self._exact_prompt_tokens(messages, body)
             if exact is not None and total > 0:
                 scale = exact / total

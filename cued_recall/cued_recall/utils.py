@@ -4,18 +4,33 @@ from typing import List, Tuple
 import httpx
 
 
+# Characters are the wrong unit for anything outside ASCII. Measured against
+# this model's tokenizer, chars/token ranges from 2.54 (Azerbaijani) to 4.50
+# (English prose) -- so a divisor tuned for English under-counts Azerbaijani by
+# a fifth. Bytes hold much steadier, 3.11 to 4.50 over the same samples, because
+# the extra UTF-8 bytes of ə/ş/ğ/ı/ö/ü/ç are exactly what the tokenizer is
+# paying for. 3.0 sits just under the lowest measured figure, so the byte signal
+# is an over-estimate on every sample rather than a coin flip.
+BYTES_PER_TOKEN = 3.0
+
+
 def estimate_tokens(text: str, chars_per_token: float = 3.2,
                     tokens_per_word: float = 1.3) -> int:
-    """Conservative token estimate from character and word counts.
+    """Conservative token estimate from character, word and byte counts.
 
-    Takes the larger of the two signals on purpose -- see
-    Pipeline._estimate_tokens, which delegates here.
+    Takes the largest of the three signals on purpose -- see
+    Pipeline._estimate_tokens, which delegates here. Under-counting hands the
+    server a prompt bigger than its window; the reply is then cut off wherever
+    it happened to be, which for an agent client means a tool call truncated
+    mid-JSON and a turn that fails to parse. Over-counting only costs some
+    trimmed history, so every tie goes to the larger number.
     """
     if not text:
         return 0
     by_chars = len(text) / max(chars_per_token, 0.1)
     by_words = len(text.split()) * tokens_per_word
-    return int(max(by_chars, by_words))
+    by_bytes = len(text.encode("utf-8", "ignore")) / BYTES_PER_TOKEN
+    return int(max(by_chars, by_words, by_bytes))
 
 
 async def count_tokens(text: str, endpoint: str, chars_per_token: float = 3.2,

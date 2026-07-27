@@ -139,7 +139,14 @@ class Config:
         # When the estimate lands above this fraction of the budget, stop
         # guessing and ask the server to tokenize the prompt exactly. Costs one
         # ~450 ms round trip, and only on prompts near the limit.
-        self.exact_count_threshold: float = raw.get("exact_count_threshold", 0.8)
+        #
+        # 0.6 rather than 0.8 because the trigger is itself an estimate: an
+        # under-count both inflates the prompt and delays the check that would
+        # have caught it. At 0.8 a 24% under-count reads as 0.79 of budget
+        # while the real prompt is already over it, and the exact count never
+        # runs. The margin is nearly free -- 450 ms against a prefill measured
+        # in tens of seconds.
+        self.exact_count_threshold: float = raw.get("exact_count_threshold", 0.6)
         self.web_search = WebSearchConfig(raw.get("web_search", {}))
 
     def get_server(self, name: str) -> ServerConfig:

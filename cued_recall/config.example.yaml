@@ -35,7 +35,7 @@ chars_per_token: 3.2
 context_reserve_tokens: 4096
 # Above this fraction of the budget, stop estimating and have the server
 # tokenize the prompt exactly (one ~450 ms call, only near the limit).
-exact_count_threshold: 0.8
+exact_count_threshold: 0.6
 # A one-off message with no follow-up in its conversation would otherwise
 # stay unrecallable forever (normal shelving only fires on the NEXT turn).
 # This is how long to wait before shelving it anyway.
