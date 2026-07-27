@@ -431,8 +431,18 @@ async function loadTps() {
     const grid = document.getElementById('tps-grid');
     grid.innerHTML = '';
 
+    // Prefill and decode first: they are the two numbers that describe the
+    // model, and they come from llama.cpp counting each separately. The
+    // end-to-end figure below divides generated tokens by whole-request wall
+    // time, so a turn that spends two minutes on prompt processing reads as
+    // slow generation -- true of the request, misleading about the model.
+    const s = data.server || {};
+    const fmt = n => (n == null ? '—' : n);
+    const sub = n => (n ? `${n.toLocaleString()} tok` : 'no traffic yet');
     const cards = [
-      { label: 'Avg T/S', value: data.avg_tps || 0 },
+      { label: 'Prefill T/S', value: fmt(s.prefill_tps), sub: sub(s.prompt_tokens) },
+      { label: 'Decode T/S', value: fmt(s.decode_tps), sub: sub(s.predicted_tokens) },
+      { label: 'End-to-end T/S', value: data.avg_tps || 0, sub: 'incl. prefill wait' },
       { label: 'Samples', value: data.count || 0 },
     ];
 
@@ -445,7 +455,10 @@ async function loadTps() {
     }
 
     for (const c of cards) {
-      grid.innerHTML += `<div class="stat-card"><div class="value">${c.value}</div><div class="label">${c.label}</div></div>`;
+      grid.innerHTML += `<div class="stat-card"><div class="value">${c.value}</div>`
+        + `<div class="label">${c.label}</div>`
+        + (c.sub ? `<div class="label" style="color:#484f58">${c.sub}</div>` : '')
+        + `</div>`;
     }
   } catch (e) {
     document.getElementById('tps-grid').innerHTML = `<div class="stat-card" style="color:#f85149">Error: ${e.message}</div>`;

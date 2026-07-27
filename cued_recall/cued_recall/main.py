@@ -476,7 +476,8 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
                 "note": "The launcher picks this up within ~15s; the model "
                         "then reloads, which takes up to a minute."}
 
-    admin_router = build_admin_router(index, store, wal, run_judge_pass, tps_ring, embed)
+    admin_router = build_admin_router(index, store, wal, run_judge_pass, tps_ring, embed,
+                                      reasoning_endpoint=cfg.reasoning_endpoint)
     app.include_router(admin_router)
 
     snapshot_task = None

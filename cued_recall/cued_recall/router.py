@@ -2,6 +2,7 @@ import asyncio
 import time
 from typing import Optional
 
+import httpx
 from fastapi import APIRouter, HTTPException
 
 from .index import VectorIndex
@@ -11,8 +12,42 @@ from .taxonomy import TAXONOMY, TAXONOMY_GROUPS, TAXONOMY_VERSION, validate_gist
 from .wal import WAL
 
 
+def rates_from_metrics(text: str) -> dict:
+    """Prefill and decode speed out of a llama-server /metrics body.
+
+    Both are token-weighted lifetime averages -- total tokens over total
+    seconds -- so a burst of tiny requests cannot drag them around the way an
+    unweighted mean of per-request rates would. They reset when the server
+    restarts, which is the boundary a config change happens on.
+    """
+    out = {"prefill_tps": None, "decode_tps": None,
+           "prompt_tokens": None, "predicted_tokens": None}
+    vals = {}
+    for line in (text or "").splitlines():
+        if not line.startswith("llamacpp:"):
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            try:
+                vals[parts[0][len("llamacpp:"):]] = float(parts[1])
+            except ValueError:
+                pass
+
+    def rate(tokens_key, seconds_key):
+        tok, sec = vals.get(tokens_key), vals.get(seconds_key)
+        if not tok or not sec:      # no traffic yet -> no honest number
+            return None
+        return round(tok / sec, 1)
+
+    out["prefill_tps"] = rate("prompt_tokens_total", "prompt_seconds_total")
+    out["decode_tps"] = rate("tokens_predicted_total", "tokens_predicted_seconds_total")
+    out["prompt_tokens"] = int(vals.get("prompt_tokens_total") or 0)
+    out["predicted_tokens"] = int(vals.get("tokens_predicted_total") or 0)
+    return out
+
+
 def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_run_fn,
-                        tps_ring: list, embed=None):
+                        tps_ring: list, embed=None, reasoning_endpoint: str = ""):
     router = APIRouter(prefix="/admin")
 
     @router.get("/blocks")
@@ -143,12 +178,39 @@ def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_ru
             "wal_events": wal_events,
         }
 
+    async def _reasoning_rates() -> dict:
+        """Prefill and decode speed, separately, from llama-server's /metrics.
+
+        The ring above times whole requests, which conflates the two: a reply
+        that spends 107 s prefilling and 1.4 s generating reads as slow
+        generation and makes a healthy model look broken. llama.cpp counts
+        them apart, so ask it.
+
+        See rates_from_metrics for what the two numbers mean. An unreachable
+        or metrics-less server yields nulls, which the admin page renders as
+        a dash rather than a confident zero.
+        """
+        empty = {"prefill_tps": None, "decode_tps": None,
+                 "prompt_tokens": None, "predicted_tokens": None}
+        if not reasoning_endpoint:
+            return empty
+        try:
+            async with httpx.AsyncClient(timeout=3) as client:
+                r = await client.get(reasoning_endpoint.rstrip("/") + "/metrics")
+            if r.status_code != 200:
+                return empty
+        except (httpx.HTTPError, ValueError):
+            return empty
+        return rates_from_metrics(r.text)
+
     @router.get("/tps")
     async def tps():
+        server = await _reasoning_rates()
         if not tps_ring:
-            return {"recent": [], "avg_tps": 0, "count": 0}
+            return {"recent": [], "avg_tps": 0, "count": 0, "server": server}
         avg = sum(e["tps"] for e in tps_ring) / len(tps_ring)
-        return {"recent": tps_ring[-20:], "avg_tps": round(avg, 1), "count": len(tps_ring)}
+        return {"recent": tps_ring[-20:], "avg_tps": round(avg, 1),
+                "count": len(tps_ring), "server": server}
 
     @router.get("/export")
     async def export_blocks(
