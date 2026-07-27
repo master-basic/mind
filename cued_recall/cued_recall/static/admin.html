@@ -438,7 +438,11 @@ async function loadTps() {
     // slow generation -- true of the request, misleading about the model.
     const s = data.server || {};
     const fmt = n => (n == null ? '—' : n);
-    const sub = n => (n ? `${n.toLocaleString()} tok` : 'no traffic yet');
+    // "none since server start" rather than "no traffic yet": these counters
+    // are cumulative from llama-server's launch and die with the process, so a
+    // dash right after a restart means the new server has not answered
+    // anything yet -- not that the page is broken.
+    const sub = n => (n ? `${n.toLocaleString()} tok` : 'none since server start');
     const cards = [
       { label: 'Prefill T/S', value: fmt(s.prefill_tps), sub: sub(s.prompt_tokens) },
       { label: 'Decode T/S', value: fmt(s.decode_tps), sub: sub(s.predicted_tokens) },
