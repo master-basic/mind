@@ -14,7 +14,11 @@ Client ──▶ Cued Recall Middleware ──▶ llama-server (reasoning)
                     └─────────────┘
                           │
                     ┌─────┴──────┐
-                    │ Judge Model │  block compression & purging
+                    │ Judge Model │  consolidation (rewrite) + correction check
+                    └─────────────┘
+                          │
+                    ┌─────┴──────┐
+                    │    Decay    │  forgetting, by age and recall count
                     └─────────────┘
                           │
                     ┌─────┴──────┐
@@ -24,9 +28,15 @@ Client ──▶ Cued Recall Middleware ──▶ llama-server (reasoning)
 
 Four server processes managed by the launcher:
 - **Reasoning** — main LLM (Qwen3-8B, configurable catalog of 6 models)
-- **Judge** — block compression/truncation decisions (Qwen2.5-1.5B)
+- **Judge** — rewrites long think traces; also tags blocks and classifies corrections (Qwen2.5-1.5B, CPU-only)
 - **Embedding** — vector retrieval keys (nomic-embed-text-v1.5)
 - **Middleware** — FastAPI proxy (this project)
+
+Memory upkeep is split in two, deliberately. **Consolidation** — turning a long
+derivation into a short one — needs to understand the text, so the judge model
+does it. **Forgetting** is a function of age, recall count and whether the
+answer was corrected, all of which are recorded exactly, so it is arithmetic
+and runs without a model call. See **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
 ---
 
@@ -37,10 +47,12 @@ Four server processes managed by the launcher:
 | OpenAI-compatible chat proxy | Working | Streaming + non-streaming, `/v1/chat/completions`, `/v1/models` |
 | Reasoning/result split | Working | ` thinking` / ` response` tag parsing during streaming |
 | Semantic recall | Working | Cosine-similarity retrieval, advisory injection, budget-limited |
-| Block lifecycle | Working | hot → shelved → truncated/purged via judge pass |
+| Block lifecycle | Working | hot → shelved → truncated/purged; passes sweep forward, oldest-unjudged first |
 | Tagging system | Working | Auto-tags blocks with gist + tags at shelve time |
-| Verification signals | Working | Correction patterns + accepted inference |
-| Judge compression | Working | Small LLM decides keep/truncate/purge with safety ladder |
+| Correction detection | Working | 17 anchored patterns (EN + AZ), plus a few-shot yes/no classifier for what they miss |
+| Decay | Working | Purges on correction, or never-recalled past a cutoff. No model call. Reversible by default |
+| Consolidation | Working | Judge rewrites long think traces only; guarded against copied openings and non-shrinking rewrites |
+| Idle consolidation | Working | Passes run after a quiet period, not mid-conversation |
 | Web search | Working | 4 backends: DuckDuckGo (free), Brave, Serper, SearXNG |
 | Web fetch | Working | SSRF-guarded, HTML-to-text, JSON detection |
 | Tool calling | Working | Own tools (web_search, web_fetch) + client tool forwarding |
@@ -156,8 +168,16 @@ Settings live in `cued_recall/config.yaml` (gitignored, auto-created from `confi
 | `recall.k` | 4 | Top blocks to retrieve |
 | `recall.threshold` | 0.62 | Cosine similarity threshold |
 | `recall.budget_tokens` | 3000 | Max injected recall tokens |
-| `judge.interval_tokens` | 20000 | Tokens between judge passes |
+| `judge.interval_tokens` | 20000 | New material before a pass is worth running |
+| `judge.idle_trigger_s` | 300 | Quiet time before a consolidation pass starts |
+| `judge.purge_age_s` | 259200 | Never recalled and older than this (3 days) → purge |
+| `judge.consolidate_min_tokens` | 600 | Below this, the model is not called at all |
+| `judge.consolidate_types` | `[reasoning]` | Block types the model may rewrite |
+| `judge.keep_recall_count` | 3 | Recalled this often → keep verbatim, never compress |
+| `judge.rejudge_interval_s` | 604800 | Leave a block alone this long after judging it |
+| `judge.purge_deletes_file` | false | Purging is reversible unless this is set |
 | `tagger.enabled` | true | Auto-tag at shelve time |
+| `verifier.enabled` | true | Ask the small model about corrections the patterns miss |
 | `web_search.backend` | duckduckgo | Search backend |
 | `web_search.brave_api_key` | — | Brave Search API key |
 | `web_search.serper_api_key` | — | Serper.dev API key |
@@ -173,6 +193,7 @@ mind/
 ├── run.py                           # Python orchestrator
 ├── ramdisk_setup.bat                # Windows RAM disk utility
 ├── INSTALLATION.md                  # Step-by-step setup guide
+├── ARCHITECTURE.md                  # Block lifecycle, recall, consolidation vs decay
 ├── snapshots/                       # Block store backups (persistent)
 └── cued_recall/
     ├── config.yaml                  # Active config (gitignored)
@@ -185,7 +206,10 @@ mind/
         ├── store.py                 # Msgpack block store
         ├── index.py                 # SQLite + sqlite-vec
         ├── embed.py                 # Embedding client
-        ├── judge.py                 # Judge pass (truncate/purge)
+        ├── judge.py                 # Consolidation + decay
+        ├── verifier.py              # Yes/no correction classifier
+        ├── tagger.py                # Gist + tags at shelve time
+        ├── small_model.py           # Shared queue for the CPU judge server
         ├── router.py                # Admin API routes
         ├── taxonomy.py              # Tag taxonomy
         ├── wal.py                   # Write-ahead log

@@ -131,7 +131,8 @@ def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_ru
         verification = body.get("verification")
         if verification not in ("accepted", "corrected"):
             raise HTTPException(status_code=400, detail="invalid verification value")
-        index.update_verification(block_id, verification)
+        # "manual" outranks anything inferred: the user pressed the button.
+        index.update_verification(block_id, verification, "manual")
         block = store.get(block_id)
         if block:
             block.verification = Verification(verification)

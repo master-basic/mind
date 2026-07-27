@@ -135,6 +135,13 @@ class Pipeline:
         self.tps_sink = None
         self.chat_sink = None
         self.tagger = None
+        self.verifier = None
+        # Which blocks recall actually served, per (conversation_id, turn).
+        # A block that was recalled and then not objected to is the only
+        # positive verification signal this system can observe; see
+        # apply_accepted_verification. In memory only -- losing it on restart
+        # costs nothing but a few unknowns.
+        self._recalled_by_turn: dict = {}
 
     @staticmethod
     def _msg_text(m) -> str:
@@ -1273,7 +1280,7 @@ class Pipeline:
                         # as a dropped connection with a traceback in the log.
                         # Report it the way a status failure is reported.
                         # str() on an httpx timeout is empty, hence the type
-                        # name (see Judge._judge_block for the same trap).
+                        # name (see Judge._consolidate for the same trap).
                         detail = str(e) or type(e).__name__
                         self.wal.write({
                             "event": "upstream_transport_error",
@@ -1736,6 +1743,23 @@ class Pipeline:
                 self.index.increment_recall, block.block_id, now
             )
 
+        self._remember_recalled(
+            conversation_id, turn_index,
+            [b.block_id for b, _ in recall_blocks],
+        )
+
+    def _remember_recalled(self, conversation_id: str, turn_index: int,
+                           block_ids: List[str]):
+        if not block_ids:
+            return
+        self._recalled_by_turn[(conversation_id, turn_index)] = block_ids
+        # Only the immediately previous turn is ever read back, so this is a
+        # short tail, not a history. Bound it so a long-running server does not
+        # accumulate one entry per turn forever.
+        if len(self._recalled_by_turn) > 500:
+            for key in list(self._recalled_by_turn)[:250]:
+                del self._recalled_by_turn[key]
+
     async def _split_reasoning(
         self, text: str, conversation_id: str, turn_index: int, now: float
     ) -> List[Block]:
@@ -1778,8 +1802,41 @@ class Pipeline:
 
     async def detect_and_apply_correction(
         self, user_message: str, conversation_id: str, turn_index: int
-    ):
+    ) -> bool:
+        """Pattern-matched corrections. Runs BEFORE the turn, deliberately.
+
+        Marking the previous turn corrected here is what stops the block the
+        user is objecting to from being recalled into the very turn where they
+        object to it. The check is a regex, so it costs nothing; the model's
+        second opinion runs after the reply instead, in
+        verify_correction_with_model.
+
+        Returns whether it matched, so the caller can skip the model when the
+        answer is already known.
+        """
         if not matches_correction(user_message, self.config.correction_patterns):
+            return False
+        prev_turn = turn_index - 1
+        if prev_turn < 0:
+            return False
+        block_ids = await asyncio.to_thread(
+            self._find_turn_blocks, conversation_id, prev_turn
+        )
+        await self._mark_corrected(block_ids, "pattern")
+        return True
+
+    async def verify_correction_with_model(
+        self, user_message: str, conversation_id: str, turn_index: int
+    ):
+        """Second opinion from the small model, after the reply has gone out.
+
+        Only reached when the patterns did not match, which is the case that
+        needs help: across 395 stored blocks the pattern list had fired zero
+        times. Never runs on the request path -- the classifier is a CPU-bound
+        round trip, and verification applies to the previous turn's blocks
+        anyway, so nothing waits on it.
+        """
+        if self.verifier is None:
             return
         prev_turn = turn_index - 1
         if prev_turn < 0:
@@ -1787,9 +1844,43 @@ class Pipeline:
         block_ids = await asyncio.to_thread(
             self._find_turn_blocks, conversation_id, prev_turn
         )
+        if not block_ids:
+            return
+        previous_answer = await self._previous_answer_text(block_ids)
+        if not previous_answer:
+            return
+
+        verdict = await self.verifier.is_correction(previous_answer, user_message)
+        # None means the model failed or hedged. That is not "no" -- leave the
+        # blocks alone rather than recording a judgement nobody made.
+        if verdict is True:
+            await self._mark_corrected(block_ids, "model")
+
+    async def _previous_answer_text(self, block_ids: List[str]) -> str:
+        """The answer the user is responding to, for the correction classifier.
+
+        Prefers the result block: that is what the user actually saw. Reasoning
+        blocks hold the think trace, which the user never read and which would
+        make the classifier judge the wrong text.
+        """
+        fallback = ""
         for bid in block_ids:
+            block = await asyncio.to_thread(self.store.get, bid)
+            if block is None:
+                continue
+            if block.type == BlockType.result:
+                return block.text
+            if not fallback:
+                fallback = block.text
+        return fallback
+
+    async def _mark_corrected(self, block_ids: List[str], source: str):
+        for bid in block_ids:
+            # The source is recorded because it decides how much weight the
+            # verdict carries: a pattern match can get a block deleted
+            # outright, a model guess cannot. See Judge._should_purge.
             await asyncio.to_thread(
-                self.index.update_verification, bid, "corrected"
+                self.index.update_verification, bid, "corrected", source
             )
             block = await asyncio.to_thread(self.store.get, bid)
             if block:
@@ -1799,28 +1890,51 @@ class Pipeline:
                 "event": "verification_set",
                 "block_id": bid,
                 "verification": "corrected",
+                "source": source,
                 "timestamp": time.time(),
             })
 
     async def apply_accepted_verification(
         self, conversation_id: str, turn_index: int
     ):
+        """Mark blocks accepted when something actually happened to them.
+
+        This used to upgrade every block of the previous turn the moment a
+        next turn arrived, which is why 309 of 395 stored blocks claim to be
+        "accepted": the conversation continuing is not evidence of anything,
+        and it upgraded blocks nobody had looked at.
+
+        A block that was RECALLED into a turn and then not objected to is a
+        real event -- it was put in front of the model, it shaped an answer,
+        and the user carried on. That is the only positive signal available
+        here, so it is the only one used.
+        """
         prev_turn = turn_index - 1
         if prev_turn < 0:
             return
-        block_ids = await asyncio.to_thread(
-            self._find_turn_blocks, conversation_id, prev_turn
+        block_ids = self._recalled_by_turn.pop(
+            (conversation_id, prev_turn), []
         )
         for bid in block_ids:
             meta = await asyncio.to_thread(self.index.get_meta, bid)
+            # Anything already corrected stays corrected: a later turn that
+            # happens to recall it must not launder that away.
             if meta and meta.get("verification") == "unknown":
                 await asyncio.to_thread(
-                    self.index.update_verification, bid, "accepted"
+                    self.index.update_verification, bid, "accepted",
+                    "recalled_uncontested"
                 )
                 block = await asyncio.to_thread(self.store.get, bid)
                 if block:
                     block.verification = Verification.accepted
                     await asyncio.to_thread(self.store.put, block)
+                self.wal.write({
+                    "event": "verification_set",
+                    "block_id": bid,
+                    "verification": "accepted",
+                    "source": "recalled_uncontested",
+                    "timestamp": time.time(),
+                })
 
     def _find_turn_blocks(self, conversation_id: str, turn_index: int) -> List[str]:
         all_meta = self.index.list_meta(limit=10000)[0]

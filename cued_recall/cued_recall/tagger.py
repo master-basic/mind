@@ -9,6 +9,7 @@ import httpx
 from .config import Config
 from .index import VectorIndex
 from .models import Block
+from .small_model import SLOTS
 from .store import BlockStore
 from .taxonomy import TAXONOMY_GROUPS, TAXONOMY_VERSION, validate_gist, validate_tags
 from .wal import WAL
@@ -39,9 +40,10 @@ class Tagger:
         self.usage_sink = None
         # Tagging is fire-and-forget, one task per block, and shelving arrives
         # in batches (idle sweeps, startup). Unbounded, that stampedes a small
-        # CPU-bound model: a third of all tag calls were timing out. Let a
-        # couple through at a time and make the rest wait rather than fail.
-        self._slots = asyncio.Semaphore(2)
+        # CPU-bound model: a third of all tag calls were timing out. The limit
+        # now lives in small_model.SLOTS, shared with the correction verifier,
+        # because the thing being protected is one server, not one caller.
+        self._slots = SLOTS
 
     async def tag_block(self, block: Block):
         if not self.config.tagger.enabled:

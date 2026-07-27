@@ -45,15 +45,75 @@ recall:
   threshold: 0.62
   budget_tokens: 3000
 judge:
+  # New material since the last pass before another one is worth running.
   interval_tokens: 20000
   min_age_s: 3600
-  purge_age_s: 1209600
+  # Never recalled and older than this, and the block goes. Was 14 days, which
+  # is not a human scale for conversation memory. Safe to shorten only because
+  # purge_deletes_file is false, so purging can be undone.
+  purge_age_s: 259200
   summary_max_tokens: 400
+  # Under this, there is nothing to compress -- a summary of a paragraph is
+  # longer than the paragraph. Raise it to make the judge do less.
+  consolidate_min_tokens: 600
+  # Only the model's own think traces get rewritten. Result blocks are the
+  # answer the user actually saw and are already dense; reading blocks are
+  # pasted or fetched source material. Handed either, a small model returns a
+  # topic sentence rather than a summary, so they are left to decay instead.
+  consolidate_types:
+  - reasoning
+  # Shorter deadline for blocks the model reported as holding nothing reusable.
+  worthless_age_s: 172800
+  # Leave a block alone this long after judging it, so a pass sweeps forward
+  # instead of revisiting the same blocks.
+  rejudge_interval_s: 604800
+  # Recalled this many times or more: keep verbatim, never compress.
+  keep_recall_count: 3
+  # Purging marks the block purged and drops its search vector, which is enough
+  # to make it unrecallable and can be undone. Set true to delete the file too.
+  purge_deletes_file: false
+  max_per_pass: 200
+  # Quiet time before a consolidation pass starts. The judge runs on CPU; this
+  # keeps it out of the way of the reasoning model.
+  idle_trigger_s: 300
+  # Sweep at least this often even with no new material, so decay still happens
+  # during a quiet week.
+  sweep_interval_s: 21600
 tagger:
   enabled: true
   endpoint: ""
   max_tags: 3
   gist_max_chars: 40
+# Phrases that mark the previous answer as wrong. Anchored on purpose: a
+# "corrected" block is dropped from recall AND skips the age gate before
+# purging, so a false match destroys a good memory. Bare "wrong", "mistake",
+# "fix" and "actually" are left out for that reason -- the verifier below is
+# meant to catch what these miss.
+correction_patterns:
+- '\b(that|this|it|you)( is|''s| was| are|''re| were) (wrong|incorrect|mistaken|false)\b'
+- '\b(isn''?t|wasn''?t|aren''?t) (right|correct|true)\b'
+- '\bnot (right|correct|true)\b(?!\s+now)'
+- '\bnot what i (asked|meant|wanted|said)\b'
+- '\b(doesn''?t|does not|didn''?t|did not|won''?t|will not) work\b'
+- '\bstill (doesn''?t|does not|not) work'
+- '^\s*(that|this|it|there) (doesn''?t|does not|didn''?t|did not) exist\b'
+- '\byou made (a|an) (mistake|error)\b'
+- '\bwrong (answer|again)\b'
+- '^\s*(no|nope|nah)[,.!]'
+- 'səhv'
+- 'yanlış'
+- 'işləmir'
+- 'alınmır'
+- 'düz deyil'
+- 'doğru deyil'
+- '^\s*(yox|xeyr)[,.!]'
+verifier:
+  # Asks the small model whether a user message was correcting the previous
+  # answer, for the phrasings correction_patterns misses. Runs after the reply,
+  # never on the request path.
+  enabled: true
+  endpoint: ""
+  max_chars: 1200
 web_search:
   enabled: true
   # duckduckgo needs no key but is rate-limited unpredictably. Set a

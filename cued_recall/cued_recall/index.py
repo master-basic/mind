@@ -49,6 +49,19 @@ class VectorIndex:
             c.execute("ALTER TABLE blocks ADD COLUMN tags TEXT DEFAULT ''")
         if "gist" not in existing_cols:
             c.execute("ALTER TABLE blocks ADD COLUMN gist TEXT DEFAULT ''")
+        # 0 means never judged, which sorts first in blocks_due_for_judging --
+        # so an existing store starts by sweeping everything it has never
+        # looked at rather than revisiting its oldest blocks again.
+        if "judged_at" not in existing_cols:
+            c.execute("ALTER TABLE blocks ADD COLUMN judged_at REAL DEFAULT 0")
+        # How a verification was arrived at: "pattern", "model", "manual", or
+        # "recalled_uncontested". A correction found by a hand-tested pattern
+        # is trusted enough to delete a block outright; one guessed at by a
+        # 1.5B classifier is not. See Judge._should_purge.
+        if "verification_source" not in existing_cols:
+            c.execute(
+                "ALTER TABLE blocks ADD COLUMN verification_source TEXT DEFAULT ''"
+            )
         # If an existing block_vec was created with a different dimension,
         # drop it: a dim change invalidates stored vectors, and keeping the
         # old table makes every upsert/query raise a dim-mismatch error.
@@ -115,6 +128,18 @@ class VectorIndex:
     def delete_meta(self, block_id: str):
         with self._lock:
             self._conn.execute("DELETE FROM blocks WHERE block_id=?", (block_id,))
+            self._conn.execute("DELETE FROM block_vec WHERE block_id=?", (block_id,))
+            self._conn.commit()
+
+    def delete_vector(self, block_id: str):
+        """Drop a block's embedding but keep its metadata row.
+
+        Purging needs this: query() resolves the KNN against block_vec first
+        and only then filters by status, so a purged block that keeps its
+        vector still consumes candidate slots and still has to be discarded
+        after the fact. The row stays so the block remains auditable.
+        """
+        with self._lock:
             self._conn.execute("DELETE FROM block_vec WHERE block_id=?", (block_id,))
             self._conn.commit()
 
@@ -340,11 +365,13 @@ class VectorIndex:
             )
             self._conn.commit()
 
-    def update_verification(self, block_id: str, verification: str):
+    def update_verification(self, block_id: str, verification: str,
+                            source: str = ""):
         with self._lock:
             self._conn.execute(
-                "UPDATE blocks SET verification=? WHERE block_id=?",
-                (verification, block_id),
+                "UPDATE blocks SET verification=?, verification_source=? "
+                "WHERE block_id=?",
+                (verification, source, block_id),
             )
             self._conn.commit()
 
@@ -381,18 +408,61 @@ class VectorIndex:
             counts[key] = cnt
         return counts
 
-    def oldest_shelved_blocks(self, min_age_s: float,
-                              limit: int = 100) -> List[str]:
-        cutoff = __import__("time").time() - min_age_s
+    def blocks_due_for_judging(self, min_age_s: float,
+                               rejudge_interval_s: float,
+                               limit: int = 200) -> List[str]:
+        """Blocks the judge has not looked at recently, least recent first.
+
+        Replaces an "oldest 50 shelved" query, which never advanced: a verdict
+        of "keep" left the block shelved, so the next pass selected the same
+        50. Over 142 recorded decisions it visited 82 distinct blocks out of
+        395. Ordering by judged_at makes the pass a sweep -- never-judged
+        blocks carry 0 and come first.
+        """
+        now = __import__("time").time()
         with self._lock:
             rows = self._conn.execute("""
                 SELECT block_id FROM blocks
                 WHERE status IN ('shelved', 'truncated')
                   AND created_at < ?
+                  AND COALESCE(judged_at, 0) < ?
+                ORDER BY COALESCE(judged_at, 0) ASC, created_at ASC
+                LIMIT ?
+            """, (now - min_age_s, now - rejudge_interval_s, limit)).fetchall()
+        return [r[0] for r in rows]
+
+    def decay_candidates(self, purge_age_s: float,
+                         limit: int = 1000) -> List[str]:
+        """Blocks arithmetic alone can condemn -- no model call involved.
+
+        Deliberately NOT gated on judged_at, unlike blocks_due_for_judging.
+        Forgetting costs one query, so there is no reason to make a block wait
+        out the consolidation cycle first: rejudge_interval_s is longer than
+        purge_age_s, so gating this the same way would mean the purge cutoff
+        fired a week late, or never.
+
+        Returns a superset -- the caller re-checks each one against the real
+        rule, so this query and that rule cannot drift apart.
+        """
+        cutoff = time.time() - purge_age_s
+        with self._lock:
+            rows = self._conn.execute("""
+                SELECT block_id FROM blocks
+                WHERE status IN ('shelved', 'truncated')
+                  AND (verification = 'corrected'
+                       OR (COALESCE(recall_count, 0) = 0 AND created_at < ?))
                 ORDER BY created_at ASC
                 LIMIT ?
             """, (cutoff, limit)).fetchall()
         return [r[0] for r in rows]
+
+    def mark_judged(self, block_id: str, ts: float):
+        with self._lock:
+            self._conn.execute(
+                "UPDATE blocks SET judged_at=? WHERE block_id=?",
+                (ts, block_id),
+            )
+            self._conn.commit()
 
     def hot_blocks_older_than(self, min_age_s: float,
                               limit: int = 200) -> List[str]:

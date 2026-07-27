@@ -15,8 +15,68 @@ class JudgeConfig:
     def __init__(self, d: dict):
         self.interval_tokens: int = d.get("interval_tokens", 20000)
         self.min_age_s: int = d.get("min_age_s", 3600)
-        self.purge_age_s: int = d.get("purge_age_s", 1209600)
+        # Was 14 days, which is not a human scale for conversation memory.
+        # Shortening it is only safe because purging no longer deletes the
+        # block file by default -- see purge_deletes_file.
+        self.purge_age_s: int = d.get("purge_age_s", 259200)
         self.summary_max_tokens: int = d.get("summary_max_tokens", 400)
+        # Below this there is nothing to compress: a summary of a paragraph is
+        # longer than the paragraph. Measured on this store the mean block is
+        # 80 tokens, so the gate stops most calls from being made at all,
+        # rather than made and answered "keep".
+        self.consolidate_min_tokens: int = d.get("consolidate_min_tokens", 600)
+        # Which block types the model is allowed to rewrite. Reasoning blocks
+        # are the model's own think trace: mostly scaffolding, and compressing
+        # them 90% loses nothing. Result blocks are the answer the user
+        # actually received and are already dense; reading blocks are source
+        # material that was pasted or fetched. Measured on this store, a 1.5B
+        # model handed either of those returns a topic sentence -- a 618-token
+        # status report came back as "A project status report detailing core
+        # features, bugs fixed, and next steps." No wording fixed that; the
+        # model cannot compress dense text without discarding it. Those types
+        # are left to decay instead.
+        self.consolidate_types: List[str] = d.get(
+            "consolidate_types", ["reasoning"]
+        )
+        # A block the model reports as holding nothing reusable does not have
+        # to sit out the full purge_age_s.
+        self.worthless_age_s: int = d.get("worthless_age_s", 172800)
+        # Once judged, leave a block alone this long. Without it a pass takes
+        # the oldest blocks, changes nothing, and takes the same ones again.
+        self.rejudge_interval_s: int = d.get("rejudge_interval_s", 604800)
+        # Repeated recall is the clearest evidence a block matters. At or above
+        # this, keep it verbatim rather than compressing it.
+        self.keep_recall_count: int = d.get("keep_recall_count", 3)
+        # Marking a block purged and dropping its search vector already makes
+        # it unrecallable. Deleting the file as well cannot be undone, so it is
+        # opt-in.
+        self.purge_deletes_file: bool = d.get("purge_deletes_file", False)
+        # Blocks per pass. Passes run while the machine is idle, so this can be
+        # far more generous than the old hard-coded 50.
+        self.max_per_pass: int = d.get("max_per_pass", 200)
+        # Quiet time before a pass starts. The judge shares a CPU-only model
+        # with the tagger; running mid-conversation competes for CPU with the
+        # reasoning model the user is waiting on.
+        self.idle_trigger_s: int = d.get("idle_trigger_s", 300)
+        # Run a pass this often even when no new material has arrived, so
+        # decay still happens during a quiet week.
+        self.sweep_interval_s: int = d.get("sweep_interval_s", 21600)
+
+
+class VerifierConfig:
+    """Second opinion on whether a user message is a correction.
+
+    The pattern list only catches phrasings someone thought to write down.
+    Across 395 stored blocks it has fired zero times, so every block in the
+    archive claims to be unverified or accepted.
+    """
+
+    def __init__(self, d: dict):
+        self.enabled: bool = d.get("enabled", True)
+        # Empty = reuse judge_endpoint, as the tagger does.
+        self.endpoint: str = d.get("endpoint", "")
+        # How much of the previous answer to show the classifier.
+        self.max_chars: int = d.get("max_chars", 1200)
 
 
 class TaggerConfig:
@@ -113,8 +173,40 @@ class Config:
         self.recall = RecallConfig(raw.get("recall", {}))
         self.judge = JudgeConfig(raw.get("judge", {}))
         self.tagger = TaggerConfig(raw.get("tagger", {}))
+        self.verifier = VerifierConfig(raw.get("verifier", {}))
+        # Anchored deliberately. A false positive is expensive here: a
+        # "corrected" block is dropped from recall entirely AND skips the age
+        # gate before purging, so a bad match destroys a good memory. That
+        # rules out bare "wrong", "mistake", "fix" and "actually", all of which
+        # occur constantly in messages that correct nothing. Phrasings these
+        # miss are meant to be caught by the verifier model instead.
         self.correction_patterns: List[str] = raw.get("correction_patterns", [
-            "that's wrong", "doesn't work", "^no[,.]", "səhvdir", "işləmir",
+            # English
+            r"\b(that|this|it|you)( is|'s| was| are|'re| were) "
+            r"(wrong|incorrect|mistaken|false)\b",
+            r"\b(isn'?t|wasn'?t|aren'?t) (right|correct|true)\b",
+            # "not right now, maybe later" is a schedule, not a complaint.
+            r"\bnot (right|correct|true)\b(?!\s+now)",
+            r"\bnot what i (asked|meant|wanted|said)\b",
+            r"\b(doesn'?t|does not|didn'?t|did not|won'?t|will not) work\b",
+            r"\bstill (doesn'?t|does not|not) work",
+            # Anchored to the start of the message. Unanchored, this fired on
+            # "I know it doesn't exist yet, please create it", which is a
+            # request, not a complaint.
+            r"^\s*(that|this|it|there) (doesn'?t|does not|didn'?t|did not) exist\b",
+            r"\byou made (a|an) (mistake|error)\b",
+            r"\bwrong (answer|again)\b",
+            # Punctuation required, as in the original pattern: allowing a
+            # space here caught "no problem, carry on".
+            r"^\s*(no|nope|nah)[,.!]",
+            # Azerbaijani
+            r"səhv",
+            r"yanlış",
+            r"işləmir",
+            r"alınmır",
+            r"düz deyil",
+            r"doğru deyil",
+            r"^\s*(yox|xeyr)[,.!\s]",
         ])
         self.servers: dict = raw.get("servers", {})
         self.models_dir: str = raw.get("models_dir", "./models")

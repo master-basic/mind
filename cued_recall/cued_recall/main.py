@@ -23,6 +23,7 @@ from .router import build_admin_router
 from .store import BlockStore
 from .sysinfo import snapshot as system_snapshot
 from .tagger import Tagger
+from .verifier import CorrectionVerifier
 from .wal import WAL
 from fastapi.staticfiles import StaticFiles
 
@@ -67,12 +68,16 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
     judge = Judge(cfg, store, index, wal)
     tagger = Tagger(cfg, store, index, wal)
     pipeline.tagger = tagger
+    verifier = CorrectionVerifier(cfg, wal)
+    pipeline.verifier = verifier
 
     app = FastAPI(title="Cued Recall Middleware")
 
     judge_pass_counter = [0]
     judge_running = [False]
     judge_tokens = [0]
+    last_turn_at = [0.0]
+    last_judge_at = [time.time()]
 
     async def run_judge_pass(min_age=None):
         if judge_running[0]:
@@ -86,12 +91,18 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
             judge_running[0] = False
 
     def _accumulate_judge_tokens(n: int):
+        # Counts how much new material has arrived since the last pass, so an
+        # idle machine with nothing new does not keep sweeping. It no longer
+        # triggers the pass itself: crossing interval_tokens fired the judge
+        # mid-conversation, where a CPU-only model competes for cores with the
+        # reasoning model the user is waiting on. See consolidate_loop.
         if n <= 0:
             return
         judge_tokens[0] += n
-        if judge_tokens[0] >= cfg.judge.interval_tokens:
-            judge_tokens[0] = 0
-            asyncio.create_task(run_judge_pass())
+        # The sink fires when a turn's content is final, which for a streamed
+        # reply is when the stream drains -- so this, not the arrival of the
+        # request, is when the machine actually went quiet.
+        last_turn_at[0] = time.time()
 
     pipeline.token_sink = _accumulate_judge_tokens
 
@@ -117,6 +128,7 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
     judge.usage_sink = lambda usage: _record_usage("judge", usage)
     embed.usage_sink = lambda usage: _record_usage("embed", usage)
     tagger.usage_sink = lambda usage: _record_usage("tagger", usage)
+    verifier.usage_sink = lambda usage: _record_usage("verifier", usage)
 
     # T/S (tokens per second) tracking — ring buffer of recent completions
     tps_ring = []  # list of {"tokens": int, "elapsed": float, "tps": float, "at": float}
@@ -482,11 +494,12 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
 
     snapshot_task = None
     hot_sweep_task = None
+    consolidate_task = None
     shutdown_event = asyncio.Event()
 
     @app.on_event("startup")
     async def startup():
-        nonlocal snapshot_task, hot_sweep_task
+        nonlocal snapshot_task, hot_sweep_task, consolidate_task
 
         snapshot = snapshot_path / "latest"
         if snapshot.exists() and not any(store.blocks_dir.iterdir()):
@@ -548,6 +561,42 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
 
         hot_sweep_task = asyncio.create_task(hot_sweep_loop())
 
+        async def consolidate_loop():
+            # Consolidation is the sleep phase: it reads and rewrites blocks
+            # on a CPU-only model, so it runs when nothing is waiting on the
+            # machine rather than in the middle of a turn.
+            check_interval = 30
+            while not shutdown_event.is_set():
+                try:
+                    now = time.time()
+                    idle_for = now - last_turn_at[0]
+                    # New material to look at, or long enough since the last
+                    # sweep that decay is overdue even on a quiet week.
+                    due = (judge_tokens[0] >= cfg.judge.interval_tokens
+                           or now - last_judge_at[0] >= cfg.judge.sweep_interval_s)
+                    if (due and not judge_running[0]
+                            and idle_for >= cfg.judge.idle_trigger_s):
+                        judge_tokens[0] = 0
+                        last_judge_at[0] = now
+                        result = await run_judge_pass()
+                        wal.write({
+                            "event": "judge_pass",
+                            "trigger": "idle",
+                            "idle_for_s": round(idle_for),
+                            "processed": result.get("processed", 0),
+                            "timestamp": time.time(),
+                        })
+                except BaseException:
+                    pass
+                try:
+                    await asyncio.wait_for(
+                        shutdown_event.wait(), timeout=check_interval
+                    )
+                except asyncio.TimeoutError:
+                    pass
+
+        consolidate_task = asyncio.create_task(consolidate_loop())
+
     @app.on_event("shutdown")
     async def shutdown():
         shutdown_event.set()
@@ -555,6 +604,8 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
             snapshot_task.cancel()
         if hot_sweep_task:
             hot_sweep_task.cancel()
+        if consolidate_task:
+            consolidate_task.cancel()
         _take_snapshot(store, index, snapshot_path, chats)
         wal.close()
         embed.close()
@@ -590,8 +641,9 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
         conv_id, turn_index = _derive_conversation(body)
 
         user_message = pipeline.get_last_user_message(body)
+        last_turn_at[0] = time.time()
 
-        await pipeline.detect_and_apply_correction(
+        matched = await pipeline.detect_and_apply_correction(
             user_message, conv_id, turn_index
         )
 
@@ -601,6 +653,16 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
 
         if turn_index > 0:
             await pipeline.apply_accepted_verification(conv_id, turn_index)
+            # Only when the patterns did not already answer it, and never
+            # awaited: the classifier is a CPU-bound round trip on the small
+            # model, and it applies to the previous turn's blocks, so the reply
+            # in flight does not depend on it.
+            if not matched:
+                asyncio.create_task(
+                    pipeline.verify_correction_with_model(
+                        user_message, conv_id, turn_index
+                    )
+                )
 
         new_tokens = 0
         if isinstance(result, dict) and "stream" not in result:

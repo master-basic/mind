@@ -35,6 +35,12 @@ class Block:
     token_count: int = 0
     text: str = ""
     original_len: int = 0
+    # What text held before the judge rewrote it. Truncation replaces the
+    # block's own words with a small model's paraphrase, and unlike purging
+    # (which only flips a status and drops a vector) that could not be undone.
+    # Written once, on the first truncation, so re-summarising a summary can
+    # never lose the true original.
+    original_text: str = ""
     stimulus_text: str = ""
     verification: Verification = Verification.unknown
     recall_count: int = 0
