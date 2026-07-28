@@ -41,8 +41,18 @@ class Block:
     # Written once, on the first truncation, so re-summarising a summary can
     # never lose the true original.
     original_text: str = ""
+    # How many times the judge has rewritten this block. Bounded by
+    # judge.max_truncate_count: each rewrite has to be 20% smaller than the
+    # last, so repeated summarising converges on a topic sentence, and the
+    # earlier rounds are the only ones that were ever paying for themselves.
+    truncate_count: int = 0
     stimulus_text: str = ""
     verification: Verification = Verification.unknown
+    # User-set: exempt from decay and from consolidation, at any age. Retrieval
+    # is the only evidence this system gathers on its own that a memory matters,
+    # which leaves no way to say "keep this" about one that has not been needed
+    # yet. This is that way.
+    pinned: bool = False
     recall_count: int = 0
     last_recalled: float = 0.0
     tags: List[str] = field(default_factory=list)

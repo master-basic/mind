@@ -51,18 +51,27 @@ and runs without a model call. See **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 
 ## Features & status
 
+**Working** means implemented and used in daily runs. **Measured** means there
+is a number in [evaluate/benchmark.md](evaluate/benchmark.md) behind the claim.
+They are different words on purpose: most of this table is the first and not the
+second.
+
 | Feature | Status | Details |
 |---|---|---|
 | OpenAI-compatible chat proxy | Working | Streaming + non-streaming, `/v1/chat/completions`, `/v1/models` |
 | Reasoning/result split | Working | ` thinking` / ` response` tag parsing during streaming |
-| Semantic recall | Working | Cosine-similarity retrieval, advisory injection, budget-limited |
+| Semantic recall | Working, measured | Cosine-similarity retrieval, advisory injection, budget-limited. At threshold 0.62: recall 0.96, **false-fire rate 0.55** — it retrieves reliably and over-retrieves badly |
+| Semantic reranker | Working, unmeasured, off by default | Second stage asks the small model whether a candidate applies to this question. Turn on with `recall.judge_enabled` once `eval_retrieval.py --judge` says it pays |
+| Manual retention (pin) | Working | A pinned block is never purged and never rewritten, at any age |
+| Restore purged blocks | Working | Purging was always reversible on disk; `POST /admin/blocks/restore` re-embeds and brings it back |
 | KV-prefix-safe injection | Working | Recall is anchored to the newest user turn, so the cached prefix survives the turn |
 | Exact token accounting | Working | Block counts and near-limit prompt budgets use the model's `/tokenize`; conservative estimator otherwise |
 | Block lifecycle | Working | hot → shelved → truncated/purged; passes sweep forward, oldest-unjudged first |
 | Tagging system | Working | Auto-tags blocks with gist + tags at shelve time |
-| Correction detection | Working | 17 anchored patterns (EN + AZ), plus a few-shot yes/no classifier for what they miss |
-| Decay | Working | Purges on correction, or never-recalled past a cutoff. No model call. Reversible by default |
-| Consolidation | Working | Judge rewrites long think traces only; guarded against copied openings and non-shrinking rewrites |
+| Correction detection | Working, measured | 17 anchored patterns (EN + AZ) plus a few-shot classifier. Patterns: precision 0.87, recall 0.76, **false-positive rate 0.12** on 34 hand-labelled rows |
+| Decay | Working | Purges on correction, or never-recalled past a cutoff. No model call. Reversible by default. See the retention guarantees below |
+| Consolidation | Working | Judge rewrites long think traces only; guarded against copied openings and non-shrinking rewrites; capped at `max_truncate_count` rewrites per block |
+| Bounded judge pass | Working | Wall-clock ceiling per pass; a pass that runs out of time resumes where it stopped. `judge_pass` records elapsed, visits, and model calls |
 | Idle consolidation | Working | Passes run after a quiet period, not mid-conversation |
 | Web search | Working | 4 backends: DuckDuckGo (free), Brave, Serper, SearXNG |
 | Web fetch | Working | SSRF-guarded, HTML-to-text, JSON detection |
@@ -87,10 +96,23 @@ and runs without a model call. See **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 | Force search heuristics | Working | Auto-detects search-like queries |
 | Retrieval benchmark | Working | Threshold sweep over a hand-built corpus, with false-fire rate |
 | End-to-end benchmark | Harness only | A/B script + paired analysis; results are hand-graded, not yet published |
-| Semantic recall judge | Planned | Two-stage recall to cut trap/distractor false fires — see `evaluate/semantic_judge_plan.md` |
 | KV cache management | In progress | Clear endpoint exists; slot save/restore is Phase 2 |
+| Retry/circuit breaking | Not started | External calls (search, embed, upstream) fail soft and are logged, but nothing backs off or trips |
 | Multi-user/isolation | Not started | Single-user alpha |
 | Authentication/TLS | Not started | Open on localhost only |
+
+### What the memory will and will not delete
+
+| Guarantee | |
+|---|---|
+| A pinned block | Never purged, never rewritten, at any age |
+| A block that has ever been recalled | Never purged by the age cutoff |
+| Any purge | Reversible — status flip plus vector drop, file kept unless `purge_deletes_file` |
+| A regex-matched correction | Stops being recalled at once; can only purge after `corrected_grace_s`, and never if the block was ever recalled |
+
+`purge_age_s` is 3 days, and read on its own that sounds alarming. It applies
+only to blocks that are unpinned, were never once retrieved, and can be
+restored afterwards.
 
 ---
 
@@ -142,7 +164,9 @@ All routes are on the middleware (default `127.0.0.1:8000`).
 | `GET` | `/admin/blocks` | List blocks (filterable, paginated) |
 | `GET` | `/admin/blocks/{id}` | Full block details + WAL history |
 | `POST` | `/admin/blocks/{id}/verify` | Set verification (accepted/corrected) |
-| `POST` | `/admin/blocks/delete` | Batch delete blocks |
+| `POST` | `/admin/blocks/{id}/pin` | Pin/unpin — a pinned block never decays or gets rewritten |
+| `POST` | `/admin/blocks/restore` | Bring purged blocks back and re-embed them |
+| `POST` | `/admin/blocks/delete` | Batch delete blocks (this one is not reversible) |
 | `GET` | `/admin/tags` | Tag taxonomy + counts |
 | `POST` | `/admin/judge/run` | Force judge pass |
 | `POST` | `/admin/kv/clear` | Clear KV caches |
@@ -217,12 +241,17 @@ Settings live in `cued_recall/config.yaml` (gitignored, auto-created from `confi
 | `recall.k` | 4 | Top blocks to retrieve |
 | `recall.threshold` | 0.62 | Cosine similarity threshold |
 | `recall.budget_tokens` | 3000 | Max injected recall tokens |
+| `recall.judge_enabled` | false | Second-stage relevance filter on the small model |
+| `recall.judge_timeout_s` | 5.0 | Per candidate; a timeout keeps the block |
 | `judge.interval_tokens` | 20000 | New material before a pass is worth running |
 | `judge.idle_trigger_s` | 300 | Quiet time before a consolidation pass starts |
 | `judge.sweep_interval_s` | 21600 | Sweep at least this often even with no new material, so decay still happens in a quiet week |
 | `judge.purge_age_s` | 259200 | Never recalled and older than this (3 days) → purge |
 | `judge.worthless_age_s` | 172800 | Shorter deadline for blocks the model found nothing reusable in |
-| `judge.max_per_pass` | 200 | Blocks the model may be asked to rewrite in one pass |
+| `judge.corrected_grace_s` | 86400 | A pattern-matched correction cannot purge before this, and never if the block was recalled |
+| `judge.max_truncate_count` | 2 | Rewrites allowed per block, ever |
+| `judge.max_pass_seconds` | 600 | Wall-clock ceiling on one pass |
+| `judge.max_per_pass` | 200 | Blocks visited in one pass |
 | `judge.consolidate_min_tokens` | 600 | Below this, the model is not called at all |
 | `judge.consolidate_types` | `[reasoning]` | Block types the model may rewrite |
 | `judge.keep_recall_count` | 3 | Recalled this often → keep verbatim, never compress |
@@ -250,9 +279,11 @@ mind/
 ├── logs/                            # Per-server llama-server stdout
 ├── snapshots/                       # Block store backups (persistent)
 ├── evaluate/                        # Retrieval + end-to-end benchmarks
-│   ├── benchmark.md                 # Method notes
+│   ├── benchmark.md                 # Method notes and results
 │   ├── corpus.jsonl                 # Hand-built probe corpus, 6 relation types
-│   ├── eval_retrieval.py            # Threshold sweep (no generation)
+│   ├── corrections.jsonl            # Labelled correction/not-correction rows
+│   ├── eval_retrieval.py            # Threshold sweep (no generation), --judge arm
+│   ├── eval_correction.py           # Precision/recall/false-positive rate for corrections
 │   ├── eval_e2e.py                  # A/B: direct vs through the middleware
 │   ├── analyse.py                   # Paired analysis + bootstrap CI
 │   ├── inspect_blocks.py            # Look at what is actually stored
@@ -307,6 +338,21 @@ The corpus is hand-written from real recurring work, with adversarial members in
 every family: `exact`, `paraphrase` and `crosslingual` (Azerbaijani) must recall;
 `trap` (same vocabulary, different answer) should fire but must not be reused
 blindly; `distractor` and `control` must not fire.
+
+Add `--judge` to run the second-stage relevance filter as a second arm and print
+both columns side by side. That is the number that decides whether
+`recall.judge_enabled` should be on.
+
+**Correction detection** — how often does it fire on something that was not a
+correction? Needs no servers:
+
+```bash
+python evaluate/eval_correction.py --no-model
+```
+
+Drop `--no-model` to score the classifier too. `--from-chats <chats.db>` mines
+real user messages for labelling, which is the only way the negative half stops
+reflecting only what someone thought to test.
 
 **End-to-end** — does having the block help? Slow and noisy, so `--repeats 3`
 with paired analysis:

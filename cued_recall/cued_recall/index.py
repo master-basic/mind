@@ -62,6 +62,11 @@ class VectorIndex:
             c.execute(
                 "ALTER TABLE blocks ADD COLUMN verification_source TEXT DEFAULT ''"
             )
+        # Set by hand, never inferred. A pinned block is skipped by both
+        # decay_candidates and blocks_due_for_judging, so nothing automatic can
+        # delete it or paraphrase it away. Existing rows default to 0.
+        if "pinned" not in existing_cols:
+            c.execute("ALTER TABLE blocks ADD COLUMN pinned INTEGER DEFAULT 0")
         # If an existing block_vec was created with a different dimension,
         # drop it: a dim change invalidates stored vectors, and keeping the
         # old table makes every upsert/query raise a dim-mismatch error.
@@ -207,7 +212,7 @@ class VectorIndex:
     # Whitelist for ORDER BY. The column name cannot be bound as a parameter,
     # so it is interpolated -- only ever from this set.
     SORTABLE = {"created_at", "token_count", "recall_count", "last_recalled",
-                "turn_index", "type", "status", "verification"}
+                "turn_index", "type", "status", "verification", "pinned"}
 
     def list_meta(self, status: Optional[str] = None,
                   type_: Optional[str] = None,
@@ -216,6 +221,7 @@ class VectorIndex:
                   recall_min: Optional[int] = None,
                   recall_max: Optional[int] = None,
                   older_than: Optional[float] = None,
+                  pinned: Optional[bool] = None,
                   sort: str = "created_at", order: str = "desc",
                   limit: int = 100, offset: int = 0) -> Tuple[List[dict], int]:
         where = []
@@ -243,6 +249,9 @@ class VectorIndex:
         if older_than is not None:
             where.append("created_at < ?")
             params.append(older_than)
+        if pinned is not None:
+            where.append("COALESCE(pinned, 0) = ?")
+            params.append(1 if pinned else 0)
         clause = " AND ".join(where) if where else "1"
         sort_col = sort if sort in self.SORTABLE else "created_at"
         direction = "ASC" if str(order).lower() == "asc" else "DESC"
@@ -375,6 +384,14 @@ class VectorIndex:
             )
             self._conn.commit()
 
+    def set_pinned(self, block_id: str, pinned: bool):
+        with self._lock:
+            self._conn.execute(
+                "UPDATE blocks SET pinned=? WHERE block_id=?",
+                (1 if pinned else 0, block_id),
+            )
+            self._conn.commit()
+
     def increment_recall(self, block_id: str, ts: float):
         with self._lock:
             self._conn.execute(
@@ -424,6 +441,7 @@ class VectorIndex:
             rows = self._conn.execute("""
                 SELECT block_id FROM blocks
                 WHERE status IN ('shelved', 'truncated')
+                  AND COALESCE(pinned, 0) = 0
                   AND created_at < ?
                   AND COALESCE(judged_at, 0) < ?
                 ORDER BY COALESCE(judged_at, 0) ASC, created_at ASC
@@ -449,6 +467,7 @@ class VectorIndex:
             rows = self._conn.execute("""
                 SELECT block_id FROM blocks
                 WHERE status IN ('shelved', 'truncated')
+                  AND COALESCE(pinned, 0) = 0
                   AND (verification = 'corrected'
                        OR (COALESCE(recall_count, 0) = 0 AND created_at < ?))
                 ORDER BY created_at ASC

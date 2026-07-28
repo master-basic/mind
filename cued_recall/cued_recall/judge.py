@@ -122,13 +122,29 @@ class Judge:
         return (f"{text[:half]}\n\n[... {omitted:,} characters omitted "
                 f"from the middle ...]\n\n{text[-half:]}")
 
-    async def run_pass(self, min_age: Optional[float] = None) -> int:
+    async def run_pass(self, min_age: Optional[float] = None) -> dict:
+        """One sweep. Returns counters, so a pass is a measurable event.
+
+        Bounded two ways, because "it terminates" should be a property of the
+        loop rather than a consequence of arithmetic elsewhere. max_per_pass
+        caps how many blocks are looked at; max_pass_seconds caps how long the
+        looking may take. Without the second, a store where most blocks do
+        qualify for a rewrite could hold a CPU-only model for hours -- the
+        blocks that skip cost two DB reads, but the ones that don't cost a
+        generation each.
+        """
+        started = time.time()
+        deadline = started + max(1, self.config.judge.max_pass_seconds)
+        counts = {"purged": 0, "truncated": 0, "model_calls": 0,
+                  "visited": 0, "stopped_early": False}
+
         # Forgetting first, and separately: it needs no model call, so it is
         # not rate-limited by the consolidation cycle. Keeping the two in one
         # loop meant a block judged at an hour old was marked and then left
         # alone for rejudge_interval_s -- longer than purge_age_s, so the
         # purge cutoff would have fired a week late.
-        processed = await self._decay_sweep()
+        decayed = await self._decay_sweep()
+        counts["purged"] += decayed
 
         # Manual runs pass min_age=0 to judge all shelved blocks now; the
         # automatic (idle-triggered) pass uses the configured age gate.
@@ -141,11 +157,26 @@ class Judge:
             self.config.judge.max_per_pass,
         )
         for bid in block_ids:
+            if time.time() >= deadline:
+                # Not marked judged, so the next pass resumes here rather than
+                # starting over: judged_at ordering makes the sweep pick up
+                # where the clock cut it off.
+                counts["stopped_early"] = True
+                break
             block = await asyncio.to_thread(self.store.get, bid)
             if block is None:
                 continue
             action, detail = await self._consider(block)
-            processed += 1
+            counts["visited"] += 1
+            if action == "purge":
+                counts["purged"] += 1
+            elif action == "truncate":
+                counts["truncated"] += 1
+            # _consider reports it, rather than the action name implying it:
+            # "purge" covers both a decay hit that costs nothing and a model
+            # that answered "nothing here worth keeping".
+            if detail.pop("model_call", False):
+                counts["model_calls"] += 1
             # Record the visit whatever the outcome. Without this a pass takes
             # the oldest blocks, mostly changes nothing, and the next pass
             # takes exactly the same ones -- which is why 345 of 395 blocks had
@@ -160,7 +191,10 @@ class Judge:
                 "timestamp": time.time(),
                 **detail,
             })
-        return processed
+        counts["elapsed_s"] = round(time.time() - started, 1)
+        counts["decay_purged"] = decayed
+        counts["processed"] = decayed + counts["visited"]
+        return counts
 
     async def _decay_sweep(self) -> int:
         """Purge on age and recall count alone, before anything is sent out.
@@ -180,9 +214,11 @@ class Judge:
             verification = meta.get("verification", "unknown") if meta else "unknown"
             recall_count = meta.get("recall_count", 0) if meta else 0
             source = meta.get("verification_source", "") if meta else ""
+            pinned = bool((meta or {}).get("pinned") or block.pinned)
             age = time.time() - block.created_at
             if not self._should_purge(verification, recall_count, age,
-                                      worthless=False, source=source):
+                                      worthless=False, source=source,
+                                      pinned=pinned):
                 continue
             await self._purge_block(block)
             removed += 1
@@ -192,6 +228,9 @@ class Judge:
                 "action": "purge",
                 "reason": ("corrected" if verification == "corrected"
                            else "never_recalled"),
+                # Which verdict earned it, so a purge can be traced back to a
+                # regex, a classifier, or a button.
+                "verification_source": source,
                 "age_days": round(age / 86400, 1),
                 "decided_by": "decay",
                 "timestamp": time.time(),
@@ -203,17 +242,24 @@ class Judge:
         verification = "unknown"
         recall_count = 0
         source = ""
+        pinned = bool(block.pinned)
         if meta:
             verification = meta.get("verification", "unknown")
             recall_count = meta.get("recall_count", 0)
             source = meta.get("verification_source", "")
+            pinned = bool(meta.get("pinned") or block.pinned)
         age = time.time() - block.created_at
         cfg = self.config.judge
+
+        # The index query already excludes pinned blocks. Checked again here so
+        # a caller that reaches _consider by another route cannot bypass it.
+        if pinned:
+            return "skip_pinned", {}
 
         # Forgetting first: it is arithmetic, so it costs no model call and
         # settles the blocks that were never going to be worth compressing.
         if self._should_purge(verification, recall_count, age,
-                              worthless=False, source=source):
+                              worthless=False, source=source, pinned=pinned):
             await self._purge_block(block)
             reason = ("corrected" if verification == "corrected"
                       else "never_recalled")
@@ -230,57 +276,88 @@ class Judge:
         if block.token_count < cfg.consolidate_min_tokens:
             return "skip_small", {"token_count": block.token_count}
 
+        # Each rewrite is a paraphrase of a paraphrase, and every round costs a
+        # generation whether or not it produces anything usable. Past a couple
+        # of rounds there is no compression left to win -- MIN_SHRINK sees to
+        # that -- so stop asking rather than re-deciding weekly forever.
+        if block.truncate_count >= cfg.max_truncate_count:
+            return "skip_max_truncations", {
+                "truncate_count": block.truncate_count,
+            }
+
         was = block.token_count
         summary = await self._consolidate(block)
 
         if summary is None:
-            return "no_decision", {}
+            return "no_decision", {"model_call": True}
 
         if summary == "":
             # The model found nothing reusable. That is a weaker signal than a
             # correction, so it shortens the wait rather than skipping it.
             if self._should_purge(verification, recall_count, age,
-                                  worthless=True, source=source):
+                                  worthless=True, source=source, pinned=pinned):
                 await self._purge_block(block)
                 return "purge", {"reason": "worthless",
-                                 "age_days": round(age / 86400, 1)}
-            return "worthless_kept", {"age_days": round(age / 86400, 1)}
+                                 "age_days": round(age / 86400, 1),
+                                 "model_call": True}
+            return "worthless_kept", {"age_days": round(age / 86400, 1),
+                                      "model_call": True}
 
         if self._is_copied_opening(summary, block.text):
             # Seen on a 2,091-token block: the "summary" was the first two
             # sentences of the original, word for word. That is not a
             # compression of the block, it is the loss of 98% of it, and the
             # size check below waves it through precisely because it is small.
-            return "summary_was_copied", {"was": was}
+            return "summary_was_copied", {"was": was, "model_call": True}
 
         got = await self._count_tokens(summary)
         if got > was * self.MIN_SHRINK:
-            return "summary_not_shorter", {"was": was, "got": got}
+            return "summary_not_shorter", {"was": was, "got": got,
+                                           "model_call": True}
 
         await self._truncate_block(block, summary, got)
-        return "truncate", {"was": was, "got": got}
+        return "truncate", {"was": was, "got": got, "model_call": True,
+                            "truncate_count": block.truncate_count}
 
     def _should_purge(self, verification: str, recall_count: int,
                       age: float, worthless: bool,
-                      source: str = "") -> bool:
+                      source: str = "", pinned: bool = False) -> bool:
         """Decay, as plain arithmetic.
 
         A corrected answer is actively harmful if it is recalled again, so it
-        goes regardless of age -- but only when the correction came from a
-        hand-tested pattern or the user pressing the button. A correction the
-        1.5B classifier guessed at does not get that power: measured on a
-        hand-built set it is right 13 times in 14, and its one miss reads
-        "now do the same for the firewall" as a complaint. Wrong there would
-        mean deleting a memory that was being recalled and was fine, so a
-        model-sourced correction still has to clear the ordinary
-        never-recalled-and-old bar.
+        stops being recalled the moment it is marked -- but how fast the block
+        itself goes depends on who said so, because the three sources are not
+        equally reliable:
+
+        | source    | effect                                                  |
+        |-----------|---------------------------------------------------------|
+        | manual    | Purge at once. The user pressed the button.             |
+        | pattern   | Purge only if it was never recalled, and only after     |
+        |           | corrected_grace_s. 17 regexes with no measured           |
+        |           | false-positive rate should not be able to delete a       |
+        |           | memory the system was actively using; dropping it from   |
+        |           | recall already removes the harm, and the grace window    |
+        |           | leaves time to notice and unpin/pin it.                  |
+        | model     | Must clear the ordinary never-recalled-and-old bar. The  |
+        |           | 1.5B classifier scores 13/14 on a hand-built set of 14,  |
+        |           | which is too small a sample to license deletion, and its |
+        |           | known miss reads "now do the same for the firewall" as   |
+        |           | a complaint.                                             |
 
         Everything else has to have been never once recalled -- retrieval is
-        the only evidence available that a memory is load-bearing.
+        the only evidence this system gathers on its own that a memory is
+        load-bearing, which is exactly why a pin exists for the memories it
+        cannot gather it about.
         """
         cfg = self.config.judge
-        if verification == "corrected" and source != "model":
-            return True
+        if pinned:
+            return False
+        if verification == "corrected":
+            if source == "manual":
+                return True
+            if source == "pattern":
+                return recall_count == 0 and age > cfg.corrected_grace_s
+            # source == "model", or unrecorded: no special power, fall through.
         if recall_count > 0:
             return False
         if worthless:
@@ -544,6 +621,7 @@ class Judge:
         block.text = summary
         block.original_len = block.token_count
         block.token_count = new_tokens
+        block.truncate_count += 1
         block.status = BlockStatus.truncated
         await asyncio.to_thread(self.store.put, block)
         await asyncio.to_thread(

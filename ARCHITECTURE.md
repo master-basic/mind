@@ -72,8 +72,30 @@ The central abstraction is a **Block** — a chunk of reasoning or result text w
 
     purged: status flipped and embedding dropped, so the block is
             unrecallable but recoverable; the msgpack file is deleted
-            only when purge_deletes_file is set
+            only when purge_deletes_file is set. POST /admin/blocks/restore
+            brings it back and re-embeds it.
+
+    pinned: orthogonal to status, set only by hand. A pinned block is
+            skipped by both decay and consolidation at any age, so it
+            keeps its own words indefinitely.
 ```
+
+### Retention guarantees
+
+Three of them, in the order they are checked:
+
+1. **A pinned block is never purged and never rewritten.** Nothing automatic
+   can override it; `POST /admin/blocks/{id}/pin` is the only way in or out.
+2. **A block that has ever been recalled is never purged by age.** Retrieval is
+   the only evidence the system gathers on its own that a memory is
+   load-bearing.
+3. **Purging is reversible.** It flips a status and drops the search vector;
+   the msgpack file survives unless `purge_deletes_file` is set, and restore
+   re-embeds from it.
+
+The pin exists because guarantee 2 only covers memories the system has already
+needed. A note that will matter next month has no recall count to protect it,
+and until there was a pin there was no way for a user to say so.
 
 ### Transitions
 
@@ -93,9 +115,21 @@ The two are deliberately separate, and only one of them uses the model.
 
 | Condition | Result |
 |---|---|
-| `verification == "corrected"` | Purge at once, at any age — a wrong answer is harmful if recalled again. |
+| Pinned | Never purged, at any age, for any reason below. |
+| `corrected`, source `manual` | Purge at once. The user pressed the button. |
+| `corrected`, source `pattern` | Stop recalling it at once; purge only if never recalled and older than `corrected_grace_s`. |
+| `corrected`, source `model` | No special power — must clear the ordinary bar below. |
 | Never recalled, older than `purge_age_s` | Purge. Retrieval is the only evidence available that a memory is load-bearing. |
 | Model found nothing reusable, never recalled, older than `worthless_age_s` | Purge. |
+
+The three correction sources are weighted apart because they are not equally
+reliable, and the expensive direction is a false positive. Measured on a
+34-row hand-labelled set (`evaluate/eval_correction.py`), the 17 anchored
+patterns score precision 0.87, recall 0.76, and a **false-positive rate of
+0.12** — two of seventeen ordinary messages read as complaints. A detector that
+wrong should not be able to delete anything, so a pattern hit now hides a
+memory for a day rather than destroying it. The classifier's 13/14 is a sample
+of fourteen and is treated as weaker still.
 
 Purging sets `status = purged` and drops the block's row from `block_vec`, which is enough to make it unrecallable and can be undone. The msgpack file survives unless `purge_deletes_file` is set.
 
@@ -108,6 +142,14 @@ Three guards sit between its answer and the archive:
 | `_is_copied_opening` | A 2,091-token block came back as its own first two sentences, verbatim. That is not compression, it is 98% loss, and the size check waves it through *because* it is small. |
 | `MIN_SHRINK` (0.8) | A rewrite must be at least 20% smaller to be worth losing the original wording. |
 | `original_text` | The pre-rewrite text is kept on first truncation, so a small model's paraphrase is never the only copy. |
+
+And it terminates. `max_truncate_count` (default 2) caps how many times any
+block may be rewritten, ever — each round paraphrases the last, and `MIN_SHRINK`
+guarantees there is little left to win after the first two. `max_pass_seconds`
+caps the pass itself: a pass that runs out of time stops without marking the
+remainder judged, so `judged_at` ordering makes the next one resume where the
+clock cut it off rather than start over. Neither bound depends on the shrink
+arithmetic happening to converge.
 
 Why only `reasoning` blocks: a think trace is mostly scaffolding and compresses ~90% with nothing lost. `result` blocks are the answer the user actually saw and are already dense; `reading` blocks are pasted or fetched source material. Measured against this store, a 1.5B model handed either returns a topic sentence — a 618-token status report came back as *"A project status report detailing core features, bugs fixed, and next steps."* No wording fixed that. Those types are left to decay instead.
 
@@ -138,7 +180,12 @@ User sends /v1/chat/completions
 │   Embeds user message via Embedding server (port 8082)
 │   Queries block_vec (sqlite-vec) for top-k cosine similarity matches
 │   Filters: skip corrected blocks, skip oversized (> budget_tokens=3000)
-│   Returns 0-4 blocks
+│   Then, if recall.judge_enabled: _filter_by_relevance() asks the small
+│   model whether each survivor actually applies to THIS question, in
+│   parallel but through the shared small-model semaphore. Fail-open.
+│   Returns 0-4 blocks. These, and only these, are the blocks "served" for
+│   the turn: recall_count is incremented for exactly this set, and it is
+│   what apply_accepted_verification reads back next turn.
 │
 ├─ build_recall_injection()
 │   Formats recalled blocks into a text prefix with similarity scores
@@ -176,8 +223,11 @@ User sends /v1/chat/completions
 │
 ├─ apply_accepted_verification()
 │   Marks accepted only those previous-turn blocks that recall actually
-│   SERVED and that were not then objected to. A turn merely happening is
-│   not evidence — that version left 309 of 395 blocks claiming "accepted".
+│   SERVED — the set recorded by _remember_recalled above, i.e. what
+│   survived the budget filter and the relevance judge and was put in
+│   front of the model — and that were not then objected to. A turn merely
+│   happening is not evidence; that version left 309 of 395 blocks
+│   claiming "accepted".
 │
 ├─ verify_correction_with_model()   [fire-and-forget, only if no pattern hit]
 │   Few-shot yes/no on the small model for the phrasings the patterns miss
@@ -231,6 +281,18 @@ and hides that it did. Every token costs at least one byte, so a payload smaller
 than the budget *in bytes* provably cannot exceed it in tokens; anything larger
 is measured properly. `exact_count_threshold` remains as a second trigger for a
 payload that is compact but dense.
+
+This is why the estimator's error on non-English text cannot overflow the
+window, and it is a proof rather than a hope — but only if the byte count
+covers everything the template will render. Tool schemas are charged to the
+budget through `_payload_overhead_tokens`, which is itself an estimate, so
+leaving them out of the byte side compared a measurement against a guess: a
+client shipping a dozen JSON-Schema tool definitions could clear the proof on
+the strength of it. `_tools_bytes` closes that.
+
+Every turn writes a `prompt_budget` WAL record — `count_method`, `counted_tokens`,
+`limit`, `payload_bytes`, `byte_proof` — so which path decided a given prompt is
+readable afterwards instead of being asserted here.
 
 Byte-based estimation exists for the same reason: characters per token range from
 2.54 (Azerbaijani) to 4.50 (English prose) against this tokenizer, while bytes per
@@ -351,10 +413,18 @@ also means there is a server-side log to read when a slot does wedge.
 
 - Location: `{store_path}/wal.jsonl`
 - Append-only JSONL audit trail for all lifecycle events
-- Turn/recall: `turn_completed`, `recall_budget`, `recall_embed_error`, `context_overflow_retry`, `upstream_error`, `upstream_transport_error`, `embed_store_error`, `web_search_error`, `chat_record_error`
+- Turn/recall: `turn_completed`, `prompt_budget`, `recall_budget`, `recall_embed_error`, `recall_judge_error`, `context_overflow_retry`, `upstream_error`, `upstream_transport_error`, `embed_store_error`, `web_search_error`, `chat_record_error`
 - Lifecycle: `tagged`, `tagger_error`, `verification_set`, `verifier_error`, `idle_shelve`, `startup_shelve`
 - Judge: `judge_pass`, `judge_action`, `judge_error`, `judge_parse_failed`, `judge_overflow_retry`, `judge_schema_unsupported`
-- Admin: `admin_verify`, `admin_delete_blocks`, `admin_import`, `admin_kv_clear`, `admin_server_restart`
+- Admin: `admin_verify`, `admin_pin`, `admin_restore`, `admin_delete_blocks`, `admin_import`, `admin_kv_clear`, `admin_server_restart`
+
+`judge_pass` carries the counters a pass produced — `elapsed_s`, `visited`,
+`model_calls`, `purged`, `truncated`, `stopped_early`. Most visits cost two DB
+reads and no generation (a rewrite needs type `reasoning`, ≥ `consolidate_min_tokens`,
+and fewer than `keep_recall_count` recalls), so `model_calls` against `visited`
+is what separates "the judge keeps up with the store" from "the judge is falling
+behind it", and a run of `stopped_early` says the store has outgrown
+`max_pass_seconds`.
 - `judge_action` carries the outcome per block: `purge`, `truncate`, `keep_recalled`, `skip_type`, `skip_small`, `worthless_kept`, `summary_was_copied`, `summary_not_shorter`, `no_decision`. Counting these is how you tell "the judge is working and there is nothing to do" apart from "the judge is broken" — the distinction the old all-`keep` log could not make.
 
 ---
@@ -412,7 +482,7 @@ was on screen:
 |---|---|---|
 | Live | Per-server context usage, GPU/system telemetry, uptime, block stats, throughput | `/admin/models`, `/admin/system`, `/admin/stats`, `/admin/tps`, `/admin/wedge` |
 | Memory | Memory health, per-turn recall budget decisions, token distribution, store growth, most-recalled blocks | `/admin/stats/budget`, `/admin/stats/distribution`, `/admin/stats/growth`, `/admin/stats/recall` |
-| Blocks | Paged, filterable block table with bulk actions | `/admin/blocks`, `/admin/blocks/{id}`, `/admin/blocks/delete` |
+| Blocks | Paged, filterable block table; pin toggle per row, bulk restore and delete | `/admin/blocks`, `/admin/blocks/{id}`, `/admin/blocks/{id}/pin`, `/admin/blocks/restore`, `/admin/blocks/delete` |
 
 Two details worth keeping:
 
@@ -437,8 +507,14 @@ nothing:
 
 | Harness | Question | Cost |
 |---|---|---|
-| `eval_retrieval.py` | Does the right block come back? | Seconds, deterministic, no generation. Sweeps `recall.threshold` from 0.30 to 0.94 and writes `retrieval_sweep.csv`. `--fake` self-tests with synthetic vectors and no servers. |
+| `eval_retrieval.py` | Does the right block come back? | Seconds, deterministic, no generation. Sweeps `recall.threshold` from 0.30 to 0.94 and writes `retrieval_sweep.csv`. `--judge` adds the relevance filter and prints both arms side by side. `--fake` self-tests with synthetic vectors and no servers. |
+| `eval_correction.py` | How often does correction detection fire on something that was not a correction? | Instant with `--no-model`. Scores the shipped patterns and the shipped classifier against a labelled set; `--from-chats` mines candidate rows out of a live `chats.db` for labelling. |
 | `eval_e2e.py` | Does having the block actually help? | Slow and noisy. A/B: baseline goes straight to `:8080`, treatment through the middleware, store wiped and re-warmed per repeat, `temperature: 0`, fixed seed, `--repeats 3`. |
+
+Both evals import the prompt the middleware actually sends
+(`utils.relevance_prompt`, `CorrectionVerifier._prompt`) rather than a copy. A
+harness that scores its own private wording measures nothing about the system,
+and a copy drifts the first time either prompt is tuned.
 
 `analyse.py` pairs each probe against itself across arms and bootstraps a CI —
 between-prompt variance is enormous (some questions produce 800 tokens of
@@ -455,10 +531,15 @@ hand-graded, since no script can catch a model anchoring confidently on a
 recalled block that did not apply.
 
 What the sweep shows: recall and false-fire trade against each other with no
-clean separation — false fires only reach zero around 0.86, where recall has
-already fallen to 0.58. `semantic_judge_plan.md` is the proposed answer: a
-second stage that asks the judge model whether a candidate block actually helps,
-filtering KNN results before injection. Not implemented yet.
+clean separation — at the shipped threshold of 0.62, recall is 0.96 and the
+false-fire rate is 0.55; false fires only reach zero around 0.86, where recall
+has already fallen to 0.58.
+
+That is what `recall.judge_enabled` is for. The second stage is now implemented
+(`_filter_by_relevance`), and it ships **off**, because the sweep that would
+justify turning it on has not been run yet — `eval_retrieval.py --judge` runs
+both arms in one command and prints the numbers at 0.62. Turning it on before
+then would be the same assertion the embedding-only "working" claim was.
 
 ---
 

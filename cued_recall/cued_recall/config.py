@@ -9,6 +9,16 @@ class RecallConfig:
         self.k: int = d.get("k", 4)
         self.threshold: float = d.get("threshold", 0.62)
         self.budget_tokens: int = d.get("budget_tokens", 3000)
+        # Second stage: ask the small model whether a candidate the vector
+        # search returned actually helps with THIS question. Similarity alone
+        # cannot separate a block about phase 1 from a question about phase 2
+        # (measured 0.841 on this corpus) or vocabulary overlap from relevance
+        # (0.708) -- both fire above threshold. Off by default: it costs a
+        # round trip per candidate on the request path, and it should be turned
+        # on because the sweep in evaluate/ says it helps, not on faith.
+        self.judge_enabled: bool = d.get("judge_enabled", False)
+        # Per candidate. Short, because they run while the user waits.
+        self.judge_timeout_s: float = d.get("judge_timeout_s", 5.0)
 
 
 class JudgeConfig:
@@ -41,6 +51,21 @@ class JudgeConfig:
         # A block the model reports as holding nothing reusable does not have
         # to sit out the full purge_age_s.
         self.worthless_age_s: int = d.get("worthless_age_s", 172800)
+        # How long a pattern-matched correction waits before it can purge. The
+        # block stops being recalled the moment it is marked, so this window
+        # costs nothing but the disk it sits on, and it is the difference
+        # between a false regex match hiding a memory and destroying it.
+        self.corrected_grace_s: int = d.get("corrected_grace_s", 86400)
+        # How many times the same block may be rewritten, ever. Each round is a
+        # paraphrase of a paraphrase and costs a generation; MIN_SHRINK means
+        # there is little left to win after the first two.
+        self.max_truncate_count: int = d.get("max_truncate_count", 2)
+        # Wall-clock ceiling on one pass. max_per_pass bounds how many blocks
+        # are looked at, but not what looking costs -- a store where most
+        # blocks qualify for a rewrite would otherwise hold a CPU-only model
+        # for hours. A pass that runs out of time stops without marking the
+        # rest judged, so the next one resumes where it stopped.
+        self.max_pass_seconds: int = d.get("max_pass_seconds", 600)
         # Once judged, leave a block alone this long. Without it a pass takes
         # the oldest blocks, changes nothing, and takes the same ones again.
         self.rejudge_interval_s: int = d.get("rejudge_interval_s", 604800)

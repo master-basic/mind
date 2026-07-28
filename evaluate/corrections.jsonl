@@ -1,0 +1,34 @@
+{"message": "that's wrong, the flag is --no-kv-offload not --kv-offload", "answer": "Use --kv-offload to keep the cache in RAM.", "is_correction": true}
+{"message": "it doesn't work, same error as before", "answer": "Restart the service and it will pick up the new config.", "is_correction": true}
+{"message": "that gave me: package not found", "answer": "Run apt install llama-server.", "is_correction": true}
+{"message": "no such file on my system", "answer": "The config lives at /etc/foo.conf.", "is_correction": true}
+{"message": "still doesn't work after the restart", "answer": "Restart nginx to apply it.", "is_correction": true}
+{"message": "that is not correct, DKIM uses the selector in the DNS name", "answer": "DKIM selectors are stored in the message body.", "is_correction": true}
+{"message": "are you sure? the docs say the default is 10", "answer": "The default is 5.", "is_correction": true}
+{"message": "nope, that port is already in use", "answer": "Bind the server to 8080.", "is_correction": true}
+{"message": "you made a mistake in the second command", "answer": "Run these two commands in order.", "is_correction": true}
+{"message": "wrong answer again, I asked about phase 2", "answer": "For phase 1, check the proposal list.", "is_correction": true}
+{"message": "it returns 404 when I try that", "answer": "GET /v1/blocks lists everything.", "is_correction": true}
+{"message": "that isn't right, ImDisk needs the -p flag", "answer": "imdisk -a -s 64G -m R: is enough.", "is_correction": true}
+{"message": "bu səhvdir, port 8081 istifadə olunur", "answer": "Judge server 8080 portunda işləyir.", "is_correction": true}
+{"message": "işləmir, eyni xəta çıxır", "answer": "Servisi yenidən başladın.", "is_correction": true}
+{"message": "yox, bu düz deyil", "answer": "Fayl /etc/foo.conf altındadır.", "is_correction": true}
+{"message": "alınmır, ImDisk quraşdırılmayıb", "answer": "ramdisk_setup.bat faylını işə salın.", "is_correction": true}
+{"message": "that's not what I asked, I wanted the read path not the write path", "answer": "Writes go through store.put().", "is_correction": true}
+{"message": "can you also show the uninstall command?", "answer": "Run apt install foo.", "is_correction": false}
+{"message": "now do the same for the firewall", "answer": "Here is the nginx config for the reverse proxy.", "is_correction": false}
+{"message": "does this apply to RHEL too?", "answer": "The file is at /etc/foo.conf.", "is_correction": false}
+{"message": "thanks, that worked", "answer": "Set X to 5.", "is_correction": false}
+{"message": "no problem, carry on", "answer": "I could not reach the search backend, so this is from memory.", "is_correction": false}
+{"message": "I know it doesn't exist yet, that's why I'm asking you to create it", "answer": "There is no such file in the repo.", "is_correction": false}
+{"message": "what happens if the judge model is wrong about a block?", "answer": "The judge rewrites blocks it finds compressible.", "is_correction": false}
+{"message": "no, keep going with the second option", "answer": "Option one is a RAM disk, option two is NVMe. Which do you want?", "is_correction": false}
+{"message": "why doesn't work stealing help here?", "answer": "The judge runs on a single CPU slot.", "is_correction": false}
+{"message": "explain what went wrong in the original design", "answer": "The judge answered keep 142 times out of 142.", "is_correction": false}
+{"message": "add a test for the case where the file is missing", "answer": "restore() reads the snapshot directory.", "is_correction": false}
+{"message": "is that the same as the incorrect usage described in the man page?", "answer": "Use --ctx-size to set the window.", "is_correction": false}
+{"message": "ok now write it to the README", "answer": "The pin flag exempts a block from decay.", "is_correction": false}
+{"message": "bəs bu necə işləyir?", "answer": "Blok yaddaşda saxlanılır.", "is_correction": false}
+{"message": "yaxşı, indi də admin səhifəsinə əlavə et", "answer": "Pin bayrağı əlavə olundu.", "is_correction": false}
+{"message": "and what about the crosslingual case?", "answer": "Paraphrases recall at 0.79.", "is_correction": false}
+{"message": "show me the false positive rate for that", "answer": "The patterns are anchored to avoid bare 'wrong'.", "is_correction": false}

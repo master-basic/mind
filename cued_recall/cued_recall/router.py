@@ -59,6 +59,7 @@ def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_ru
         recall_min: Optional[int] = None,
         recall_max: Optional[int] = None,
         older_than_days: Optional[float] = None,
+        pinned: Optional[bool] = None,
         sort: str = "created_at",
         order: str = "desc",
         limit: int = 100,
@@ -74,6 +75,7 @@ def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_ru
             recall_min=recall_min,
             recall_max=recall_max,
             older_than=older_than,
+            pinned=pinned,
             sort=sort,
             order=order,
             limit=limit,
@@ -144,6 +146,79 @@ def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_ru
             "timestamp": time.time(),
         })
         return {"status": "ok"}
+
+    @router.post("/blocks/{block_id}/pin")
+    async def pin_block(block_id: str, body: dict):
+        """Exempt a block from decay and consolidation, or stop exempting it.
+
+        The system's only automatic evidence that a memory matters is that it
+        was retrieved. That works for memories it has already needed, and not
+        at all for one the user knows will matter later -- which is what this
+        is for.
+        """
+        pinned = bool((body or {}).get("pinned", True))
+        block = store.get(block_id)
+        if block is None:
+            raise HTTPException(status_code=404, detail="block not found")
+        index.set_pinned(block_id, pinned)
+        # Dual-written like verification: the column answers queries, the field
+        # survives an index rebuilt from the msgpack files.
+        block.pinned = pinned
+        store.put(block)
+        wal.write({
+            "event": "admin_pin",
+            "block_id": block_id,
+            "pinned": pinned,
+            "timestamp": time.time(),
+        })
+        return {"status": "ok", "block_id": block_id, "pinned": pinned}
+
+    @router.post("/blocks/restore")
+    async def restore_blocks(body: dict):
+        """Bring purged blocks back.
+
+        Purging only flips a status and drops the search vector precisely so
+        that this is possible, but nothing exposed it, which made "reversible"
+        a property of the file format rather than something a user could act
+        on. Restoring re-embeds: the vector was deleted, and it is the vector
+        that makes a block findable again.
+        """
+        if embed is None:
+            raise HTTPException(status_code=503,
+                                detail="embedding client not available")
+        block_ids = (body or {}).get("block_ids", [])
+        if not block_ids:
+            raise HTTPException(status_code=400, detail="no block_ids provided")
+        restored, missing, failed = 0, 0, 0
+        for bid in block_ids:
+            block = store.get(bid)
+            if block is None:
+                # purge_deletes_file was on when this one went, so there is
+                # nothing left to restore.
+                missing += 1
+                continue
+            block.status = BlockStatus.shelved
+            store.put(block)
+            index.update_status(bid, "shelved")
+            embed_text = (block.stimulus_text or block.text)[:2000]
+            if embed_text:
+                try:
+                    vec = await asyncio.to_thread(embed.embed, embed_text)
+                    await asyncio.to_thread(index.upsert_vector, bid, vec)
+                except Exception:
+                    # Status is back either way; without a vector the block is
+                    # visible in the admin table but not yet recallable.
+                    failed += 1
+            restored += 1
+        wal.write({
+            "event": "admin_restore",
+            "restored": restored,
+            "missing": missing,
+            "embed_failed": failed,
+            "timestamp": time.time(),
+        })
+        return {"status": "ok", "restored": restored, "missing": missing,
+                "embed_failed": failed}
 
     @router.post("/blocks/delete")
     async def delete_blocks(body: dict):

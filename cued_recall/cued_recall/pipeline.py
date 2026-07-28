@@ -49,14 +49,17 @@ from .config import Config
 from .embed import EmbeddingClient
 from .index import VectorIndex
 from .models import Block, BlockType, BlockStatus, Verification
+from .small_model import SLOTS
 from .store import BlockStore
 from .utils import (
     build_stimulus,
     count_tokens,
     estimate_tokens,
     matches_correction,
+    relevance_prompt,
     split_paragraph_boundary,
     truncate_tokens,
+    RELEVANCE_SYSTEM,
 )
 from .wal import WAL
 
@@ -223,6 +226,17 @@ class Pipeline:
                 pass
         return overhead
 
+    @staticmethod
+    def _tools_bytes(body: dict) -> int:
+        """UTF-8 size of the tool definitions the template will render."""
+        tools = body.get("tools")
+        if not tools:
+            return 0
+        try:
+            return len(json.dumps(tools).encode("utf-8", "ignore"))
+        except (TypeError, ValueError):
+            return 0
+
     async def _exact_prompt_tokens(self, messages: list, body: dict) -> Optional[int]:
         """Tokenize the prompt on the server for an exact count.
 
@@ -305,15 +319,41 @@ class Pipeline:
         # budget in bytes provably cannot exceed it in tokens, and anything
         # larger is worth 450 ms to measure properly. The configured threshold
         # stays as a second trigger for a payload that is compact but dense.
+        #
+        # Tool schemas count toward those bytes. They are charged to `limit`
+        # through _payload_overhead_tokens, which is an ESTIMATE -- so leaving
+        # them out of the byte side compared a real measurement against a
+        # guess, and a client shipping a dozen JSON-Schema tool definitions
+        # could slip past the proof on the strength of that guess.
         payload_bytes = sum(len(self._msg_text(m).encode("utf-8", "ignore"))
                             for m in messages)
+        payload_bytes += self._tools_bytes(body)
         must_count = payload_bytes >= limit
+        count_method = "estimate"
         if use_exact and (must_count or total > limit * self.config.exact_count_threshold):
             exact = await self._exact_prompt_tokens(messages, body)
             if exact is not None and total > 0:
                 scale = exact / total
                 per_msg = [int(t * scale) for t in per_msg]
                 total = exact
+                count_method = "exact"
+
+        # How the budget was decided, so the claim that the estimator is safe
+        # here is auditable from the log rather than taken on trust. An
+        # "estimate" line whose payload_bytes is under the limit is the proof
+        # itself: a token costs at least one byte, so those tokens cannot have
+        # exceeded the budget however badly the estimate read.
+        self.wal.write({
+            "event": "prompt_budget",
+            "count_method": count_method,
+            "counted_tokens": total,
+            "limit": limit,
+            "payload_bytes": payload_bytes,
+            "byte_proof": payload_bytes < limit,
+            "messages": len(messages),
+            "trimmed": total > limit,
+            "timestamp": time.time(),
+        })
 
         if total <= limit:
             return messages
@@ -500,10 +540,18 @@ class Pipeline:
             total_tokens += block.token_count
             blocks.append((block, sim))
 
+        rejected_by_judge = 0
+        if self.config.recall.judge_enabled and blocks:
+            kept = await self._filter_by_relevance(query_text, blocks)
+            rejected_by_judge = len(blocks) - len(kept)
+            blocks = kept
+            total_tokens = sum(b.token_count for b, _ in blocks)
+
         self.wal.write({
             "event": "recall_budget",
             "candidates": len(results),
             "admitted": len(blocks),
+            "rejected_by_judge": rejected_by_judge,
             "skipped_corrected": skipped_corrected,
             "skipped_missing": skipped_missing,
             "skipped_oversized": skipped_oversized,
@@ -515,6 +563,68 @@ class Pipeline:
             "timestamp": time.time(),
         })
         return blocks
+
+    async def _filter_by_relevance(
+        self, question: str, blocks: List[Tuple[Block, float]]
+    ) -> List[Tuple[Block, float]]:
+        """Drop candidates the small model says do not apply to this question.
+
+        Cosine similarity answers "is this about the same subject", which is
+        not the question that matters. Measured on the evaluate/ corpus, a
+        block about phase 1 of a problem scores 0.841 against a question about
+        phase 2, and a block sharing only vocabulary scores 0.708 -- both above
+        the 0.62 threshold, both wrong to inject.
+
+        Fail-open throughout: a timeout or an unparseable reply keeps the
+        block. The failure this guards against is a mildly irrelevant note in
+        the prompt; the failure it must not cause is losing a relevant one
+        because a CPU model was busy.
+        """
+        async def verdict(pair):
+            block, sim = pair
+            try:
+                # Through the shared semaphore: the judge server has one slot,
+                # so a gather() of four calls outside this queue is the pile-up
+                # that once timed out a third of all tag calls.
+                async with SLOTS:
+                    async with httpx.AsyncClient(
+                        timeout=self.config.recall.judge_timeout_s
+                    ) as client:
+                        resp = await client.post(
+                            self.config.judge_endpoint.rstrip("/")
+                            + "/v1/chat/completions",
+                            json={
+                                "messages": [
+                                    {"role": "system",
+                                     "content": RELEVANCE_SYSTEM},
+                                    {"role": "user",
+                                     "content": relevance_prompt(
+                                         question, block.text)},
+                                ],
+                                "temperature": 0,
+                                "max_tokens": 4,
+                            },
+                        )
+                        resp.raise_for_status()
+                        content = (resp.json().get("choices", [{}])[0]
+                                   .get("message", {}).get("content", ""))
+            except Exception as e:
+                self.wal.write({
+                    "event": "recall_judge_error",
+                    "block_id": block.block_id,
+                    # str() on an httpx timeout is "", so carry the type.
+                    "error": f"{type(e).__name__}: {e}",
+                    "timestamp": time.time(),
+                })
+                return True
+            text = (content or "").strip().lower()
+            if text.startswith("no"):
+                return False
+            # Anything that is not a clear "no" keeps the block.
+            return True
+
+        verdicts = await asyncio.gather(*[verdict(p) for p in blocks])
+        return [p for p, keep in zip(blocks, verdicts) if keep]
 
     def build_recall_injection(self, blocks: List[Tuple[Block, float]]) -> str:
         if not blocks:

@@ -86,6 +86,39 @@ def truncate_tokens(text: str, max_tokens: int) -> str:
     return " ".join(words[:max_tokens])
 
 
+# The second recall stage: whether a candidate the vector search returned
+# actually applies to this question. Kept here rather than in Pipeline so
+# evaluate/eval_retrieval.py scores the prompt that ships, not a copy of it
+# that drifts.
+RELEVANCE_SYSTEM = ("You judge whether a note helps answer a question. You "
+                    "reply with exactly one word: yes or no.")
+
+
+def relevance_prompt(question: str, note: str) -> str:
+    """Ask the small model whether one note applies to one question.
+
+    Both sides are bounded: the judge server's window is 8k and several
+    candidates may be in flight at once. The instructions sit after the note
+    for the same reason the judge's do -- on a 1.5B model, an instruction
+    thousands of characters back is one it has stopped attending to.
+
+    The three "answer no" cases are the three the embedding cannot see. On the
+    evaluate/ corpus a note about phase 1 scores 0.841 against a question about
+    phase 2, and one sharing only vocabulary scores 0.708; both clear the 0.62
+    threshold, and both are wrong to inject.
+    """
+    return (
+        f"Question:\n{truncate_tokens(question, 300)}\n\n"
+        f"Note from the archive:\n{truncate_tokens(note, 900)}\n\n"
+        "Does the note contain information that would change or improve "
+        "the answer to that question?\n"
+        "Answer no if the note is about a different phase, version or "
+        "stage of the problem, if it only shares vocabulary with the "
+        "question, or if it addresses a different issue.\n"
+        "Answer yes or no."
+    )
+
+
 def split_paragraph_boundary(text: str, max_tokens: int) -> Tuple[str, str]:
     paragraphs = re.split(r"(\n\s*\n)", text)
     parts = []

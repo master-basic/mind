@@ -163,6 +163,11 @@ tr:hover td { background: #161b22; }
     <option value="desc">desc</option>
     <option value="asc">asc</option>
   </select>
+  <select id="filter-pinned" title="Pinned state">
+    <option value="">Pinned + unpinned</option>
+    <option value="true">Pinned only</option>
+    <option value="false">Unpinned only</option>
+  </select>
   <button onclick="showDeadWeight()" title="Never recalled, largest first">Dead weight</button>
   <button onclick="resetFilters()">Reset</button>
   <select id="page-size" title="Rows per page">
@@ -172,6 +177,7 @@ tr:hover td { background: #161b22; }
     <option value="500">500 / page</option>
   </select>
   <button onclick="loadBlocks()">Refresh</button>
+  <button id="btn-restore" onclick="restoreSelected()" disabled title="Bring purged blocks back and re-embed them">Restore Selected</button>
   <button class="btn-danger" id="btn-delete" onclick="deleteSelected()" disabled>Delete Selected <span id="sel-count"></span></button>
   <button class="btn-danger" onclick="runJudge()">Run Judge Pass</button>
   <button class="btn-danger" onclick="clearKv()">Clear KV Cache</button>
@@ -184,6 +190,7 @@ tr:hover td { background: #161b22; }
 <table>
 <thead><tr>
   <th class="chk-cell"><input type="checkbox" id="sel-all" class="chk" title="Select all"></th>
+  <th title="Pinned blocks are never purged or rewritten">pin</th>
   <th>block_id</th>
   <th>type</th>
   <th>status</th>
@@ -218,6 +225,7 @@ function updateSelUI() {
   const n = selected.size;
   document.getElementById('sel-count').textContent = n ? `(${n})` : '';
   document.getElementById('btn-delete').disabled = n === 0;
+  document.getElementById('btn-restore').disabled = n === 0;
 }
 
 async function loadServerInfo() {
@@ -731,6 +739,8 @@ async function loadBlocks() {
   if (type) params.set('type_', type);
   if (conv) params.set('conversation_id', conv);
   if (tag) params.set('tag', tag);
+  const pinnedFilter = document.getElementById('filter-pinned').value;
+  if (pinnedFilter) params.set('pinned', pinnedFilter);
 
   const seq = ++blocksRequestSeq;
   try {
@@ -752,8 +762,12 @@ async function loadBlocks() {
       const created = new Date(b.created_at * 1000);
       const checked = selected.has(b.block_id) ? 'checked' : '';
       const tags = (b.tags || []).map(t => `<span class="tag-badge">${t}</span>`).join('');
+      const pinned = !!b.pinned;
       tbody.innerHTML += `<tr>
         <td class="chk-cell"><input type="checkbox" class="chk" data-id="${b.block_id}" ${checked}></td>
+        <td class="chk-cell"><button class="pin-btn" data-pin-id="${b.block_id}" data-pinned="${pinned ? 1 : 0}"
+            title="${pinned ? 'Pinned: exempt from decay and rewriting. Click to unpin.' : 'Click to pin: never purged, never rewritten.'}"
+            style="background:none;border:none;cursor:pointer;font-size:15px;padding:0;opacity:${pinned ? 1 : 0.25}">📌</button></td>
         <td title="${b.block_id}">${b.block_id}</td>
         <td>${b.type}</td>
         <td><span class="badge badge-${b.status}">${b.status}</span></td>
@@ -769,12 +783,12 @@ async function loadBlocks() {
     }
 
     if (!data.items?.length) {
-      tbody.innerHTML = '<tr><td colspan="12" style="text-align:center;color:#484f58;padding:24px;">No blocks found</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="13" style="text-align:center;color:#484f58;padding:24px;">No blocks found</td></tr>';
     }
     updatePager((data.items || []).length);
   } catch (e) {
     if (seq !== blocksRequestSeq) return;
-    document.getElementById('blocks-tbody').innerHTML = `<tr><td colspan="12" style="color:#f85149">Error: ${e.message}</td></tr>`;
+    document.getElementById('blocks-tbody').innerHTML = `<tr><td colspan="13" style="color:#f85149">Error: ${e.message}</td></tr>`;
   }
   loadTagFilter();
 }
@@ -869,7 +883,15 @@ async function runJudge() {
     const r = await fetch(API + '/admin/judge/run', { method: 'POST' });
     const data = await r.json();
     const n = data.processed != null ? data.processed : '?';
-    alert('Judge pass: ' + (data.status || 'done') + ' — ' + n + ' block(s) reviewed');
+    // A pass mostly does nothing per block by design, so "reviewed 200" on its
+    // own reads as either healthy or broken. The breakdown says which.
+    const parts = [`${n} block(s) reviewed`];
+    if (data.model_calls != null) parts.push(`${data.model_calls} sent to the model`);
+    if (data.truncated) parts.push(`${data.truncated} rewritten`);
+    if (data.purged) parts.push(`${data.purged} purged`);
+    if (data.elapsed_s != null) parts.push(`${data.elapsed_s}s`);
+    if (data.stopped_early) parts.push('stopped at the time limit — run again to continue');
+    alert('Judge pass: ' + (data.status || 'done') + '\n' + parts.join('\n'));
     refresh();
   } catch (e) {
     alert('Error: ' + e.message);
@@ -895,6 +917,7 @@ document.getElementById('sort-by').addEventListener('change', reloadFromFirstPag
 document.getElementById('sort-order').addEventListener('change', reloadFromFirstPage);
 document.getElementById('filter-recall-min').addEventListener('change', reloadFromFirstPage);
 document.getElementById('filter-recall-max').addEventListener('change', reloadFromFirstPage);
+document.getElementById('filter-pinned').addEventListener('change', reloadFromFirstPage);
 
 // The preset writes the min/max boxes rather than being a filter of its own,
 // so there is one source of truth and an arbitrary range stays expressible.
@@ -907,7 +930,7 @@ document.getElementById('filter-recall-preset').addEventListener('change', funct
 });
 
 function resetFilters() {
-  ['filter-status','filter-type','filter-tag','filter-conv',
+  ['filter-status','filter-type','filter-tag','filter-conv','filter-pinned',
    'filter-recall-min','filter-recall-max','filter-recall-preset'].forEach(id => {
     document.getElementById(id).value = '';
   });
@@ -927,7 +950,7 @@ function showDeadWeight() {
 }
 
 function resetFiltersQuiet() {
-  ['filter-status','filter-type','filter-tag','filter-conv',
+  ['filter-status','filter-type','filter-tag','filter-conv','filter-pinned',
    'filter-recall-min','filter-recall-max','filter-recall-preset'].forEach(id => {
     document.getElementById(id).value = '';
   });
@@ -950,6 +973,62 @@ document.getElementById('blocks-tbody').addEventListener('change', function(e) {
     updateSelUI();
   }
 });
+
+// Delegated, because the table body is rewritten on every refresh and
+// per-row listeners would not survive it.
+document.getElementById('blocks-tbody').addEventListener('click', async function(e) {
+  const btn = e.target.closest('.pin-btn');
+  if (!btn) return;
+  const id = btn.dataset.pinId;
+  const next = btn.dataset.pinned !== '1';
+  btn.disabled = true;
+  try {
+    const r = await fetch(API + '/admin/blocks/' + id + '/pin', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({pinned: next}),
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    // Repaint this one cell rather than reloading: a full refresh would move
+    // rows under the cursor mid-click on a sorted table.
+    btn.dataset.pinned = next ? '1' : '0';
+    btn.style.opacity = next ? 1 : 0.25;
+    btn.title = next
+      ? 'Pinned: exempt from decay and rewriting. Click to unpin.'
+      : 'Click to pin: never purged, never rewritten.';
+  } catch (err) {
+    alert('Could not change pin: ' + err.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+async function restoreSelected() {
+  const ids = [...selected];
+  if (!ids.length) return;
+  try {
+    const r = await fetch(API + '/admin/blocks/restore', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({block_ids: ids}),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || ('HTTP ' + r.status));
+    selected.clear();
+    updateSelUI();
+    document.getElementById('sel-all').checked = false;
+    let msg = `Restored ${data.restored || 0} block(s) to shelved`;
+    // A block whose file was deleted (purge_deletes_file) cannot come back,
+    // and one that failed to re-embed is visible but not yet recallable --
+    // both are worth saying out loud rather than reporting a flat success.
+    if (data.missing) msg += `\n${data.missing} had no file left to restore`;
+    if (data.embed_failed) msg += `\n${data.embed_failed} could not be re-embedded (not recallable until they are)`;
+    alert(msg);
+    loadBlocks();
+  } catch (e) {
+    alert('Error: ' + e.message);
+  }
+}
 
 async function deleteSelected() {
   const ids = [...selected];

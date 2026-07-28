@@ -24,6 +24,8 @@ class CorrectionVerifier:
 
     TIMEOUT_S = 120
     MAX_TOKENS = 4
+    SYSTEM_PROMPT = ("You classify one message. You reply with exactly one "
+                     "word: yes or no.")
 
     def __init__(self, config: Config, wal: WAL):
         self.config = config
@@ -50,13 +52,58 @@ class CorrectionVerifier:
         # trimmed as hard as the answer it responds to.
         message = (user_message or "")[:2000]
 
-        # Few-shot, because the bare instruction did not work. Asked in plain
-        # prose this model scored 6/14 on a hand-built set -- worse than
-        # answering "no" every time -- and it said yes to ordinary follow-ups
-        # like "can you also show how to change the port?", which is the
-        # expensive direction. The examples pin down the distinction it kept
-        # missing: a bad outcome versus a request for more.
-        prompt = (
+        prompt = self._prompt(answer, message)
+
+        try:
+            async with SLOTS:
+                async with httpx.AsyncClient(timeout=self.TIMEOUT_S) as client:
+                    resp = await client.post(
+                        self.url,
+                        json={
+                            "messages": [
+                                {"role": "system",
+                                 "content": self.SYSTEM_PROMPT},
+                                {"role": "user", "content": prompt},
+                            ],
+                            "temperature": 0,
+                            "max_tokens": self.MAX_TOKENS,
+                        },
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    content = (
+                        data.get("choices", [{}])[0]
+                        .get("message", {})
+                        .get("content", "")
+                    )
+                    if self.usage_sink:
+                        usage = data.get("usage")
+                        if usage:
+                            self.usage_sink(usage)
+        except Exception as e:
+            self.wal.write({
+                "event": "verifier_error",
+                # str() on an httpx timeout is "", so always carry the type.
+                "error": f"{type(e).__name__}: {e}",
+                "timestamp": time.time(),
+            })
+            return None
+
+        return self._parse(content)
+
+    @staticmethod
+    def _prompt(answer: str, message: str) -> str:
+        """The few-shot classification prompt.
+
+        A method rather than an inline string so evaluate/eval_correction.py
+        scores what ships. Few-shot because the bare instruction did not work:
+        asked in plain prose this model scored 6/14 on a hand-built set --
+        worse than answering "no" every time -- and it said yes to ordinary
+        follow-ups like "can you also show how to change the port?", which is
+        the expensive direction. The examples pin down the distinction it kept
+        missing: a bad outcome versus a request for more.
+        """
+        return (
             "Decide whether the user is reporting that the assistant's answer "
             "was wrong or did not work.\n\n"
             "Say yes when the user reports a bad outcome: an error, a "
@@ -92,45 +139,6 @@ class CorrectionVerifier:
             f'Answer: "{answer}"\n'
             f'Message: "{message}"'
         )
-
-        try:
-            async with SLOTS:
-                async with httpx.AsyncClient(timeout=self.TIMEOUT_S) as client:
-                    resp = await client.post(
-                        self.url,
-                        json={
-                            "messages": [
-                                {"role": "system",
-                                 "content": "You classify one message. You "
-                                            "reply with exactly one word: "
-                                            "yes or no."},
-                                {"role": "user", "content": prompt},
-                            ],
-                            "temperature": 0,
-                            "max_tokens": self.MAX_TOKENS,
-                        },
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-                    content = (
-                        data.get("choices", [{}])[0]
-                        .get("message", {})
-                        .get("content", "")
-                    )
-                    if self.usage_sink:
-                        usage = data.get("usage")
-                        if usage:
-                            self.usage_sink(usage)
-        except Exception as e:
-            self.wal.write({
-                "event": "verifier_error",
-                # str() on an httpx timeout is "", so always carry the type.
-                "error": f"{type(e).__name__}: {e}",
-                "timestamp": time.time(),
-            })
-            return None
-
-        return self._parse(content)
 
     @staticmethod
     def _parse(content: str) -> Optional[bool]:

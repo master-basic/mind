@@ -73,3 +73,72 @@ trap-family answer quality	hand-graded	anchoring failures
 That last row has no script because it can't have one. Read the twelve trap-family answers. If the model recalls the phase-1 block and confidently tells you to check phase-1 proposals when the question was about phase 2, you've found the real limitation of the design — and writing that up honestly will get you more respect on r/LocalLLaMA than any speedup number.
 
 Run the retrieval sweep first, tonight. It's fast, it produces a chart, and "here is the precision/recall curve for semantic recall on paraphrased technical questions, including the false-fire rate" is a far better second post than anything else you could write.
+
+---
+
+# Results
+
+## Retrieval, embedding only
+
+`retrieval_sweep.csv`, nomic-embed-text-v1.5, k=4. Recall and false fires do not
+separate cleanly: false fires reach zero only at 0.86, where recall has already
+fallen to 0.58. At the shipped threshold of 0.62 recall is 0.96 and the
+false-fire rate is 0.55 — better than half the prompts that should retrieve
+nothing retrieve something.
+
+That is the finding, not a footnote to it. It is why `recall.judge_enabled`
+exists, and why claiming semantic recall "works" on the strength of the recall
+column alone would be dishonest.
+
+## Retrieval, with the semantic judge
+
+Not yet measured. Run both arms in one command:
+
+```
+python eval_retrieval.py --endpoint http://127.0.0.1:8082 --judge
+```
+
+The judge is asked once per (probe, candidate) pair rather than once per pair
+per threshold — the top-k selection does not depend on the threshold, so the
+candidate set is fixed and 33 sweep steps reuse the same verdicts. Success is a
+materially lower false-fire rate at 0.62 with recall roughly unchanged. If it is
+not, that result gets published too and `judge_enabled` stays off.
+
+## Correction detection
+
+`python eval_correction.py --no-model`, 34 hand-written rows (17 corrections,
+17 not), against the 17 shipped patterns:
+
+| metric | value |
+|---|---|
+| precision | 0.87 |
+| recall | 0.76 |
+| false-positive rate | 0.12 (2 of 17) |
+
+The two false positives are real and worth naming:
+
+- *"no, keep going with the second option"* — matched by `^\s*(no|nope|nah)[,.!]`.
+  A leading "no" is often a redirection, not a complaint.
+- *"why doesn't work stealing help here?"* — matched by `(doesn't|does not) work`,
+  where "work" is part of a noun phrase.
+
+Left unfixed on purpose. Tuning regexes against 34 rows someone wrote to test
+those regexes is how you get a pattern list that scores well on its own test set
+and no better in the field. The structural fix went in instead:
+`judge.corrected_grace_s` means a pattern-sourced correction stops a block being
+recalled but cannot purge it for 24 hours, and never at all if it was ever
+recalled. A false positive now hides a memory for a day rather than deleting it.
+
+The four false negatives ("that gave me: package not found", "no such file on my
+system", "are you sure? the docs say 10", "it returns 404 when I try that") are
+exactly the phrasings the patterns are documented as not reaching, and are the
+verifier's job. Score it with the judge server up:
+
+```
+python eval_correction.py
+```
+
+**Caveat that applies to both numbers:** these rows are hand-written, and 34 of
+them. They bound the shape of the problem, not the rate. `--from-chats` mines
+real user messages out of a live `chats.db` for labelling, which is the only way
+the negative half stops reflecting what someone thought to test.

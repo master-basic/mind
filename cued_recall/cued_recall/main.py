@@ -85,8 +85,12 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
         judge_running[0] = True
         try:
             judge_pass_counter[0] += 1
-            processed = await judge.run_pass(min_age=min_age)
-            return {"status": "ok", "processed": processed}
+            # run_pass returns counters, not a bare count: how long a pass took
+            # and how many of its visits actually cost a generation is the only
+            # way to tell "the judge keeps up with the store" from "the judge
+            # is quietly falling behind it".
+            counts = await judge.run_pass(min_age=min_age)
+            return {"status": "ok", **counts}
         finally:
             judge_running[0] = False
 
@@ -584,6 +588,15 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
                             "trigger": "idle",
                             "idle_for_s": round(idle_for),
                             "processed": result.get("processed", 0),
+                            "visited": result.get("visited", 0),
+                            "model_calls": result.get("model_calls", 0),
+                            "purged": result.get("purged", 0),
+                            "truncated": result.get("truncated", 0),
+                            "elapsed_s": result.get("elapsed_s", 0),
+                            # True means the wall-clock ceiling cut the pass
+                            # short; a run of these is the signal that the
+                            # store has outgrown max_pass_seconds.
+                            "stopped_early": result.get("stopped_early", False),
                             "timestamp": time.time(),
                         })
                 except BaseException:

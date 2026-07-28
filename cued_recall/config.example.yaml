@@ -44,6 +44,13 @@ recall:
   k: 4
   threshold: 0.62
   budget_tokens: 3000
+  # Ask the small model whether each candidate actually helps with the question
+  # before injecting it. Similarity cannot tell "phase 1" from "phase 2" or
+  # shared vocabulary from relevance -- both score above this threshold. Costs
+  # one short call per candidate, on the request path. Turn it on when the
+  # sweep in evaluate/ says it pays for itself on your corpus.
+  judge_enabled: false
+  judge_timeout_s: 5.0
 judge:
   # New material since the last pass before another one is worth running.
   interval_tokens: 20000
@@ -64,6 +71,16 @@ judge:
   - reasoning
   # Shorter deadline for blocks the model reported as holding nothing reusable.
   worthless_age_s: 172800
+  # A pattern-matched correction stops the block being recalled at once, but
+  # cannot purge it until this long has passed, and never if it was ever
+  # recalled. The patterns have no measured false-positive rate; this is what
+  # stops one bad match from being destructive.
+  corrected_grace_s: 86400
+  # Rewrites allowed per block, ever. Each one paraphrases the last.
+  max_truncate_count: 2
+  # Wall-clock ceiling for one pass. A pass that runs out of time stops without
+  # marking the remainder judged, so the next pass resumes where it left off.
+  max_pass_seconds: 600
   # Leave a block alone this long after judging it, so a pass sweeps forward
   # instead of revisiting the same blocks.
   rejudge_interval_s: 604800
@@ -127,9 +144,3 @@ web_search:
   # configured rather than reporting "no results".
   fallback: true
   max_results: 5
-correction_patterns:
-- that's wrong
-- doesn't work
-- ^no[,.]
-- səhvdir
-- işləmir
