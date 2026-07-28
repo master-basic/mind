@@ -509,6 +509,7 @@ nothing:
 |---|---|---|
 | `eval_retrieval.py` | Does the right block come back? | Seconds, deterministic, no generation. Sweeps `recall.threshold` from 0.30 to 0.94 and writes `retrieval_sweep.csv`. `--judge` adds the relevance filter and prints both arms side by side. `--fake` self-tests with synthetic vectors and no servers. |
 | `eval_correction.py` | How often does correction detection fire on something that was not a correction? | Instant with `--no-model`. Scores the shipped patterns and the shipped classifier against a labelled set; `--from-chats` mines candidate rows out of a live `chats.db` for labelling. |
+| `eval_throughput.py` | What does the memory layer cost per turn? | Minutes. Same prompts direct to `:8080` and through `:8000`, streamed, reporting TTFT and decode rate apart — the middleware's work is all pre-first-token, so decode should be flat and TTFT carries the cost. |
 | `eval_e2e.py` | Does having the block actually help? | Slow and noisy. A/B: baseline goes straight to `:8080`, treatment through the middleware, store wiped and re-warmed per repeat, `temperature: 0`, fixed seed, `--repeats 3`. |
 
 Both evals import the prompt the middleware actually sends
@@ -553,6 +554,21 @@ So both defaults moved together, and they only make sense together:
 raising the threshold back toward 0.62 leaves the worst of both — a low bar and
 nothing checking what clears it. See `evaluate/benchmark.md` for the full table
 and the trap-family caveat.
+
+It is not free, and the price is latency rather than tokens. Measured on live
+traffic (`evaluate/throughput.md`), a turn with 3–4 candidates spends
+**1.5–2.2 s** on judge calls before the reasoning model is asked anything —
+3–4 requests to a CPU 1.5B, two at a time through the shared slot semaphore.
+A turn with no candidates pays none of it. The cost falls entirely on
+time-to-first-token; decode is unaffected, because the judge has finished
+before generation starts.
+
+The obvious inefficiency is that the cost is identical whether the judge admits
+everything or nothing, and on an off-topic question it is always nothing —
+three CPU calls to conclude the store has nothing to say. A similarity floor
+below which the judge is not consulted would recover most of it. Not
+implemented; the sweep data needed to choose that floor is already in
+`retrieval_sweep.csv`.
 
 ---
 

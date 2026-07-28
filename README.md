@@ -98,6 +98,7 @@ second.
 | Multi-backend search fallback | Working | Tries configured backends in chain on failure |
 | Force search heuristics | Working | Auto-detects search-like queries |
 | Retrieval benchmark | Working | Threshold sweep over a hand-built corpus, with false-fire rate |
+| Throughput benchmark | Working, measured | Direct vs through the middleware. Decode unchanged; **+1.7 s time-to-first-token**, nearly all of it the relevance judge |
 | End-to-end benchmark | Harness only | A/B script + paired analysis; results are hand-graded, not yet published |
 | KV cache management | In progress | Clear endpoint exists; slot save/restore is Phase 2 |
 | Retry/circuit breaking | Not started | External calls (search, embed, upstream) fail soft and are logged, but nothing backs off or trips |
@@ -287,6 +288,8 @@ mind/
 │   ├── corrections.jsonl            # Labelled correction/not-correction rows
 │   ├── eval_retrieval.py            # Threshold sweep (no generation), --judge arm
 │   ├── eval_correction.py           # Precision/recall/false-positive rate for corrections
+│   ├── eval_throughput.py           # Direct vs through-the-middleware: TTFT and tok/s
+│   ├── throughput.md                # Throughput report
 │   ├── eval_e2e.py                  # A/B: direct vs through the middleware
 │   ├── analyse.py                   # Paired analysis + bootstrap CI
 │   ├── inspect_blocks.py            # Look at what is actually stored
@@ -356,6 +359,21 @@ python evaluate/eval_correction.py --no-model
 Drop `--no-model` to score the classifier too. `--from-chats <chats.db>` mines
 real user messages for labelling, which is the only way the negative half stops
 reflecting only what someone thought to test.
+
+**Throughput** — what does the memory layer cost per turn? Runs the same
+prompts straight at `llama-server` and again through the middleware:
+
+```bash
+python evaluate/eval_throughput.py --repeats 3
+```
+
+Reports time-to-first-token, decode tokens/sec and prompt size **separately**,
+because a single tok/s number is what once hid a turn spending 107 s on prefill
+and 1.4 s generating. Everything the middleware does — embedding the query,
+vector search, the relevance judge — lands in TTFT; decode should be flat,
+since the middleware is not in that path. `--cold` clears the KV cache before
+every request to compare prefill instead of steady state. Results:
+**[evaluate/throughput.md](evaluate/throughput.md)**.
 
 **End-to-end** — does having the block help? Slow and noisy, so `--repeats 3`
 with paired analysis:
