@@ -7,16 +7,24 @@ import yaml
 class RecallConfig:
     def __init__(self, d: dict):
         self.k: int = d.get("k", 4)
-        self.threshold: float = d.get("threshold", 0.62)
+        # Lowered from 0.62 once the relevance judge below took over rejecting
+        # what does not apply. The threshold used to do two jobs -- find the
+        # right blocks, and suppress the wrong ones -- and it was bad at the
+        # second: at 0.62 more than half the prompts that should retrieve
+        # nothing retrieved something. Measured with the judge on, 0.48 gives a
+        # false-fire rate of 0.00 and recalls the Azerbaijani family 6 of 6,
+        # against 3 of 6 at the 0.70 the embedding alone would have needed.
+        self.threshold: float = d.get("threshold", 0.48)
         self.budget_tokens: int = d.get("budget_tokens", 3000)
         # Second stage: ask the small model whether a candidate the vector
         # search returned actually helps with THIS question. Similarity alone
         # cannot separate a block about phase 1 from a question about phase 2
         # (measured 0.841 on this corpus) or vocabulary overlap from relevance
-        # (0.708) -- both fire above threshold. Off by default: it costs a
-        # round trip per candidate on the request path, and it should be turned
-        # on because the sweep in evaluate/ says it helps, not on faith.
-        self.judge_enabled: bool = d.get("judge_enabled", False)
+        # (0.708) -- both fire above threshold. On by default since the sweep
+        # measured it: false fires go to 0.00 at every threshold, and the only
+        # recall it costs is the trap family -- which it refuses on exactly the
+        # grounds that family exists to test. See evaluate/benchmark.md.
+        self.judge_enabled: bool = d.get("judge_enabled", True)
         # Per candidate. Short, because they run while the user waits.
         self.judge_timeout_s: float = d.get("judge_timeout_s", 5.0)
 

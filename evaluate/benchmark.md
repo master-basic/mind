@@ -92,17 +92,70 @@ column alone would be dishonest.
 
 ## Retrieval, with the semantic judge
 
-Not yet measured. Run both arms in one command:
+Measured 2026-07-28, Qwen2.5-1.5B-Instruct on CPU as the relevance judge:
 
 ```
 python eval_retrieval.py --endpoint http://127.0.0.1:8082 --judge
 ```
 
-The judge is asked once per (probe, candidate) pair rather than once per pair
-per threshold — the top-k selection does not depend on the threshold, so the
-candidate set is fixed and 33 sweep steps reuse the same verdicts. Success is a
-materially lower false-fire rate at 0.62 with recall roughly unchanged. If it is
-not, that result gets published too and `judge_enabled` stays off.
+| threshold | recall | false-fire | recall +judge | false-fire +judge |
+|---|---|---|---|---|
+| 0.48 | 1.00 | 0.82 | 0.75 | **0.00** |
+| 0.62 (shipped) | 0.96 | 0.55 | 0.71 | **0.00** |
+| 0.70 | 0.88 | 0.18 | 0.63 | **0.00** |
+| 0.86 | 0.58 | 0.00 | 0.50 | 0.00 |
+
+The judge takes the false-fire rate to zero at every threshold. It is not
+trading recall away at random to get there — the entire recall cost is one
+family:
+
+| relation | fired without judge | fired with judge |
+|---|---|---|
+| exact (6) | 6 | 6 |
+| paraphrase (6) | 6 | 6 |
+| crosslingual (6) | 6 at 0.48 | 6 |
+| trap (6) | 6 | **0** |
+| distractor (6) | 2–6 | **0** |
+| control (5) | 0–5 | **0** |
+
+Every legitimate recall survives. Every distractor and control is refused. The
+judge rejects the whole trap family, and the corpus labels those
+`should_recall: true`, which is where the 0.96 → 0.71 comes from.
+
+Whether that is a loss is a real question, not a rounding error. A trap probe
+asks about phase 2 while the stored block concluded something about phase 1; the
+corpus counts retrieval as correct there because the block *is* about the same
+subject, and expects the model not to reuse the conclusion blindly. The judge
+reads the same pair and says it does not apply. That is the failure mode the
+trap family exists to expose, being refused one stage earlier than the corpus
+assumed it would be.
+
+The second finding is more useful than the headline. Because the judge removes
+false fires outright, the embedding threshold no longer has to carry that job —
+and dropping it to 0.48 recovers the crosslingual family completely, 6 of 6
+against 3 of 6 at the 0.70 the embedding alone would need. Azerbaijani recall
+was written up here as "not working"; it works, at a threshold that was
+previously unusable because of the noise it let through.
+
+Cost: ~150 judge calls for the sweep, serial, on a CPU 1.5B. In the pipeline the
+calls for one turn run concurrently through the shared small-model semaphore,
+bounded by `recall.judge_timeout_s` (5 s), and a timeout keeps the block.
+
+## Judge throughput
+
+The review's "a large store will never finish a pass" is answerable now that
+`judge_pass` carries counters. Measured on a 164-block store, manual pass
+(`min_age=0`, so nothing is age-gated out):
+
+```
+visited=163  model_calls=1  truncated=1  purged=0  elapsed_s=7.3  stopped_early=false
+```
+
+163 blocks in 7.3 s because the gates are cheap and the model is the exception:
+75 skipped on type, 45 on size, 42 kept for being recalled 3+ times, and exactly
+one was worth a rewrite. A pass costs the model roughly what the store has newly
+accumulated, not what it holds. `max_pass_seconds` bounds the case where that
+stops being true, and `stopped_early` in the log is how you would know.
 
 ## Correction detection
 

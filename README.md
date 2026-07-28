@@ -60,8 +60,8 @@ second.
 |---|---|---|
 | OpenAI-compatible chat proxy | Working | Streaming + non-streaming, `/v1/chat/completions`, `/v1/models` |
 | Reasoning/result split | Working | ` thinking` / ` response` tag parsing during streaming |
-| Semantic recall | Working, measured | Cosine-similarity retrieval, advisory injection, budget-limited. At threshold 0.62: recall 0.96, **false-fire rate 0.55** — it retrieves reliably and over-retrieves badly |
-| Semantic reranker | Working, unmeasured, off by default | Second stage asks the small model whether a candidate applies to this question. Turn on with `recall.judge_enabled` once `eval_retrieval.py --judge` says it pays |
+| Semantic recall | Working, measured | Cosine retrieval plus a relevance filter. Embedding alone at 0.62 recalls 0.96 with a **false-fire rate of 0.55**; that is why it no longer runs alone |
+| Semantic reranker | Working, measured, **on by default** | Second stage asks the small model whether a candidate applies. False-fire rate **0.00** at every threshold. Its only recall cost is the trap family. Disable with `recall.judge_enabled: false` — and raise `threshold` back toward 0.62 if you do |
 | Manual retention (pin) | Working | A pinned block is never purged and never rewritten, at any age |
 | Restore purged blocks | Working | Purging was always reversible on disk; `POST /admin/blocks/restore` re-embeds and brings it back |
 | KV-prefix-safe injection | Working | Recall is anchored to the newest user turn, so the cached prefix survives the turn |
@@ -71,7 +71,7 @@ second.
 | Correction detection | Working, measured | 17 anchored patterns (EN + AZ) plus a few-shot classifier. Patterns: precision 0.87, recall 0.76, **false-positive rate 0.12** on 34 hand-labelled rows |
 | Decay | Working | Purges on correction, or never-recalled past a cutoff. No model call. Reversible by default. See the retention guarantees below |
 | Consolidation | Working | Judge rewrites long think traces only; guarded against copied openings and non-shrinking rewrites; capped at `max_truncate_count` rewrites per block |
-| Bounded judge pass | Working | Wall-clock ceiling per pass; a pass that runs out of time resumes where it stopped. `judge_pass` records elapsed, visits, and model calls |
+| Bounded judge pass | Working, measured | Wall-clock ceiling per pass; a pass that runs out of time resumes where it stopped. Measured: 163 blocks visited in 7.3 s, 1 model call |
 | Idle consolidation | Working | Passes run after a quiet period, not mid-conversation |
 | Web search | Working | 4 backends: DuckDuckGo (free), Brave, Serper, SearXNG |
 | Web fetch | Working | SSRF-guarded, HTML-to-text, JSON detection |
@@ -239,9 +239,9 @@ Settings live in `cued_recall/config.yaml` (gitignored, auto-created from `confi
 | `exact_count_threshold` | 0.6 | Above this fraction of the budget, tokenize the prompt on the server instead of estimating |
 | `hot_shelve_timeout_s` | 15 | Seconds before abandoned convos are shelved |
 | `recall.k` | 4 | Top blocks to retrieve |
-| `recall.threshold` | 0.62 | Cosine similarity threshold |
+| `recall.threshold` | 0.48 | Cosine similarity threshold. Low on purpose — the judge below does the rejecting. Raise toward 0.62 if you disable it |
 | `recall.budget_tokens` | 3000 | Max injected recall tokens |
-| `recall.judge_enabled` | false | Second-stage relevance filter on the small model |
+| `recall.judge_enabled` | true | Second-stage relevance filter on the small model |
 | `recall.judge_timeout_s` | 5.0 | Per candidate; a timeout keeps the block |
 | `judge.interval_tokens` | 20000 | New material before a pass is worth running |
 | `judge.idle_trigger_s` | 300 | Quiet time before a consolidation pass starts |

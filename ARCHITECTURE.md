@@ -535,11 +535,24 @@ clean separation — at the shipped threshold of 0.62, recall is 0.96 and the
 false-fire rate is 0.55; false fires only reach zero around 0.86, where recall
 has already fallen to 0.58.
 
-That is what `recall.judge_enabled` is for. The second stage is now implemented
-(`_filter_by_relevance`), and it ships **off**, because the sweep that would
-justify turning it on has not been run yet — `eval_retrieval.py --judge` runs
-both arms in one command and prints the numbers at 0.62. Turning it on before
-then would be the same assertion the embedding-only "working" claim was.
+That is what `recall.judge_enabled` is for, and the sweep has now been run.
+`_filter_by_relevance` takes the false-fire rate to **0.00 at every threshold**.
+Recall goes 0.96 → 0.71 at 0.62, and the entire cost is the trap family: every
+exact, paraphrase and crosslingual probe survives, every distractor and control
+is refused. The judge reads a phase-1 note against a phase-2 question and says
+it does not apply — the failure the trap family exists to expose, refused one
+stage earlier than the corpus assumed.
+
+The more useful consequence: with false fires handled by the second stage, the
+embedding threshold no longer has to suppress them, and at 0.48 the crosslingual
+(Azerbaijani) family recalls 6 of 6 against 3 of 6 at the 0.70 the embedding
+would otherwise need.
+
+So both defaults moved together, and they only make sense together:
+`judge_enabled` on, `threshold` down to 0.48. Turning the judge off without
+raising the threshold back toward 0.62 leaves the worst of both — a low bar and
+nothing checking what clears it. See `evaluate/benchmark.md` for the full table
+and the trap-family caveat.
 
 ---
 

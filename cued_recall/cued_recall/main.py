@@ -507,9 +507,36 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
 
         snapshot = snapshot_path / "latest"
         if snapshot.exists() and not any(store.blocks_dir.iterdir()):
-            store.restore(snapshot)
-            index.restore(snapshot)
-            chats.restore(snapshot)
+            # An unreadable snapshot must not look like an absent one. Both
+            # store.restore and index.restore gate on Path.exists(), which
+            # returns False on PermissionError as readily as on "no such
+            # file" -- so a snapshot directory the process cannot open
+            # restored nothing, said nothing, and left an empty store that
+            # looked like a first run. Observed on a real store: 158 blocks
+            # sat in a `latest` whose ACL denied the account, and the only
+            # symptom was an empty Blocks table.
+            try:
+                probe = list(snapshot.iterdir())
+            except OSError as e:
+                probe = None
+                print(f"[cued-recall] CANNOT READ SNAPSHOT {snapshot}: {e}. "
+                      f"Starting with an EMPTY store -- the snapshot was NOT "
+                      f"restored and will be overwritten by the next "
+                      f"snapshot tick unless you stop the server now.",
+                      flush=True)
+                wal.write({
+                    "event": "snapshot_unreadable",
+                    "path": str(snapshot),
+                    "error": f"{type(e).__name__}: {e}",
+                    "timestamp": time.time(),
+                })
+            if probe:
+                store.restore(snapshot)
+                index.restore(snapshot)
+                chats.restore(snapshot)
+                restored = len(list(store.blocks_dir.glob("*.msgpack")))
+                print(f"[cued-recall] restored {restored} blocks from {snapshot}",
+                      flush=True)
 
         # Shelve any 'hot' blocks left over from previous sessions so they
         # become recallable. The per-turn logic only shelves a turn when the
@@ -529,8 +556,21 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
                         ),
                         timeout=300,
                     )
-                except BaseException:
-                    pass
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as e:
+                    # Silence here is how a store goes unbacked-up for weeks:
+                    # a locked or unwritable snapshot directory failed on
+                    # every tick and never said so once. Losing a snapshot is
+                    # still not worth stopping the server for, so it is logged
+                    # and the loop continues.
+                    print(f"[cued-recall] SNAPSHOT FAILED: "
+                          f"{type(e).__name__}: {e}", flush=True)
+                    wal.write({
+                        "event": "snapshot_failed",
+                        "error": f"{type(e).__name__}: {e}",
+                        "timestamp": time.time(),
+                    })
                 try:
                     await asyncio.wait_for(
                         shutdown_event.wait(), timeout=interval
@@ -806,19 +846,38 @@ def _shelve_leftover_hot(store: BlockStore, index: VectorIndex, wal: WAL):
 
 def _take_snapshot(store: BlockStore, index: VectorIndex, snapshot_path: Path,
                    chats: 'ChatStore' = None):
-    import shutil
     import tempfile
 
-    tmp = Path(tempfile.mkdtemp())
+    # Staged beside the destination rather than in the system temp dir, so the
+    # final step is a rename within one filesystem instead of a cross-device
+    # copy that can half-finish.
+    snapshot_path.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(dir=str(snapshot_path), prefix=".staging-"))
     try:
         store.snapshot(tmp)
         index.snapshot(tmp)
         if chats is not None:
             chats.snapshot(tmp)
+
+        # Swap, never delete-then-write. The old order removed `latest` and
+        # then moved the new snapshot into place, so a crash, a lock, or a
+        # denied ACL in between left NO snapshot at all -- the one moment the
+        # backup is most needed is the moment it did not exist. Now the
+        # previous snapshot is only discarded once its replacement is in
+        # place under the right name.
         latest = snapshot_path / "latest"
+        previous = snapshot_path / "previous"
         if latest.exists():
-            _rmtree_win32(latest)
-        shutil.move(str(tmp), str(latest))
+            if previous.exists():
+                _rmtree_win32(previous)
+            os.replace(str(latest), str(previous))
+        try:
+            os.replace(str(tmp), str(latest))
+        except OSError:
+            # Put the old one back rather than leaving nothing behind.
+            if previous.exists() and not latest.exists():
+                os.replace(str(previous), str(latest))
+            raise
     finally:
         if tmp.exists():
             _rmtree_win32(tmp)

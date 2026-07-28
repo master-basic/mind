@@ -42,14 +42,18 @@ exact_count_threshold: 0.6
 hot_shelve_timeout_s: 15
 recall:
   k: 4
-  threshold: 0.62
+  # Lower than it looks: the relevance judge below, not this number, is what
+  # keeps irrelevant blocks out. Measured with the judge on, 0.48 gives a
+  # false-fire rate of 0.00 and recalls Azerbaijani paraphrases 6 of 6, where
+  # the embedding alone needed 0.70 to be quiet and managed 3 of 6 there.
+  # Raise it toward 0.62 if you turn judge_enabled off.
+  threshold: 0.48
   budget_tokens: 3000
   # Ask the small model whether each candidate actually helps with the question
   # before injecting it. Similarity cannot tell "phase 1" from "phase 2" or
-  # shared vocabulary from relevance -- both score above this threshold. Costs
-  # one short call per candidate, on the request path. Turn it on when the
-  # sweep in evaluate/ says it pays for itself on your corpus.
-  judge_enabled: false
+  # shared vocabulary from relevance -- both score above any usable threshold.
+  # Costs one short call per candidate, in parallel, on the request path.
+  judge_enabled: true
   judge_timeout_s: 5.0
 judge:
   # New material since the last pass before another one is worth running.
