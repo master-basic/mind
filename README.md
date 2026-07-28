@@ -41,6 +41,9 @@ free VRAM and the model's own GGUF metadata before launch, then stays resident
 as a watchdog: a llama.cpp slot can be lost while the process keeps answering
 `/health`, and only the launcher owns the handles needed to restart it.
 
+How it got from an idea to this, including what broke on the way:
+**[CHANGELOG.md](CHANGELOG.md)**.
+
 Memory upkeep is split in two, deliberately. **Consolidation** — turning a long
 derivation into a short one — needs to understand the text, so the judge model
 does it. **Forgetting** is a function of age, recall count and whether the
