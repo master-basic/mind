@@ -24,13 +24,22 @@ Client ──▶ Cued Recall Middleware ──▶ llama-server (reasoning)
                     ┌─────┴──────┐
                     │  Embedding  │  semantic retrieval keys
                     └─────────────┘
+                          │
+                    ┌─────┴──────┐
+                    │ Transcripts │  plain chat history, never touched by decay
+                    └─────────────┘
 ```
 
 Four server processes managed by the launcher:
-- **Reasoning** — main LLM (Qwen3-8B, configurable catalog of 6 models)
+- **Reasoning** — main LLM (Qwen3.5-9B by default, catalog of 6 including 35B-A3B MoE)
 - **Judge** — rewrites long think traces; also tags blocks and classifies corrections (Qwen2.5-1.5B, CPU-only)
 - **Embedding** — vector retrieval keys (nomic-embed-text-v1.5)
 - **Middleware** — FastAPI proxy (this project)
+
+`run.py` sizes the reasoning server's context window and MoE expert split from
+free VRAM and the model's own GGUF metadata before launch, then stays resident
+as a watchdog: a llama.cpp slot can be lost while the process keeps answering
+`/health`, and only the launcher owns the handles needed to restart it.
 
 Memory upkeep is split in two, deliberately. **Consolidation** — turning a long
 derivation into a short one — needs to understand the text, so the judge model
@@ -47,6 +56,8 @@ and runs without a model call. See **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 | OpenAI-compatible chat proxy | Working | Streaming + non-streaming, `/v1/chat/completions`, `/v1/models` |
 | Reasoning/result split | Working | ` thinking` / ` response` tag parsing during streaming |
 | Semantic recall | Working | Cosine-similarity retrieval, advisory injection, budget-limited |
+| KV-prefix-safe injection | Working | Recall is anchored to the newest user turn, so the cached prefix survives the turn |
+| Exact token accounting | Working | Block counts and near-limit prompt budgets use the model's `/tokenize`; conservative estimator otherwise |
 | Block lifecycle | Working | hot → shelved → truncated/purged; passes sweep forward, oldest-unjudged first |
 | Tagging system | Working | Auto-tags blocks with gist + tags at shelve time |
 | Correction detection | Working | 17 anchored patterns (EN + AZ), plus a few-shot yes/no classifier for what they miss |
@@ -56,14 +67,27 @@ and runs without a model call. See **[ARCHITECTURE.md](ARCHITECTURE.md)**.
 | Web search | Working | 4 backends: DuckDuckGo (free), Brave, Serper, SearXNG |
 | Web fetch | Working | SSRF-guarded, HTML-to-text, JSON detection |
 | Tool calling | Working | Own tools (web_search, web_fetch) + client tool forwarding |
-| Model catalog | Working | 6 reasoning models with interactive menu |
-| Admin web GUI | Working | Context usage, stats, block table, export/import, KV clear |
+| Model catalog | Working | 6 reasoning models with interactive menu; launch details remembered per model |
+| VRAM autosizing | Working | Context window sized from free VRAM + GGUF KV geometry; leftover VRAM spent on MoE expert layers (`--n-cpu-moe`) |
+| MoE support | Working | 17–20 GB A3B models on a 12 GB card, experts in system RAM |
+| Wedge watchdog | Working | Detects a llama.cpp server whose `/health` answers but whose inference queue is blocked, and restarts it |
+| Server logs | Working | Each llama-server's stdout in `logs/{name}.log` |
+| Built-in chat UI | Working | Streaming, reasoning pane, file upload, Stop button |
+| Chat history | Working | Durable transcripts in `chats.db` with a sidebar; independent of the block lifecycle |
+| Admin web GUI | Working | Tabbed: Live (context, GPU, throughput), Memory (analytics), Blocks (table) |
+| GPU/system telemetry | Working | Per-GPU and per-process usage, uptime, launch plan |
+| Memory analytics | Working | Store growth, token distribution, recall effectiveness, per-turn budget decisions |
+| Throughput reporting | Working | Prefill and decode speeds reported separately from llama.cpp's own counters |
+| Usage reporting | Working | `prompt_tokens`/`completion_tokens` returned to the client so agents can compact |
 | Export/import blocks | Working | JSON export/import with re-embedding |
-| Snapshots | Working | Periodic + on-shutdown, persistent across reboots |
+| Snapshots | Working | Periodic + on-shutdown, persistent across reboots; blocks, index and transcripts |
 | WAL event log | Working | JSONL audit trail for all lifecycle events |
 | RAM disk support | Working | ImDisk (Windows) / tmpfs (Linux), auto-mount |
 | Multi-backend search fallback | Working | Tries configured backends in chain on failure |
 | Force search heuristics | Working | Auto-detects search-like queries |
+| Retrieval benchmark | Working | Threshold sweep over a hand-built corpus, with false-fire rate |
+| End-to-end benchmark | Harness only | A/B script + paired analysis; results are hand-graded, not yet published |
+| Semantic recall judge | Planned | Two-stage recall to cut trap/distractor false fires — see `evaluate/semantic_judge_plan.md` |
 | KV cache management | In progress | Clear endpoint exists; slot save/restore is Phase 2 |
 | Multi-user/isolation | Not started | Single-user alpha |
 | Authentication/TLS | Not started | Open on localhost only |
@@ -81,7 +105,10 @@ run.bat                          # Windows — double-click or run in terminal
 python run.py                    # Linux
 ```
 
-First run downloads 3 models (~7 GB), starts 4 servers, and opens the middleware at `http://127.0.0.1:8000`.
+First run offers a model menu, downloads 3 models (~8 GB with the default
+reasoning model), prints a launch plan showing what runs where and with how much
+context, then starts 4 servers. Chat UI at `http://127.0.0.1:8000`, admin at
+`/admin`. Later runs reuse the remembered answers without asking.
 
 ---
 
@@ -96,13 +123,22 @@ All routes are on the middleware (default `127.0.0.1:8000`).
 | `GET` | `/v1/models` | OpenAI-compatible model list |
 | `POST` | `/v1/chat/completions` | Chat completion with streaming, recall, tools |
 | `GET` | `/chat` | Built-in chat UI |
-| `GET` | `/health` | Health check |
+| `GET` | `/health` | Health check (also reports `hot_shelve_timeout_s`) |
+
+### Chat history
+
+| Method | Route | Description |
+|--------|-------|-------------|
+| `GET` | `/chats` | List conversations (paginated, filterable by source) |
+| `GET` | `/chats/{id}` | Full transcript |
+| `PATCH` | `/chats/{id}` | Rename a conversation |
+| `DELETE` | `/chats/{id}` | Delete the transcript — derived memory blocks are kept |
 
 ### Admin
 
 | Method | Route | Description |
 |--------|-------|-------------|
-| `GET` | `/admin` | Admin web GUI |
+| `GET` | `/admin` | Admin web GUI (Live / Memory / Blocks tabs) |
 | `GET` | `/admin/blocks` | List blocks (filterable, paginated) |
 | `GET` | `/admin/blocks/{id}` | Full block details + WAL history |
 | `POST` | `/admin/blocks/{id}/verify` | Set verification (accepted/corrected) |
@@ -111,10 +147,17 @@ All routes are on the middleware (default `127.0.0.1:8000`).
 | `POST` | `/admin/judge/run` | Force judge pass |
 | `POST` | `/admin/kv/clear` | Clear KV caches |
 | `GET` | `/admin/stats` | Block counts, file counts |
-| `GET` | `/admin/tps` | Tokens-per-second ring buffer |
+| `GET` | `/admin/stats/growth` | Blocks created per day |
+| `GET` | `/admin/stats/distribution` | Token-size histogram |
+| `GET` | `/admin/stats/recall` | Recall effectiveness + most-recalled blocks |
+| `GET` | `/admin/stats/budget` | Recent per-turn recall budget decisions |
+| `GET` | `/admin/tps` | Request-level ring buffer + server prefill/decode rates |
 | `GET` | `/admin/export` | Export blocks as JSON |
 | `POST` | `/admin/import` | Import blocks from JSON |
 | `GET` | `/admin/models` | Per-server status + context usage |
+| `GET` | `/admin/system` | GPU/CPU telemetry, uptime |
+| `GET` | `/admin/wedge` | Is a server's inference queue blocked? |
+| `POST` | `/admin/server/restart` | Ask the launcher to restart a llama server (503 without one) |
 
 ### Utility
 
@@ -136,10 +179,13 @@ run.bat [options]          # Windows
 | `--storage PATH` | Root for models + blocks. Sticky across runs |
 | `--snapshot PATH` | Snapshot backup location (persistent, not on RAM disk) |
 | `--models-cache DIR` | Keep models here; copy to working dir each run |
+| `--download-to DIR` | Download to this directory first, then copy to the working dir |
 | `--reasoning-model PATH` | Explicit reasoning GGUF path |
 | `--reasoning-choice N` | Pick model from catalog by number |
 | `--model-menu` | Force model selection menu |
-| `--reasoning-cpu-moe` | Force `--cpu-moe` for MoE models |
+| `--reasoning-ctx N\|auto` | Context window. `auto` sizes it from free VRAM and the model's KV cost |
+| `--reasoning-cpu-moe` | Force expert offload (auto-detected for A3B/MoE models) |
+| `--reasoning-n-cpu-moe N\|auto` | How many layers keep their experts in RAM. `auto` spends leftover VRAM on the rest |
 | `--judge-model PATH` | Explicit judge GGUF path |
 | `--embed-model PATH` | Explicit embedding GGUF path |
 | `--reasoning-port N` | Reasoning server port (default: 8080) |
@@ -162,15 +208,21 @@ Settings live in `cued_recall/config.yaml` (gitignored, auto-created from `confi
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `block_tokens_reasoning` | 8000 | Max tokens per reasoning block |
-| `max_context_tokens` | 26624 | Prompt budget (derived from `--ctx-size`) |
-| `tokens_per_word` | 1.3 | Word→token multiplier |
+| `max_context_tokens` | 26624 | Prompt budget. Rewritten by `run.py` from the context it actually served |
+| `context_reserve_tokens` | 4096 | Held back for the reply, including the think trace |
+| `tokens_per_word` | 1.3 | Word→token multiplier (estimator) |
+| `chars_per_token` | 3.2 | Char→token divisor (estimator) |
+| `exact_count_threshold` | 0.6 | Above this fraction of the budget, tokenize the prompt on the server instead of estimating |
 | `hot_shelve_timeout_s` | 15 | Seconds before abandoned convos are shelved |
 | `recall.k` | 4 | Top blocks to retrieve |
 | `recall.threshold` | 0.62 | Cosine similarity threshold |
 | `recall.budget_tokens` | 3000 | Max injected recall tokens |
 | `judge.interval_tokens` | 20000 | New material before a pass is worth running |
 | `judge.idle_trigger_s` | 300 | Quiet time before a consolidation pass starts |
+| `judge.sweep_interval_s` | 21600 | Sweep at least this often even with no new material, so decay still happens in a quiet week |
 | `judge.purge_age_s` | 259200 | Never recalled and older than this (3 days) → purge |
+| `judge.worthless_age_s` | 172800 | Shorter deadline for blocks the model found nothing reusable in |
+| `judge.max_per_pass` | 200 | Blocks the model may be asked to rewrite in one pass |
 | `judge.consolidate_min_tokens` | 600 | Below this, the model is not called at all |
 | `judge.consolidate_types` | `[reasoning]` | Block types the model may rewrite |
 | `judge.keep_recall_count` | 3 | Recalled this often → keep verbatim, never compress |
@@ -189,35 +241,84 @@ Settings live in `cued_recall/config.yaml` (gitignored, auto-created from `confi
 
 ```
 mind/
-├── run.bat                          # Windows launcher
-├── run.py                           # Python orchestrator
+├── run.bat                          # Windows launcher (interactive, remembers answers)
+├── run.py                           # Python orchestrator: VRAM planning, launch, watchdog
+├── run_settings.txt                 # What the last launch resolved (read by run.bat)
 ├── ramdisk_setup.bat                # Windows RAM disk utility
 ├── INSTALLATION.md                  # Step-by-step setup guide
 ├── ARCHITECTURE.md                  # Block lifecycle, recall, consolidation vs decay
+├── logs/                            # Per-server llama-server stdout
 ├── snapshots/                       # Block store backups (persistent)
+├── evaluate/                        # Retrieval + end-to-end benchmarks
+│   ├── benchmark.md                 # Method notes
+│   ├── corpus.jsonl                 # Hand-built probe corpus, 6 relation types
+│   ├── eval_retrieval.py            # Threshold sweep (no generation)
+│   ├── eval_e2e.py                  # A/B: direct vs through the middleware
+│   ├── analyse.py                   # Paired analysis + bootstrap CI
+│   ├── inspect_blocks.py            # Look at what is actually stored
+│   ├── retrieval_sweep.csv          # Latest sweep output
+│   └── semantic_judge_plan.md       # Planned two-stage recall filter
 └── cued_recall/
     ├── config.yaml                  # Active config (gitignored)
     ├── config.example.yaml          # Template, auto-copied
+    ├── backfill_token_counts.py     # Re-count stored blocks with the real tokenizer
     └── cued_recall/
         ├── main.py                  # FastAPI app, all routes
         ├── pipeline.py              # Recall, blockify, tools, web search
         ├── config.py                # Config classes
         ├── models.py                # Block schema
         ├── store.py                 # Msgpack block store
-        ├── index.py                 # SQLite + sqlite-vec
+        ├── index.py                 # SQLite + sqlite-vec, analytics queries
+        ├── chats.py                 # Durable chat transcripts
         ├── embed.py                 # Embedding client
         ├── judge.py                 # Consolidation + decay
         ├── verifier.py              # Yes/no correction classifier
         ├── tagger.py                # Gist + tags at shelve time
         ├── small_model.py           # Shared queue for the CPU judge server
+        ├── sysinfo.py               # GPU/CPU telemetry (standalone by design)
         ├── router.py                # Admin API routes
         ├── taxonomy.py              # Tag taxonomy
         ├── wal.py                   # Write-ahead log
-        ├── utils.py                 # Stimulus builder, correction matcher
+        ├── utils.py                 # Token counting, stimulus builder, correction matcher
         └── static/
             ├── admin.html           # Admin web GUI
             └── chat.html            # Built-in chat UI
 ```
+
+---
+
+## Benchmarks
+
+Two harnesses, kept apart because conflating them produces numbers that mean
+nothing.
+
+**Retrieval** — does the right block come back? No generation, deterministic,
+runs in seconds:
+
+```bash
+python evaluate/eval_retrieval.py --endpoint http://127.0.0.1:8082
+```
+
+Sweeps `recall.threshold` from 0.30 to 0.94 over `corpus.jsonl` and writes
+`retrieval_sweep.csv` with a recall rate *and* a false-fire rate at each step.
+`--fake` self-tests the harness with synthetic vectors and no servers running.
+
+The corpus is hand-written from real recurring work, with adversarial members in
+every family: `exact`, `paraphrase` and `crosslingual` (Azerbaijani) must recall;
+`trap` (same vocabulary, different answer) should fire but must not be reused
+blindly; `distractor` and `control` must not fire.
+
+**End-to-end** — does having the block help? Slow and noisy, so `--repeats 3`
+with paired analysis:
+
+```bash
+python evaluate/eval_e2e.py --repeats 3
+```
+
+Baseline goes straight to `:8080`, treatment through the middleware, store wiped
+and re-warmed between repeats. `analyse.py` pairs each probe against itself and
+bootstraps a CI. Answer quality is graded by hand on purpose — no script catches
+a model anchoring confidently on a recalled block that did not apply.
 
 ---
 
