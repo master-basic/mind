@@ -103,7 +103,7 @@ second.
 | KV cache management | In progress | Clear endpoint exists; slot save/restore is Phase 2 |
 | Retry/circuit breaking | Not started | External calls (search, embed, upstream) fail soft and are logged, but nothing backs off or trips |
 | Multi-user/isolation | Not started | Single-user alpha |
-| Authentication/TLS | Not started | Open on localhost only |
+| Authentication/TLS | Not started | Loopback by default; `--host` can open it to a LAN, with nothing guarding it |
 
 ### What the memory will and will not delete
 
@@ -136,11 +136,38 @@ reasoning model), prints a launch plan showing what runs where and with how much
 context, then starts 4 servers. Chat UI at `http://127.0.0.1:8000`, admin at
 `/admin`. Later runs reuse the remembered answers without asking.
 
+### Reaching it from another machine
+
+The middleware listens on loopback by default, so only the machine running it
+can connect. `--host 0.0.0.0` binds every interface instead, and the startup
+banner then prints the LAN address to point clients at:
+
+```
+python run.py --host 0.0.0.0
+```
+
+`run.bat` asks for the same thing interactively and remembers the answer in
+`run_settings.txt` (`HOST=`). Windows Firewall still has to allow the port:
+
+```
+netsh advfirewall firewall add rule name="Cued Recall 8000" dir=in action=allow protocol=TCP localport=8000
+```
+
+The three llama.cpp servers stay on loopback either way — the middleware is the
+front door, and behind it they serve the raw models with no memory layer. Pass
+`--expose-backends` to bind them too, which is what a benchmark run from another
+machine needs (`evaluate/` scripts talk to ports 8080–8082 directly).
+
+There is no authentication and no TLS anywhere in this stack. Anyone who can
+reach port 8000 can read and write the memory store. Bind it to a network you
+trust, not to the internet.
+
 ---
 
 ## API endpoints
 
-All routes are on the middleware (default `127.0.0.1:8000`).
+All routes are on the middleware (default `127.0.0.1:8000`, or the machine's LAN
+address when started with `--host 0.0.0.0`).
 
 ### Chat
 

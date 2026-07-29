@@ -187,10 +187,20 @@ def parse_args():
                         "expert layers; pass a number to pin it, or the model's "
                         "layer count to keep every expert off the GPU")
 
-    g = p.add_argument_group("Port overrides")
     g.add_argument("--reasoning-ctx", metavar="N|auto", default="auto",
                    help="Reasoning context size. 'auto' (default) sizes it from "
                         "free VRAM and the model's KV cost; pass a number to pin it")
+
+    g = p.add_argument_group("Network")
+    g.add_argument("--host", metavar="ADDR", default="127.0.0.1",
+                   help="Address the middleware listens on. '127.0.0.1' (default) "
+                        "is this machine only; '0.0.0.0' accepts connections from "
+                        "other machines on the network. There is no authentication, "
+                        "so only do that on a network you trust")
+    g.add_argument("--expose-backends", action="store_true",
+                   help="Bind the llama servers to --host as well. Off by default: "
+                        "the middleware reaches them over loopback, and they serve "
+                        "the raw models with no memory layer and no auth")
     g.add_argument("--reasoning-port", type=int, default=8080, help="Reasoning model port (default: 8080)")
     g.add_argument("--judge-port",     type=int, default=8081, help="Judge model port (default: 8081)")
     g.add_argument("--embed-port",     type=int, default=8082, help="Embedding model port (default: 8082)")
@@ -858,9 +868,36 @@ def gpu_free_mib():
 
 def port_in_use(port: int) -> bool:
     import socket
+    # Loopback even when the server is bound to 0.0.0.0 -- a wildcard bind
+    # answers on 127.0.0.1 too, so this still sees it.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.3)
         return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def is_loopback(host: str) -> bool:
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+def lan_address() -> str:
+    """This machine's address on the network, for printing a reachable URL.
+
+    0.0.0.0 is a bind target, not somewhere anyone can browse to, so the
+    "all systems running" banner would otherwise hand out a dead link. The
+    UDP socket picks the interface the default route uses without sending a
+    packet; falls back to the hostname lookup, then to loopback.
+    """
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(0.3)
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except OSError:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except OSError:
+            return "127.0.0.1"
 
 
 def autosize_reasoning_ctx(reasoning_path, embed_path=None, gpu_layers=99,
@@ -1176,7 +1213,10 @@ def update_config(storage_root, snapshot_path, args, reasoning_ctx=None):
              f"- {RESERVE_TOOLS_TOKENS} tools)")
     config["max_context_tokens"] = derived
     config.setdefault("tokens_per_word", 1.3)
-    config["listen"] = f"127.0.0.1:{args.middleware_port}"
+    config["listen"] = f"{args.host}:{args.middleware_port}"
+    # The middleware always reaches the llama servers over loopback, whatever
+    # they are bound to -- it runs on the same machine, and routing its own
+    # traffic out to a LAN address would only add a hop.
     config["reasoning_endpoint"] = f"http://127.0.0.1:{args.reasoning_port}"
     config["judge_endpoint"] = f"http://127.0.0.1:{args.judge_port}"
     config["embed_endpoint"] = f"http://127.0.0.1:{args.embed_port}"
@@ -1214,8 +1254,9 @@ RESTART_REQUEST = LOG_DIR / "restart-request"
 class ServerSupervisor:
     """Watches the llama servers and restarts one that has wedged."""
 
-    def __init__(self, llama_bin, server_defs, processes):
+    def __init__(self, llama_bin, server_defs, processes, host="127.0.0.1"):
         self.llama_bin = llama_bin
+        self.host = host
         self.defs = {sd["name"]: sd for sd in server_defs}
         self.processes = processes          # shared list of (name, proc, port)
         self.strikes = {}
@@ -1281,7 +1322,8 @@ class ServerSupervisor:
                     old_log.close()
                 except Exception:
                     pass
-            fresh = start_server(self.llama_bin, name, sd["model"], port, sd["extra"])
+            fresh = start_server(self.llama_bin, name, sd["model"], port,
+                                 sd["extra"], self.host)
             self.processes[idx] = (name, fresh, port)
             ok = wait_for_server(name, port, fresh)
             info(f"{name} {'restarted' if ok else 'did NOT come back'}")
@@ -1341,8 +1383,8 @@ def wait_for_server(name, port, proc, timeout=120):
     return False
 
 
-def start_server(llama_bin, name, model_path, port, extra):
-    args = [llama_bin, "-m", model_path, "--port", str(port), "--host", "127.0.0.1"]
+def start_server(llama_bin, name, model_path, port, extra, host="127.0.0.1"):
+    args = [llama_bin, "-m", model_path, "--port", str(port), "--host", host]
     if extra:
         args.extend(extra)
     # Output goes to a file, not a PIPE. Nothing ever read that pipe, so once
@@ -1396,6 +1438,10 @@ def main():
     print()
 
     ensure_config_exists()
+
+    if not is_loopback(args.host):
+        warn(f"Listening on {args.host}: reachable from other machines, "
+             "with no authentication in front of it")
 
     llama_bin = find_llama_server(args)
     if not llama_bin:
@@ -1499,10 +1545,16 @@ def main():
 
     update_config(storage_root, snapshot_path, args, reasoning_ctx)
 
+    # The llama servers stay on loopback unless asked otherwise: the middleware
+    # is the front door, and the raw servers behind it have neither the memory
+    # layer nor any authentication.
+    backend_host = args.host if args.expose_backends else "127.0.0.1"
+
     processes = []
     try:
         for sd in server_defs:
-            proc = start_server(llama_bin, sd["name"], sd["model"], sd["port"], sd["extra"])
+            proc = start_server(llama_bin, sd["name"], sd["model"], sd["port"],
+                                sd["extra"], backend_host)
             processes.append((sd["name"], proc, sd["port"]))
 
         info("Waiting for servers...")
@@ -1536,7 +1588,8 @@ def main():
                 continue
             warn(f"{name} failed to start; retrying ({', '.join(surrendered)})")
             sd["extra"] = retry_extra
-            retry = start_server(llama_bin, name, sd["model"], port, sd["extra"])
+            retry = start_server(llama_bin, name, sd["model"], port,
+                                 sd["extra"], backend_host)
             processes[i] = (name, retry, port)
             if wait_for_server(name, port, retry):
                 # The prompt budget was written from the ctx that just failed.
@@ -1555,21 +1608,39 @@ def main():
                   "CUED_RECALL_RESTART_FILE": str(RESTART_REQUEST)}
         middleware = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "cued_recall.main:create_app",
-             "--factory", "--host", "127.0.0.1", "--port", str(args.middleware_port),
+             "--factory", "--host", args.host, "--port", str(args.middleware_port),
              "--log-level", "info"],
             cwd=str(ROOT / "cued_recall"),
             env=mw_env,
         )
         processes.append(("middleware", middleware, args.middleware_port))
 
+        # 0.0.0.0 means "every interface", which is not an address anyone can
+        # type. Show where the stack actually answers from another machine.
+        shown_host = lan_address() if args.host == "0.0.0.0" else args.host
+        backend_shown = shown_host if args.expose_backends else "127.0.0.1"
+
         print()
         print("=== All systems running ===")
-        print(f"  Middleware:     http://127.0.0.1:{args.middleware_port}/v1/chat/completions")
-        print(f"  Admin GUI:      http://127.0.0.1:{args.middleware_port}/admin")
-        print(f"  Admin stats:    http://127.0.0.1:{args.middleware_port}/admin/stats")
+        print(f"  Middleware:     http://{shown_host}:{args.middleware_port}/v1/chat/completions")
+        print(f"  Admin GUI:      http://{shown_host}:{args.middleware_port}/admin")
+        print(f"  Admin stats:    http://{shown_host}:{args.middleware_port}/admin/stats")
         for name, _, port in processes:
             if name != "middleware":
-                print(f"  {name.capitalize():14} http://127.0.0.1:{port}")
+                print(f"  {name.capitalize():14} http://{backend_shown}:{port}")
+        if not is_loopback(args.host):
+            mw_port = args.middleware_port
+            print(f"  Open to the network on {args.host}:{mw_port}. Nothing asks for")
+            print("  a password, so anyone who can reach that port can read and")
+            print("  write the memory store.")
+            if os.name == "nt":
+                # The bind succeeds regardless; it is the firewall that makes
+                # the connection time out from the other machine, which looks
+                # exactly like "it did not work".
+                print("  If it is unreachable, allow the port (as Administrator):")
+                print('    netsh advfirewall firewall add rule '
+                      f'name="Cued Recall {mw_port}" dir=in action=allow '
+                      f'protocol=TCP localport={mw_port}')
         print(f"  Storage:        {storage_root}")
         print(f"  Snapshots:      {snapshot_path}")
         print("  Press Ctrl+C to stop all processes")
@@ -1580,7 +1651,8 @@ def main():
         signal.signal(signal.SIGINT, shutdown)
         signal.signal(signal.SIGTERM, shutdown)
 
-        supervisor = ServerSupervisor(llama_bin, server_defs, processes)
+        supervisor = ServerSupervisor(llama_bin, server_defs, processes,
+                                      backend_host)
         threading.Thread(target=supervisor.watch, daemon=True).start()
         info(f"Wedge watchdog active (probe every {WATCHDOG_INTERVAL}s, "
              f"restart after {WEDGE_STRIKES} blocked probes)")

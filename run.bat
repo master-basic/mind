@@ -65,6 +65,7 @@ set "SAVED_REASONING="
 set "SAVED_REASONING_CHOICE="
 set "SAVED_JUDGE="
 set "SAVED_EMBED="
+set "SAVED_HOST="
 set "HAVE_SAVED=0"
 if exist "%SETTINGS_FILE%" (
     for /f "usebackq tokens=1,* delims==" %%A in ("%SETTINGS_FILE%") do set "SAVED_%%A=%%B"
@@ -89,6 +90,7 @@ echo Found settings from your last run:
 echo   llama-server:    !SAVED_LLAMA_BIN!
 echo   Models cache:    !SAVED_MODELS_CACHE!
 echo   Storage path:    !SAVED_STORAGE!
+if "!SAVED_HOST!"=="" (echo   Listen on:       127.0.0.1 ^(this PC only^)) else (echo   Listen on:       !SAVED_HOST!)
 echo.
 echo Models it will load:
 if not "!CUR_NAME!"=="" echo   Reasoning:       !CUR_NAME!   [choice !SAVED_REASONING_CHOICE!, ctx !CUR_CTX!]
@@ -111,6 +113,7 @@ set "REASONING=!SAVED_REASONING!"
 set "REASONING_CHOICE=!SAVED_REASONING_CHOICE!"
 set "JUDGE=!SAVED_JUDGE!"
 set "EMBED=!SAVED_EMBED!"
+set "HOST=!SAVED_HOST!"
 goto :save_and_build
 
 :ask
@@ -139,6 +142,14 @@ set /p "JUDGE=Path to judge GGUF model [!SAVED_JUDGE!]: "
 set "EMBED=!SAVED_EMBED!"
 set /p "EMBED=Path to embedding GGUF model [!SAVED_EMBED!]: "
 
+REM 0.0.0.0 opens the chat UI, admin page and API to every machine on the
+REM network. Nothing in front of it asks for a password, so this is a LAN-only
+REM answer, and Windows Firewall still has to allow the port.
+echo.
+echo Who can reach this? 127.0.0.1 = this PC only, 0.0.0.0 = anyone on your network (no password).
+set "HOST=!SAVED_HOST!"
+set /p "HOST=Listen address [!SAVED_HOST!] (blank=127.0.0.1): "
+
 :save_and_build
 echo.
 echo Proceeding with the selected options...
@@ -162,6 +173,7 @@ REM so parentheses in Windows paths can't truncate the write)
 >>"%SETTINGS_FILE%" echo REASONING=!REASONING!
 >>"%SETTINGS_FILE%" echo JUDGE=!JUDGE!
 >>"%SETTINGS_FILE%" echo EMBED=!EMBED!
+>>"%SETTINGS_FILE%" echo HOST=!HOST!
 REM Preserve the remembered model-menu choice; run.py rewrites it when the
 REM user picks from the menu.
 if not "!REASONING_CHOICE!"=="" (>>"%SETTINGS_FILE%" echo REASONING_CHOICE=!REASONING_CHOICE!)
@@ -176,6 +188,7 @@ if not "!REASONING!"==""    set "ARGS=!ARGS! --reasoning-model !REASONING!"
 if not "!REASONING_CHOICE!"=="" set "ARGS=!ARGS! --reasoning-choice !REASONING_CHOICE!"
 if not "!JUDGE!"==""        set "ARGS=!ARGS! --judge-model !JUDGE!"
 if not "!EMBED!"==""        set "ARGS=!ARGS! --embed-model !EMBED!"
+if not "!HOST!"==""         set "ARGS=!ARGS! --host !HOST!"
 
 goto :run
 

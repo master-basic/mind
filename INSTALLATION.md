@@ -188,6 +188,38 @@ Your chat client connects to the middleware as if it were a standard OpenAI API.
 
 There is also a built-in chat UI at http://127.0.0.1:8000/ if you don't want a separate client.
 
+### From another PC on your network
+
+By default the middleware only accepts connections from the machine it runs on. To let other computers use it:
+
+1. **Answer the listen-address prompt.** `run.bat` asks `Listen address [...] (blank=127.0.0.1)`. Enter `0.0.0.0`. On Linux, or to skip the prompt, pass it as a flag:
+
+   ```
+   python run.py --host 0.0.0.0
+   ```
+
+   The answer is remembered in `run_settings.txt` as `HOST=`, so later runs keep it.
+
+2. **Allow the port through Windows Firewall.** Run once, in an Administrator terminal:
+
+   ```
+   netsh advfirewall firewall add rule name="Cued Recall 8000" dir=in action=allow protocol=TCP localport=8000
+   ```
+
+3. **Use the address from the startup banner.** With `--host 0.0.0.0` it prints this machine's LAN address instead of `127.0.0.1`:
+
+   ```
+   === All systems running ===
+     Middleware:     http://192.168.1.50:8000/v1/chat/completions
+     Admin GUI:      http://192.168.1.50:8000/admin
+   ```
+
+   On the other PC, point the chat client's API endpoint at `http://192.168.1.50:8000/v1`, or open that address in a browser for the chat UI.
+
+The three llama.cpp servers (8080–8082) stay on loopback and are not reachable from elsewhere. That is deliberate — they answer with the raw model and no memory layer. `--expose-backends` binds them to the same address, which is only needed to run the `evaluate/` benchmark scripts from another machine.
+
+> **No password, no encryption.** Anyone who can reach port 8000 can chat with the model, read every stored memory block, and delete blocks from the admin page. Only do this on a home or office network you control. Do not forward the port through a router.
+
 ### opencode
 
 opencode needs `npm` set so it knows which SDK adapter to use for a custom provider. A working `opencode.json`:

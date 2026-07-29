@@ -163,7 +163,9 @@ splitting; a wedge watchdog; snapshots; and two evaluation harnesses.
 
 ## What it does not do
 
-Single user. No authentication, no TLS, localhost only. No retry or circuit
+Single user. No authentication, no TLS. It binds loopback by default and
+`--host 0.0.0.0` will serve a LAN, but nothing stands in front of that: reaching
+the port is the whole authorization model. No retry or circuit
 breaking on external calls — they fail soft and get logged, nothing backs off.
 KV slot save/restore is unfinished. The end-to-end benchmark has a harness and
 no published results, because the grading that matters there is done by hand.
