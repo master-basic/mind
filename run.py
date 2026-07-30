@@ -27,6 +27,7 @@ import re
 import platform
 import argparse
 import threading
+from collections import namedtuple
 from pathlib import Path
 
 ROOT = Path(__file__).parent.resolve()
@@ -671,12 +672,17 @@ def resolve_models(args, storage_root, hf_hub):
     return result
 
 
-# Headroom carved out of the reasoning server's context window.
-#   - the reply itself shares the same window as the prompt
-#   - tool definitions ride along in the request but are not counted by
-#     _fit_messages, and an agentic client's tool set is not small
+# Headroom carved out of the reasoning server's context window: the reply
+# shares the same window as the prompt.
+#
+# There used to be a second reserve here for tool definitions, on the grounds
+# that they ride along in the request without _fit_messages counting them. That
+# stopped being true -- Pipeline._payload_overhead_tokens now charges the actual
+# schemas against the budget per request, measured rather than guessed. Keeping
+# the flat 2048 as well billed an agentic client twice for the same bytes, and
+# on a 16k window that was the margin between trimming some history and
+# trimming the user's message down to nothing.
 RESERVE_OUTPUT_TOKENS = 4096
-RESERVE_TOOLS_TOKENS = 2048
 
 
 def reasoning_ctx_size() -> int:
@@ -693,7 +699,7 @@ def reasoning_ctx_size() -> int:
 
 def derive_max_context_tokens(ctx=None) -> int:
     ctx = ctx or reasoning_ctx_size()
-    return max(4096, ctx - RESERVE_OUTPUT_TOKENS - RESERVE_TOOLS_TOKENS)
+    return max(4096, ctx - RESERVE_OUTPUT_TOKENS)
 
 
 # --------------------------------------------------------------------------
@@ -733,6 +739,13 @@ MIN_AUTO_CTX = 8192
 # This is a latency ceiling, not a memory one -- pin --reasoning-ctx N to go
 # past it deliberately.
 MAX_AUTO_CTX = 65536
+# A sliding-window layer's cache holds the window plus room for the batch in
+# flight, not the whole context. 2048 is llama.cpp's default --batch-size, which
+# the reasoning server does not override (only the embed server does). The exact
+# padding is a llama.cpp internal that has moved between releases, so this is
+# deliberately generous: over-reserving costs some context, under-reserving
+# costs a failed load.
+SWA_BATCH_PAD_TOKENS = 2048
 _GGUF_SIMPLE = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i",
                 6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d"}
 # ggml_type -> (elements per block, bytes per block). Needed to turn a tensor's
@@ -893,20 +906,47 @@ def moe_expert_layer_mib(path) -> list:
     return [per_layer[i] / (1024 * 1024) for i in range(max(per_layer) + 1)]
 
 
-def kv_bytes_per_token(md: dict) -> int:
-    """KV cache cost of one token, from the model's own header.
+KVCost = namedtuple("KVCost", "per_token fixed_bytes note")
 
-    The naive formula (every layer keeps a KV cache) is wrong for hybrid
-    models. Qwen3.5 for instance sets full_attention_interval=4, meaning only
-    every 4th layer holds a KV cache at all -- the rest are Gated DeltaNet
-    layers carrying a constant-size recurrent state. Ignoring that overstates
-    the cost 4x and would hand back a quarter of the context the card can
-    actually hold. Validated against measurement: this returns 32 KiB/token
-    for Qwen3.5-9B, where loading at 32k/64k/128k measured 1.00/2.04/4.10 GiB.
+
+def kv_cache_bytes(cost, ctx: int) -> int:
+    """Total KV cache for a `ctx`-token window.
+
+    Assumes ctx is at least the sliding window plus its batch pad, which
+    MIN_AUTO_CTX (8192) guarantees against the windows in play here -- below
+    that the sliding layers would be bounded by ctx instead and this reads
+    slightly high, which is the safe direction.
+    """
+    return cost.per_token * ctx + cost.fixed_bytes
+
+
+def kv_bytes_per_token(md: dict, batch_pad: int = SWA_BATCH_PAD_TOKENS):
+    """KV cache cost of this model, from its own header.
+
+    Returns a KVCost: `per_token` bytes that scale with the window, plus
+    `fixed_bytes` that do not. Use kv_cache_bytes() to combine them.
+
+    Two things make the naive "every layer caches every token" formula wrong,
+    and each one costs real context if ignored:
+
+    * Hybrid attention. Qwen3.5 sets full_attention_interval=4, so only every
+      4th layer holds a KV cache at all -- the rest are Gated DeltaNet layers
+      carrying a constant-size recurrent state. Ignoring that overstates the
+      cost 4x and hands back a quarter of the context the card can hold.
+      Validated against measurement: 32 KiB/token for Qwen3.5-9B, where loading
+      at 32k/64k/128k measured 1.00/2.04/4.10 GiB.
+
+    * Interleaved sliding-window attention. Gemma4 runs 25 of its 30 layers on
+      a 1024-token sliding window and only 5 on global attention. A sliding
+      layer's cache is bounded by that window, so it is a fixed cost that does
+      not grow with the context -- which is why it comes back separately here
+      instead of folded into a per-token figure. Charging those 25 layers per
+      token read 420 KiB/token against a real ~20 KiB/token plus a few hundred
+      MiB, a ~12x over-estimate, and that is what pinned the window to 16k.
     """
     arch = md.get("general.architecture")
     if not arch:
-        return 0
+        return KVCost(0, 0, "")
     g = lambda k, d=None: md.get(f"{arch}.{k}", d)
 
     n_layer = g("block_count") or 0
@@ -916,33 +956,58 @@ def kv_bytes_per_token(md: dict) -> int:
     k_len = g("attention.key_length") or (embed // n_heads if n_heads else 0)
     v_len = g("attention.value_length") or k_len
     if not (n_layer and n_kv_heads and k_len):
-        return 0
+        return KVCost(0, 0, "")
 
     # Hybrid attention: only 1 layer in `full_attention_interval` keeps a cache.
     interval = g("full_attention_interval") or 1
     full_layers = max(1, n_layer // interval) if interval > 1 else n_layer
 
-    # Gemma4 stores head_count_kv as a per-layer list (different KV heads for
-    # sliding window vs global attention layers). Sum each layer individually
-    # using the correct key/value length for each layer type.
+    # A per-layer head count (Gemma4) means the layers are not interchangeable,
+    # so which ones slide has to be read from sliding_window_pattern. Inferring
+    # it from the head count had the mapping backwards: in this GGUF the GLOBAL
+    # layers are the 2-head ones and the sliding layers carry 8.
     if isinstance(n_kv_heads, list):
-        k_len_swa = g("attention.key_length_swa") or k_len
-        v_len_swa = g("attention.value_length_swa") or v_len
-        heads = (n_kv_heads + [0] * n_layer)[:n_layer]
-        total = 0
-        for i, h in enumerate(heads):
-            if interval > 1 and i % interval != 0:
-                continue
-            # SWA layers have fewer KV heads (e.g. 2 vs 8) and shorter k/v len.
-            if h <= 2 and k_len_swa != k_len:
-                total += h * (k_len_swa + v_len_swa)
-            else:
-                total += h * (k_len + v_len)
-        # llama.cpp defaults to f16 K and V.
-        return int(total * 2)
+        return _kv_cost_per_layer(g, n_layer, n_kv_heads, k_len, v_len,
+                                  interval, batch_pad)
 
     # llama.cpp defaults to f16 K and V.
-    return int(full_layers * n_kv_heads * (k_len + v_len) * 2)
+    per_token = int(full_layers * n_kv_heads * (k_len + v_len) * 2)
+    return KVCost(per_token, 0, f"{full_layers}/{n_layer} layers hold a cache")
+
+
+def _kv_cost_per_layer(g, n_layer, n_kv_heads, k_len, v_len, interval, batch_pad):
+    """KV cost for a model whose KV geometry varies by layer (Gemma4's iSWA)."""
+    k_len_swa = g("attention.key_length_swa") or k_len
+    v_len_swa = g("attention.value_length_swa") or v_len
+    window = g("attention.sliding_window") or 0
+    pattern = g("attention.sliding_window_pattern")
+    if not isinstance(pattern, list):
+        # No pattern to read: charge every layer as global. Wrong high rather
+        # than wrong low, and it cannot silently hand out a window that will
+        # not load.
+        pattern = []
+    pattern = (list(pattern) + [False] * n_layer)[:n_layer]
+    heads = (list(n_kv_heads) + [0] * n_layer)[:n_layer]
+
+    per_token = swa_per_token = 0
+    n_global = n_swa = 0
+    for i, h in enumerate(heads):
+        if interval > 1 and i % interval != 0:
+            continue
+        if window and pattern[i]:
+            swa_per_token += h * (k_len_swa + v_len_swa)
+            n_swa += 1
+        else:
+            per_token += h * (k_len + v_len)
+            n_global += 1
+    # llama.cpp defaults to f16 K and V.
+    per_token *= 2
+    swa_per_token *= 2
+
+    note = f"{n_global}/{n_layer} layers hold a full cache"
+    if n_swa:
+        note += f", {n_swa} slide over {window:,} tokens"
+    return KVCost(per_token, swa_per_token * (window + batch_pad), note)
 
 
 def gpu_free_mib():
@@ -1001,13 +1066,18 @@ def lan_address() -> str:
 
 def autosize_reasoning_ctx(reasoning_path, embed_path=None, gpu_layers=99,
                            cpu_moe=False, pinned_ctx=None,
-                           free_mib=None, ports_busy=None):
+                           free_mib=None, ports_busy=None, extras_paths=None):
     """Plan the reasoning server's VRAM: context size, then the MoE split.
 
     One pool of memory, so one decision: the KV cache is sized first (it sets
     how long a conversation can get), and whatever is left over is spent on
     expert layers rather than left idle. Pass `pinned_ctx` to fix the window
     and size only the split around it.
+
+    `extras_paths` is the {name: path} map of side files launched with the model
+    (--mmproj, -md). llama.cpp puts both on the GPU, and for Gemma4 they are
+    1.4 GB between them -- leaving them out of the budget sized a window the
+    card could not actually hold.
 
     Returns (ctx, n_cpu_moe, notes), where n_cpu_moe is None for "use plain
     --cpu-moe" and notes are the lines to show the user. Falls back to the
@@ -1041,8 +1111,8 @@ def autosize_reasoning_ctx(reasoning_path, embed_path=None, gpu_layers=99,
         return default, None, [f"reasoning model not on disk yet; showing default ctx {default:,}"]
 
     md = read_gguf_metadata(reasoning_path)
-    per_token = kv_bytes_per_token(md)
-    if not per_token:
+    cost = kv_bytes_per_token(md)
+    if not cost.per_token:
         return default, None, ["could not read KV geometry from the GGUF; keeping default ctx"]
 
     arch = md.get("general.architecture", "?")
@@ -1072,18 +1142,29 @@ def autosize_reasoning_ctx(reasoning_path, embed_path=None, gpu_layers=99,
         except OSError:
             pass
 
+    # Side files launched alongside the model. --cpu-moe does not touch these:
+    # the vision projector and the MTP draft head both load onto the GPU whole.
+    extras_mib = 0
+    for path in (extras_paths or {}).values():
+        try:
+            extras_mib += os.path.getsize(path) // (1024 * 1024)
+        except OSError:
+            pass
+
     # Two GPU-resident llama.cpp processes (reasoning + embed), each paying
     # its own CUDA context.
     overhead = CUDA_OVERHEAD_MIB * (2 if embed_path else 1)
     safety = max(VRAM_SAFETY_MIN_MIB, int(total_mib * VRAM_SAFETY_FRACTION))
-    budget_mib = free_mib - weights_mib - embed_mib - overhead - safety - TRANSIENT_BUF_MIB
+    budget_mib = (free_mib - weights_mib - embed_mib - extras_mib
+                  - overhead - safety - TRANSIENT_BUF_MIB)
 
     notes.append(f"{gpu_name}: {free_mib:,} MiB free of {total_mib:,} MiB")
     if moe_note:
         notes.append(moe_note)
     notes.append(
         f"reserving {weights_mib:,} weights + {embed_mib:,} embed "
-        f"+ {overhead} CUDA + {safety} safety + {TRANSIENT_BUF_MIB} transient = "
+        + (f"+ {extras_mib:,} mmproj/draft " if extras_mib else "")
+        + f"+ {overhead} CUDA + {safety} safety + {TRANSIENT_BUF_MIB} transient = "
         f"{budget_mib:,} MiB for KV"
     )
 
@@ -1099,22 +1180,26 @@ def autosize_reasoning_ctx(reasoning_path, embed_path=None, gpu_layers=99,
         notes.append(f"keeping default ctx {default:,}")
         return default, None, notes
 
-    kib = per_token / 1024
+    kib = cost.per_token / 1024
+    # The sliding-window layers are a flat charge whatever the window, so they
+    # come off the budget before the per-token division rather than scaling
+    # with it.
+    scalable_bytes = budget_mib * 1024 * 1024 - cost.fixed_bytes
     if pinned_ctx:
         ctx = pinned_ctx
         hit_trained = hit_latency = False
     else:
-        ctx = int(budget_mib * 1024 * 1024 // per_token)
+        ctx = int(max(0, scalable_bytes) // cost.per_token)
         ctx = (ctx // 4096) * 4096                   # llama.cpp likes round numbers
         ctx = min(ctx, int(trained_ctx))             # never exceed what it was trained for
         hit_trained = ctx >= int(trained_ctx)
         hit_latency = ctx > MAX_AUTO_CTX
         ctx = min(ctx, MAX_AUTO_CTX)
-    notes.append(
-        f"KV costs {kib:.0f} KiB/token "
-        f"({max(1, (md.get(arch + '.block_count') or 1) // (md.get(arch + '.full_attention_interval') or 1))}"
-        f"/{md.get(arch + '.block_count')} layers hold a cache)"
-    )
+    kv_note = f"KV costs {kib:.0f} KiB/token ({cost.note})"
+    if cost.fixed_bytes:
+        kv_note += (f" plus a flat {cost.fixed_bytes / (1024 * 1024):,.0f} MiB "
+                    f"for the sliding layers")
+    notes.append(kv_note)
 
     if ctx < MIN_AUTO_CTX:
         notes.append(f"computed ctx {ctx:,} below the {MIN_AUTO_CTX:,} floor; "
@@ -1127,13 +1212,13 @@ def autosize_reasoning_ctx(reasoning_path, embed_path=None, gpu_layers=99,
         notes.append(f"capped at the model's trained context ({int(trained_ctx):,})")
 
     n_cpu_moe, moe_notes = _plan_expert_split(
-        reasoning_path, cpu_moe, budget_mib, ctx, per_token
+        reasoning_path, cpu_moe, budget_mib, ctx, cost
     )
     notes.extend(moe_notes)
     return ctx, n_cpu_moe, notes
 
 
-def _plan_expert_split(reasoning_path, cpu_moe, budget_mib, ctx, per_token):
+def _plan_expert_split(reasoning_path, cpu_moe, budget_mib, ctx, cost):
     """Decide --n-cpu-moe N from the VRAM the KV cache did not claim.
 
     Capping the context stops short of using the card: once the window is
@@ -1152,7 +1237,7 @@ def _plan_expert_split(reasoning_path, cpu_moe, budget_mib, ctx, per_token):
     if not sizes:
         return None, ["could not read per-layer expert sizes; keeping --cpu-moe"]
 
-    kv_mib = ctx * per_token / (1024 * 1024)
+    kv_mib = kv_cache_bytes(cost, ctx) / (1024 * 1024)
     spare = budget_mib - kv_mib
     n_layers = len(sizes)
 
@@ -1233,7 +1318,7 @@ def resolve_reasoning_ctx(args, models):
                    (model_path and is_moe_model(Path(model_path).name)))
     ctx, n_cpu_moe, notes = autosize_reasoning_ctx(
         model_path, models.get("embed"), gpu_layers=99, cpu_moe=cpu_moe,
-        pinned_ctx=pinned,
+        pinned_ctx=pinned, extras_paths=models.get("reasoning_extras"),
     )
 
     # An explicit --reasoning-n-cpu-moe overrides the computed split, the same
@@ -1308,8 +1393,8 @@ def update_config(storage_root, snapshot_path, args, reasoning_ctx=None):
     derived = derive_max_context_tokens(ctx)
     if config.get("max_context_tokens") != derived:
         info(f"max_context_tokens: {derived:,} "
-             f"(ctx {ctx:,} - {RESERVE_OUTPUT_TOKENS} reply "
-             f"- {RESERVE_TOOLS_TOKENS} tools)")
+             f"(ctx {ctx:,} - {RESERVE_OUTPUT_TOKENS} reply; tool schemas are "
+             f"charged per request, not reserved here)")
     config["max_context_tokens"] = derived
     config.setdefault("tokens_per_word", 1.3)
     config["listen"] = f"{args.host}:{args.middleware_port}"

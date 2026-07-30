@@ -691,6 +691,22 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
         body = await request.json()
         stream = body.get("stream", False)
 
+        msgs = body.get("messages", [])
+        last_user = None
+        for m in reversed(msgs):
+            if m.get("role") == "user":
+                last_user = m
+                break
+        wal.write({
+            "event": "incoming_request",
+            "keys": list(body.keys()),
+            "messages_count": len(msgs),
+            "user_content_type": type(last_user.get("content", "")).__name__ if last_user else "none",
+            "user_content_len": len(str(last_user.get("content", ""))) if last_user else 0,
+            "user_content_preview": str(last_user.get("content", ""))[:200] if last_user else "",
+            "stream": stream,
+        })
+
         conv_id, turn_index = _derive_conversation(body)
 
         user_message = pipeline.get_last_user_message(body)

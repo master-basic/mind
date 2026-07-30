@@ -117,6 +117,11 @@ class Pipeline:
     # How far under the limit trimming goes once it has to trim at all. The
     # gap is deliberate slack: see the comment in _fit_messages.
     TRIM_TARGET_RATIO = 0.8
+    # Floor on what trimming may leave of the newest user turn. A question cut
+    # below this is not worth answering, and a question cut to zero is worse
+    # than an error: the model reports that the message is empty, which reads as
+    # a broken model rather than a misconfigured budget.
+    MIN_QUERY_TOKENS = 256
 
     def __init__(
         self,
@@ -243,14 +248,15 @@ class Pipeline:
         Only worth calling near the limit -- /tokenize costs a fixed ~450 ms
         regardless of input size. Returns None if the server can't be reached,
         in which case the caller keeps its estimate.
+
+        Tools are deliberately excluded from the blob here. They are already
+        accounted for in _payload_overhead_tokens, which subtracts them from
+        the budget. Including them in both places double-counts their size,
+        making the trimmer think far more history must be dropped than actually
+        needs to be -- and when the only messages left are the system prompt
+        and the latest user turn, the truncation step empties the user message.
         """
         blob = "\n".join(self._msg_text(m) for m in messages)
-        tools = body.get("tools")
-        if tools:
-            try:
-                blob += "\n" + json.dumps(tools)
-            except (TypeError, ValueError):
-                pass
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 r = await client.post(
@@ -388,20 +394,58 @@ class Pipeline:
             total -= sizes.pop(victim)
             result.pop(victim)
 
-        # If still over, truncate the last message. Drops from the FRONT,
-        # keeping the tail: for a pasted document or a tool result, the end is
-        # usually the part being asked about.
+        # If nothing is left to drop and it still does not fit, start shrinking
+        # messages in place -- cheapest to lose first: old turns, then the system
+        # prompt, then the newest user turn, and that one only down to a floor.
+        #
+        # It used to truncate result[-1] unconditionally, which is usually the
+        # newest user turn. The drop loop above carefully protects that turn;
+        # this step then erased it anyway, because keep_tokens goes to zero as
+        # soon as the overshoot exceeds the message's own size. A two-token "hi"
+        # against a budget blown by an agentic client's tool schemas came out as
+        # content="", and the model answered that the message was empty -- the
+        # one failure mode with no error anywhere to point at it.
+        #
+        # Each shrink drops from the FRONT, keeping the tail: for a pasted
+        # document or a tool result, the end is usually the part being asked
+        # about.
         if total > limit and result:
-            last = result[-1]
-            text = self._msg_text(last)
-            last_tokens = sizes[-1] if sizes else self._estimate_tokens(text)
-            if text and last_tokens > 0:
-                keep_tokens = max(0, last_tokens - (total - limit))
+            protected = self._newest_user_index(result)
+            order = sorted((j for j in range(1, len(result)) if j != protected),
+                           key=lambda j: sizes[j], reverse=True)
+            if protected != 0:
+                order.append(0)
+            if protected is not None:
+                order.append(protected)
+
+            for j in order:
+                if total <= limit:
+                    break
+                text = self._msg_text(result[j])
+                if not text or sizes[j] <= 0:
+                    continue
+                floor = self.MIN_QUERY_TOKENS if j == protected else 0
+                keep_tokens = max(floor, sizes[j] - (total - limit))
+                if keep_tokens >= sizes[j]:
+                    continue          # already smaller than its own floor
                 # Convert the token allowance back into characters at this
                 # message's own measured density, rounding down so we never
                 # leave more than the budget allows.
-                keep_chars = int(len(text) * (keep_tokens / last_tokens))
-                result[-1] = _set_content(last, text[len(text) - keep_chars:])
+                keep_chars = int(len(text) * (keep_tokens / sizes[j]))
+                result[j] = _set_content(result[j], text[len(text) - keep_chars:])
+                total -= sizes[j] - keep_tokens
+                sizes[j] = keep_tokens
+
+        if total > limit:
+            # The system prompt and the current question do not fit together, so
+            # no amount of trimming will help. Silently sending a blank question
+            # is how that stayed invisible; say what is actually wrong instead.
+            raise RuntimeError(
+                f"prompt does not fit: {total:,} tokens of messages against a "
+                f"{limit:,}-token budget with nothing left to trim. The "
+                f"reasoning server's window is too small for this client's "
+                f"system prompt and tool schemas -- raise --reasoning-ctx."
+            )
 
         # Trimming can orphan a `tool` result whose preceding assistant
         # tool_calls message was dropped, which llama.cpp rejects. Drop any
@@ -1350,7 +1394,20 @@ class Pipeline:
                 round_content = ""
                 tool_fallback_filter = self.ToolCallFallbackFilter()
                 reasoning_fallback_filter = self.ToolCallFallbackFilter()
-                fitted = await self._fit_messages(messages, body)
+                try:
+                    fitted = await self._fit_messages(messages, body)
+                except RuntimeError as e:
+                    # _fit_messages raises when nothing more can be trimmed.
+                    # Uncaught, that exception reaches the client as a bare
+                    # connection drop -- the generator is already the body of
+                    # a 200 StreamingResponse, so there is no status code left
+                    # to carry an error, and the stream just ends with no
+                    # explanation. Same visible-error treatment as an upstream
+                    # HTTP failure, so this doesn't become the next silent
+                    # empty-response bug.
+                    yield sse({"content": f"\n\n[{e}]"})
+                    upstream_finish = "stop"
+                    break
 
                 # An upstream failure here used to be invisible. The old code
                 # went straight to `async for line in resp.aiter_lines()` with
