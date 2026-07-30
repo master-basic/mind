@@ -922,6 +922,25 @@ def kv_bytes_per_token(md: dict) -> int:
     interval = g("full_attention_interval") or 1
     full_layers = max(1, n_layer // interval) if interval > 1 else n_layer
 
+    # Gemma4 stores head_count_kv as a per-layer list (different KV heads for
+    # sliding window vs global attention layers). Sum each layer individually
+    # using the correct key/value length for each layer type.
+    if isinstance(n_kv_heads, list):
+        k_len_swa = g("attention.key_length_swa") or k_len
+        v_len_swa = g("attention.value_length_swa") or v_len
+        heads = (n_kv_heads + [0] * n_layer)[:n_layer]
+        total = 0
+        for i, h in enumerate(heads):
+            if interval > 1 and i % interval != 0:
+                continue
+            # SWA layers have fewer KV heads (e.g. 2 vs 8) and shorter k/v len.
+            if h <= 2 and k_len_swa != k_len:
+                total += h * (k_len_swa + v_len_swa)
+            else:
+                total += h * (k_len + v_len)
+        # llama.cpp defaults to f16 K and V.
+        return int(total * 2)
+
     # llama.cpp defaults to f16 K and V.
     return int(full_layers * n_kv_heads * (k_len + v_len) * 2)
 
