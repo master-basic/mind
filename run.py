@@ -69,10 +69,14 @@ REASONING_CATALOG = [
     },
     {
         "num": 5,
-        "label": "Qwen3.6-35B-A3B unc-heretic MXFP4    20.3 GB  MoE, experts in RAM",
-        "repo": "noctrex/Qwen3.6-35B-A3B-uncensored-heretic-MXFP4_MOE-GGUF",
-        "file": "Qwen3.6-35B-A3B-uncensored-heretic-MXFP4_MOE.gguf",
+        "label": "Gemma4-26B-A4B Uncensored Balanced      16.8 GB  MoE, experts in RAM",
+        "repo": "HauhauCS/Gemma4-26B-A4B-QAT-Uncensored-HauhauCS-Balanced-MTP",
+        "file": "Gemma4-26B-A4B-QAT-Uncensored-HauhauCS-Balanced-Q4_K_M.gguf",
         "moe": True,
+        "extras": [
+            {"name": "mmproj", "file": "mmproj-Gemma4-26B-A4B-QAT-Uncensored-HauhauCS-Balanced-BF16.gguf"},
+            {"name": "mtp", "file": "mtp-gemma-4-26B-A4B-it.gguf"},
+        ],
     },
     {
         "num": 6,
@@ -275,7 +279,7 @@ SETTINGS_FILE = ROOT / "run_settings.txt"
 
 def is_moe_model(filename: str) -> bool:
     low = (filename or "").lower()
-    return "a3b" in low or "moe" in low
+    return "a3b" in low or "a4b" in low or "moe" in low
 
 
 def save_settings(**pairs):
@@ -500,6 +504,71 @@ def resolve_snapshot_path(args):
     return snapshot_path
 
 
+def _resolve_extras(entry, persist_dir, work_dir, same_location, args, hf_hub):
+    """Download and stage companion files (mmproj, MTP draft head, etc.).
+
+    Returns a dict mapping extra name -> resolved path, or {} on failure.
+    """
+    extras = entry.get("extras", [])
+    if not extras:
+        return {}
+    extra_paths = {}
+    for extra in extras:
+        extra_file = extra["file"]
+        extra_name = extra["name"]
+        extra_persist = persist_dir / extra_file
+        extra_work = work_dir / extra_file
+
+        # Already in the working dir.
+        if extra_work.exists():
+            extra_paths[extra_name] = str(extra_work)
+            continue
+
+        # On disk in the persistent location.
+        if extra_persist.exists():
+            if same_location or args.dry_run:
+                extra_paths[extra_name] = str(extra_persist)
+                continue
+        else:
+            # Download.
+            if args.no_download:
+                warn(f"Extra {extra_name} not found at {extra_persist}; "
+                     f"skipping (--no-download)")
+                continue
+            if args.dry_run:
+                info(f"Would download extra {extra_name}: "
+                     f"{entry['repo']}/{extra_file} -> {extra_persist}")
+                extra_paths[extra_name] = str(extra_persist)
+                continue
+            info(f"Downloading extra {extra_name} ({extra_file})...")
+            try:
+                hf_hub.hf_hub_download(
+                    repo_id=entry["repo"],
+                    filename=extra_file,
+                    local_dir=persist_dir,
+                )
+                downloaded = persist_dir / extra_file
+                if downloaded != extra_persist and not extra_persist.exists():
+                    downloaded.rename(extra_persist)
+                info(f"Downloaded extra {extra_name} -> {extra_persist}")
+            except Exception as e:
+                warn(f"Failed to download extra {extra_name}: {e}")
+                continue
+
+        # Stage to working dir.
+        if not same_location and not args.dry_run:
+            try:
+                shutil.copy2(extra_persist, extra_work)
+                extra_paths[extra_name] = str(extra_work)
+            except Exception as e:
+                warn(f"Could not copy extra {extra_name} to work dir: {e}")
+                extra_paths[extra_name] = str(extra_persist)
+        else:
+            extra_paths[extra_name] = str(extra_persist)
+
+    return extra_paths
+
+
 def resolve_models(args, storage_root, hf_hub):
     """Resolve model paths using a keep-on-disk, run-from-RAM flow.
 
@@ -545,6 +614,11 @@ def resolve_models(args, storage_root, hf_hub):
         if work_file.exists():
             result[name] = str(work_file)
             info(f"{name} model ready: {work_file}")
+            # Still resolve extras even if main model is already staged.
+            extras = _resolve_extras(entry, persist_dir, work_dir,
+                                     same_location, args, hf_hub)
+            if extras:
+                result[f"{name}_extras"] = extras
             continue
 
         # 1) Make sure a persistent copy exists on disk (download once).
@@ -576,17 +650,23 @@ def resolve_models(args, storage_root, hf_hub):
         # 2) Stage the persistent copy into the RAM-disk working dir.
         if same_location:
             result[name] = str(persist_file)
-            continue
-        if args.dry_run:
+        elif args.dry_run:
             info(f"Would copy {name}: {persist_file} -> {work_file}")
-            continue
-        try:
-            info(f"Copying {name} to RAM disk: {persist_file} -> {work_file}")
-            shutil.copy2(persist_file, work_file)
-            result[name] = str(work_file)
-        except Exception as e:
-            warn(f"Could not copy {name} to work dir, using disk copy: {e}")
             result[name] = str(persist_file)
+        else:
+            try:
+                info(f"Copying {name} to RAM disk: {persist_file} -> {work_file}")
+                shutil.copy2(persist_file, work_file)
+                result[name] = str(work_file)
+            except Exception as e:
+                warn(f"Could not copy {name} to work dir, using disk copy: {e}")
+                result[name] = str(persist_file)
+
+        # 3) Resolve companion files (mmproj, MTP draft head, etc.).
+        extras = _resolve_extras(entry, persist_dir, work_dir,
+                                 same_location, args, hf_hub)
+        if extras:
+            result[f"{name}_extras"] = extras
 
     return result
 
@@ -1456,11 +1536,14 @@ def main():
     # choice), then let the normal resolve flow download/copy it.
     chosen = choose_reasoning_model(args)
     if chosen:
-        MODEL_MANIFEST[0] = {
+        entry = {
             "name": "reasoning",
             "repo": chosen["repo"],
             "file": chosen["file"],
         }
+        if chosen.get("extras"):
+            entry["extras"] = chosen["extras"]
+        MODEL_MANIFEST[0] = entry
 
     hf_hub = None if args.no_download and not args.models_cache else ensure_hf_hub()
 
@@ -1517,6 +1600,14 @@ def main():
                      f"(first {reasoning_n_cpu_moe} layers' experts in system RAM)")
             else:
                 info("Reasoning is MoE but every expert fits in VRAM; no offload")
+        if name == "reasoning":
+            extras = models.get("reasoning_extras", {})
+            if "mmproj" in extras:
+                extra += ["--mmproj", extras["mmproj"]]
+                info(f"Vision projection: {Path(extras['mmproj']).name}")
+            if "mtp" in extras:
+                extra += ["--draft", extras["mtp"], "--spec-type", "draft-mtp"]
+                info(f"MTP draft head: {Path(extras['mtp']).name} (~35% faster)")
         if name in ("reasoning", "judge"):
             # llama-server rejects every /slots action with 501 unless it was
             # started with --slot-save-path -- including "erase", which writes

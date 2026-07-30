@@ -118,10 +118,19 @@ goto :save_and_build
 
 :ask
 REM Each prompt offers the previously saved value as its default (press Enter to keep)
-REM The model-menu choice is not prompted for here, but it still has to survive:
-REM without this, answering "n" above dropped it from the rewrite below and
-REM silently lost the remembered model.
 set "REASONING_CHOICE=!SAVED_REASONING_CHOICE!"
+
+echo.
+echo Select reasoning model (or press Enter to keep previous):
+echo   1. Qwen3.5-9B (default)                  6.6 GB  dense, full GPU
+echo   2. Qwen3.5-9B ultra-uncensored-heretic   6.5 GB  dense, full GPU
+echo   3. Qwen3.5-9B abliterated                5.6 GB  dense, full GPU
+echo   4. Qwen3.5-35B-A3B Abliterated          19.9 GB  MoE, experts in RAM
+echo   5. Gemma4-26B-A4B Uncensored Balanced    16.8 GB  MoE, experts in RAM
+echo   6. Hermes3.6-35B-A3B Unc Genesis V5     17.4 GB  MoE, experts in RAM
+set "MODEL_PICK="
+set /p "MODEL_PICK=Reasoning model [!SAVED_REASONING_CHOICE!]: "
+if not "!MODEL_PICK!"=="" set "REASONING_CHOICE=!MODEL_PICK!"
 
 set "LLAMA_BIN=!SAVED_LLAMA_BIN!"
 set /p "LLAMA_BIN=Folder containing llama-server.exe [!SAVED_LLAMA_BIN!] (blank=auto-detect from PATH): "
