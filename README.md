@@ -153,10 +153,15 @@ python run.py --host 0.0.0.0
 netsh advfirewall firewall add rule name="Cued Recall 8000" dir=in action=allow protocol=TCP localport=8000
 ```
 
-The three llama.cpp servers stay on loopback either way — the middleware is the
-front door, and behind it they serve the raw models with no memory layer. Pass
-`--expose-backends` to bind them too, which is what a benchmark run from another
-machine needs (`evaluate/` scripts talk to ports 8080–8082 directly).
+The three llama.cpp servers follow the same address: bind the middleware to the
+network and the reasoning server (8080), judge (8081) and embedding (8082)
+servers are reachable too, which is what a benchmark run from another machine
+needs (`evaluate/` scripts talk to those ports directly). They serve the raw
+models with no memory layer in front, so pass `--no-expose-backends` to keep
+them on loopback and publish only the middleware.
+
+The firewall rule has to cover whichever ports were opened — the startup banner
+prints the exact command for the set it actually published.
 
 There is no authentication and no TLS anywhere in this stack. Anyone who can
 reach port 8000 can read and write the memory store. Bind it to a network you

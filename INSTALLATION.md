@@ -216,7 +216,9 @@ By default the middleware only accepts connections from the machine it runs on. 
 
    On the other PC, point the chat client's API endpoint at `http://192.168.1.50:8000/v1`, or open that address in a browser for the chat UI.
 
-The three llama.cpp servers (8080–8082) stay on loopback and are not reachable from elsewhere. That is deliberate — they answer with the raw model and no memory layer. `--expose-backends` binds them to the same address, which is only needed to run the `evaluate/` benchmark scripts from another machine.
+The three llama.cpp servers (8080–8082) are published to the same address, so the reasoning model itself is reachable from the other machine — not just the middleware in front of it. That is what the `evaluate/` benchmark scripts need, since they talk to those ports directly. They answer with the raw model and no memory layer, so pass `--no-expose-backends` to keep them on loopback and publish only port 8000.
+
+Windows Firewall has to allow every port that was opened, not just 8000; the startup banner prints the exact `netsh` command for the set it published.
 
 > **No password, no encryption.** Anyone who can reach port 8000 can chat with the model, read every stored memory block, and delete blocks from the admin page. Only do this on a home or office network you control. Do not forward the port through a router.
 

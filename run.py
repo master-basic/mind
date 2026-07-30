@@ -202,10 +202,14 @@ def parse_args():
                         "is this machine only; '0.0.0.0' accepts connections from "
                         "other machines on the network. There is no authentication, "
                         "so only do that on a network you trust")
-    g.add_argument("--expose-backends", action="store_true",
-                   help="Bind the llama servers to --host as well. Off by default: "
-                        "the middleware reaches them over loopback, and they serve "
-                        "the raw models with no memory layer and no auth")
+    g.add_argument("--expose-backends", action=argparse.BooleanOptionalAction,
+                   default=None,
+                   help="Bind the llama servers to --host as well. Follows --host "
+                        "by default: asking for a network-visible stack and then "
+                        "getting a reasoning server only this PC can reach is not "
+                        "what anyone means. Pass --no-expose-backends to keep them "
+                        "on loopback -- they serve the raw models with no memory "
+                        "layer and no auth")
     g.add_argument("--reasoning-port", type=int, default=8080, help="Reasoning model port (default: 8080)")
     g.add_argument("--judge-port",     type=int, default=8081, help="Judge model port (default: 8081)")
     g.add_argument("--embed-port",     type=int, default=8082, help="Embedding model port (default: 8082)")
@@ -1043,6 +1047,21 @@ def is_loopback(host: str) -> bool:
     return host in ("127.0.0.1", "localhost", "::1")
 
 
+def backends_exposed(args) -> bool:
+    """Whether the llama servers bind to --host rather than loopback.
+
+    Unset means "follow --host". Binding the middleware to 0.0.0.0 while the
+    reasoning server stayed on 127.0.0.1 meant a client on another machine
+    could talk to the memory layer but not to the model it fronts -- and
+    nothing said so, because both processes started fine. Asking for a
+    network-visible stack now gets one; --no-expose-backends keeps the old
+    split for anyone who wants only the front door published.
+    """
+    if args.expose_backends is None:
+        return not is_loopback(args.host)
+    return args.expose_backends
+
+
 def lan_address() -> str:
     """This machine's address on the network, for printing a reachable URL.
 
@@ -1626,6 +1645,10 @@ def main():
     if not is_loopback(args.host):
         warn(f"Listening on {args.host}: reachable from other machines, "
              "with no authentication in front of it")
+        if backends_exposed(args):
+            warn("The llama servers are published too, so the raw models are "
+                 "reachable without the memory layer. --no-expose-backends "
+                 "keeps them on loopback")
 
     llama_bin = find_llama_server(args)
     if not llama_bin:
@@ -1740,10 +1763,16 @@ def main():
 
     update_config(storage_root, snapshot_path, args, reasoning_ctx)
 
-    # The llama servers stay on loopback unless asked otherwise: the middleware
-    # is the front door, and the raw servers behind it have neither the memory
-    # layer nor any authentication.
-    backend_host = args.host if args.expose_backends else "127.0.0.1"
+    # The llama servers follow --host unless asked otherwise. The middleware is
+    # still the front door, and the raw servers behind it have neither the
+    # memory layer nor any authentication -- but a stack published to the
+    # network with its model unreachable is broken in a way nothing reports.
+    #
+    # Exposed means 0.0.0.0, not --host verbatim. update_config always points
+    # the middleware at 127.0.0.1, and binding to one specific LAN address
+    # excludes loopback -- so echoing --host here would publish the model and
+    # cut off the process that actually needs it.
+    backend_host = "0.0.0.0" if backends_exposed(args) else "127.0.0.1"
 
     processes = []
     try:
@@ -1813,7 +1842,7 @@ def main():
         # 0.0.0.0 means "every interface", which is not an address anyone can
         # type. Show where the stack actually answers from another machine.
         shown_host = lan_address() if args.host == "0.0.0.0" else args.host
-        backend_shown = shown_host if args.expose_backends else "127.0.0.1"
+        backend_shown = shown_host if backends_exposed(args) else "127.0.0.1"
 
         print()
         print("=== All systems running ===")
@@ -1825,17 +1854,27 @@ def main():
                 print(f"  {name.capitalize():14} http://{backend_shown}:{port}")
         if not is_loopback(args.host):
             mw_port = args.middleware_port
+            # Every port that had to be opened, not just the front door: the
+            # firewall hint is only useful if it covers what was published.
+            open_ports = [mw_port]
+            if backends_exposed(args):
+                open_ports += [port for name, _, port in processes
+                               if name != "middleware"]
             print(f"  Open to the network on {args.host}:{mw_port}. Nothing asks for")
             print("  a password, so anyone who can reach that port can read and")
             print("  write the memory store.")
+            if backends_exposed(args):
+                others = ", ".join(str(p) for p in open_ports[1:])
+                print(f"  The llama servers are open too ({others}) -- those are the")
+                print("  raw models, with no memory layer and no auth in front.")
             if os.name == "nt":
                 # The bind succeeds regardless; it is the firewall that makes
                 # the connection time out from the other machine, which looks
                 # exactly like "it did not work".
-                print("  If it is unreachable, allow the port (as Administrator):")
+                print("  If it is unreachable, allow the ports (as Administrator):")
                 print('    netsh advfirewall firewall add rule '
-                      f'name="Cued Recall {mw_port}" dir=in action=allow '
-                      f'protocol=TCP localport={mw_port}')
+                      f'name="Cued Recall" dir=in action=allow '
+                      f'protocol=TCP localport={",".join(str(p) for p in open_ports)}')
         print(f"  Storage:        {storage_root}")
         print(f"  Snapshots:      {snapshot_path}")
         print("  Press Ctrl+C to stop all processes")
