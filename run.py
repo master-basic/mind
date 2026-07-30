@@ -1625,7 +1625,7 @@ def main():
                 extra += ["--mmproj", extras["mmproj"]]
                 info(f"Vision projection: {Path(extras['mmproj']).name}")
             if "mtp" in extras:
-                extra += ["--draft", extras["mtp"], "--spec-type", "draft-mtp"]
+                extra += ["-md", extras["mtp"], "--spec-type", "draft-mtp"]
                 info(f"MTP draft head: {Path(extras['mtp']).name} (~35% faster)")
         if name in ("reasoning", "judge"):
             # llama-server rejects every /slots action with 501 unless it was
