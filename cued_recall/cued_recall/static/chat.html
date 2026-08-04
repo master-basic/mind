@@ -2,19 +2,29 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- No viewport-fit=cover: it extends the layout viewport under the system
+     bars, and the only thing that pays that back is env(safe-area-inset-*),
+     which Firefox on Android reports as 0. The result there was the header
+     hidden under the status bar and the composer under the gesture bar.
+     interactive-widget lets Chrome shrink the layout viewport for the on-screen
+     keyboard; browsers that ignore it fall back to the visualViewport sync. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
 <meta name="theme-color" content="#161b22">
 <title>Cued Recall — Chat</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 html { height: 100%; }
-/* 100dvh rather than 100%: on a phone the layout viewport is taller than the
-   part you can see, so a 100%-tall body parked the composer permanently under
-   the browser toolbar with no way to scroll to it (#messages is the only
-   scroller). overscroll-behavior kills pull-to-refresh, which would reload the
-   page and throw away the in-memory history mid-conversation. */
-body { height: 100vh; height: 100dvh; overscroll-behavior-y: none; -webkit-tap-highlight-color: transparent; font-family: -apple-system, 'Segoe UI', system-ui, sans-serif; background: #0d1117; color: #c9d1d9; display: flex; flex-direction: column; }
-header { display: flex; align-items: center; gap: 12px; padding: 12px calc(16px + env(safe-area-inset-right, 0px)) 12px calc(16px + env(safe-area-inset-left, 0px)); border-bottom: 1px solid #30363d; background: #161b22; }
+/* Not height:100% -- on a phone that is the layout viewport, which is taller
+   than the part you can see, so it parked the composer under the browser
+   toolbar with no way to scroll to it (#messages is the only scroller).
+   100svh is the viewport with the browser UI *shown*, i.e. the size that
+   always fits; the visualViewport sync in the script then trims it to the
+   exact visible height. Deliberately not 100dvh: dvh assumes the toolbar can
+   retract, and this page never scrolls the document, so it never does.
+   overscroll-behavior kills pull-to-refresh, which would reload the page and
+   throw away the in-memory history mid-conversation. */
+body { height: 100vh; height: 100svh; overscroll-behavior-y: none; -webkit-tap-highlight-color: transparent; font-family: -apple-system, 'Segoe UI', system-ui, sans-serif; background: #0d1117; color: #c9d1d9; display: flex; flex-direction: column; }
+header { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid #30363d; background: #161b22; }
 header h1 { font-size: 16px; color: #58a6ff; font-weight: 600; }
 header .status { font-size: 12px; color: #8b949e; margin-left: auto; }
 header a { color: #8b949e; font-size: 12px; text-decoration: none; border: 1px solid #30363d; padding: 4px 10px; border-radius: 6px; }
@@ -62,7 +72,7 @@ header a:hover { color: #c9d1d9; border-color: #8b949e; }
 .think summary { cursor: pointer; padding: 6px 10px; font-size: 12px; color: #a371f7; user-select: none; }
 .think .think-body { padding: 8px 10px; border-top: 1px solid #30363d; font-size: 13px; color: #8b949e; white-space: pre-wrap; }
 .recall-note { max-width: 780px; margin: 0 auto; width: 100%; font-size: 12px; color: #d29922; }
-footer { border-top: 1px solid #30363d; background: #161b22; padding: 12px calc(16px + env(safe-area-inset-right, 0px)) calc(12px + env(safe-area-inset-bottom, 0px)) calc(16px + env(safe-area-inset-left, 0px)); }
+footer { border-top: 1px solid #30363d; background: #161b22; padding: 12px 16px; }
 .composer { max-width: 780px; margin: 0 auto; display: flex; gap: 8px; }
 /* 16px is the floor: anything smaller makes iOS Safari zoom the whole page on
    focus, which pushes the layout wider than the viewport. */
@@ -108,14 +118,14 @@ button.stop:hover { background: #f85149; }
   #sidebar:not(.open) { display: flex; visibility: hidden; transform: translateX(-100%); }
   #sidebar.open { visibility: visible; transform: none; }
   #backdrop.show { display: block; }
-  header { padding: 10px calc(12px + env(safe-area-inset-right, 0px)) 10px calc(12px + env(safe-area-inset-left, 0px)); gap: 8px; }
+  header { padding: 10px 12px; gap: 8px; }
   header h1 { font-size: 14px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #messages { padding: 14px 12px; }
   /* Stack the role label above the text: the fixed 64px gutter was ~18% of a
      360px screen. */
   .msg { flex-direction: column; gap: 2px; }
   .msg .who { flex: none; padding-top: 0; }
-  footer { padding-left: calc(12px + env(safe-area-inset-left, 0px)); padding-right: calc(12px + env(safe-area-inset-right, 0px)); }
+  footer { padding: 12px; }
   #toggle-side, .attach, #send { min-height: 44px; }
   #toggle-side, .attach { min-width: 44px; }
   #new-chat { min-height: 44px; }
@@ -611,18 +621,22 @@ mqMobile.addEventListener('change', (e) => setSidebar(!e.matches));
 
 // An on-screen keyboard overlays the layout viewport instead of shrinking it,
 // which is what buries the composer. Track the visual viewport so the shell is
-// only ever as tall as the part actually on screen.
+// only ever as tall as the part actually on screen. Runs once immediately as
+// well: first paint is where the composer was getting clipped, and no resize
+// event fires before it.
 if (isTouch && window.visualViewport) {
   const vv = window.visualViewport;
   const syncViewport = () => {
     const stick = nearBottom();
     document.body.style.height = vv.height + 'px';
-    // iOS scrolls the layout viewport instead of resizing it; undo that.
-    window.scrollTo(0, 0);
+    // iOS scrolls the layout viewport instead of resizing it; undo that. Only
+    // when it actually moved -- the document itself never scrolls here.
+    if (window.scrollY !== 0) window.scrollTo(0, 0);
     if (stick) $messages.scrollTop = $messages.scrollHeight;
   };
   vv.addEventListener('resize', syncViewport);
   vv.addEventListener('scroll', syncViewport);
+  syncViewport();
 }
 
 checkHealth();
