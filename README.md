@@ -63,7 +63,8 @@ second.
 |---|---|---|
 | OpenAI-compatible chat proxy | Working | Streaming + non-streaming, `/v1/chat/completions`, `/v1/models` |
 | Reasoning/result split | Working | ` thinking` / ` response` tag parsing during streaming |
-| Semantic recall | Working, measured | Cosine retrieval plus a relevance filter. Embedding alone at 0.62 recalls 0.96 with a **false-fire rate of 0.55**; that is why it no longer runs alone |
+| Semantic recall | Working, measured | Cosine retrieval plus a relevance filter. Embedding alone at 0.62 recalls 0.96 with a **false-fire rate of 0.55**; that is why it no longer runs alone. End to end it fires 6/6 on exact, paraphrase and Azerbaijani probes |
+| Vector backfill | Working | Blocks are embedded once, at creation, and a failure there was logged and never retried -- so a block written while the embedding server was busy stayed `shelved`, kept its text, and was invisible to recall forever. 57 of 1,812 blocks in one real store were in that state. `backfill_missing_vectors.py` finds and re-embeds them |
 | Semantic reranker | Working, measured, **on by default** | Second stage asks the small model whether a candidate applies. False-fire rate **0.00** at every threshold. Its only recall cost is the trap family. Disable with `recall.judge_enabled: false` — and raise `threshold` back toward 0.62 if you do |
 | Manual retention (pin) | Working | A pinned block is never purged and never rewritten, at any age |
 | Restore purged blocks | Working | Purging was always reversible on disk; `POST /admin/blocks/restore` re-embeds and brings it back |
@@ -99,7 +100,7 @@ second.
 | Force search heuristics | Working | Auto-detects search-like queries |
 | Retrieval benchmark | Working | Threshold sweep over a hand-built corpus, with false-fire rate |
 | Throughput benchmark | Working, measured | Direct vs through the middleware. Decode unchanged; **+1.7 s time-to-first-token**, nearly all of it the relevance judge |
-| End-to-end benchmark | Harness only | A/B script + paired analysis; results are hand-graded, not yet published |
+| End-to-end benchmark | Working; cost measured, effect not yet | Three arms, so the memory is separated from the tool definitions the middleware injects. **Cost is measured**: +1,334 prompt tokens and +6.4 s a turn. **Whether it shortens the reasoning trace is still open** — median +395 chars but the interval spans zero (CI [-604, +1012]) on 9 usable pairs, one model, a 6-block store. Underpowered, not negative. Of four hand-graded traps, two were helped, one anchored on the stale block, one was noise |
 | KV cache management | In progress | Clear endpoint exists; slot save/restore is Phase 2 |
 | Retry/circuit breaking | Not started | External calls (search, embed, upstream) fail soft and are logged, but nothing backs off or trips |
 | Multi-user/isolation | Not started | Single-user alpha |

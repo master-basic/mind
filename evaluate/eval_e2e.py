@@ -47,10 +47,19 @@ def chat(base, prompt, model, timeout=600):
         data = json.loads(r.read())
     dt = time.perf_counter() - t0
 
-    text = data["choices"][0]["message"]["content"]
+    message = data["choices"][0]["message"]
+    text = message.get("content") or ""
     usage = data.get("usage", {})
+    # Two places the think trace can be, and only one of them was checked.
+    # llama.cpp parses reasoning out of the content for models whose template
+    # declares it and returns it as its own field -- Gemma4 and Qwen3.5 both
+    # land here -- so `content` arrives with the tags already stripped and this
+    # regex found nothing. think_chars then read 0 for every arm, which looks
+    # exactly like "memory did not shorten the reasoning" rather than like a
+    # harness that was not measuring it. The middleware reads both fields
+    # (pipeline.py forward_nonstream); the eval has to as well.
     m = THINK.search(text)
-    think = m.group(1) if m else ""
+    think = m.group(1) if m else (message.get("reasoning_content") or "")
     answer = THINK.sub("", text).strip()
 
     return {

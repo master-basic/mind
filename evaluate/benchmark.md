@@ -1,78 +1,104 @@
-Good — this is the question that actually matters, and it's the one that will turn the project from "interesting design" into something people star.
+# Benchmark design
 
-The key move is splitting this into two separate evals, because most people conflate them and end up with numbers that mean nothing:
+Two harnesses, kept apart on purpose, because conflating them produces numbers
+that mean nothing.
 
-Retrieval eval — does the right block come back? No LLM generation involved. Deterministic, runs in seconds, sweepable across thresholds. This is where your public question about recall.threshold gets answered.
-End-to-end eval — does having the block actually help? Slow, noisy, needs many repeats.
+**Retrieval** — does the right block come back? No generation involved, so it is
+deterministic, runs in seconds, and can be swept across thresholds. This is what
+answers the question of where `recall.threshold` belongs.
 
-Do the first one first. It's cheap, it produces the chart, and if retrieval is bad there's no point measuring anything downstream.
+**End to end** — does having the block actually help? Slow, noisy, and needs
+repeats before any of it means anything.
 
-Let me set up the corpus design and the harness.
+Retrieval comes first: it is cheap, it produces the curve, and if retrieval is
+bad there is nothing downstream worth measuring.
 
-Architected end-to-end testing framework with performance metrics and state management
-Architected end-to-end testing framework with performance metrics and state management
-
-Logic checks out — with the fake bag-of-words embedder, exact scores 1.00, trap scores high (shares most vocabulary), crosslingual collapses to noise. Exactly the shape you'd predict, which means the harness is measuring what it claims to.
-
-Now the end-to-end half:
-
-Created 2 files, ran 2 commands, read a file
-Created 2 files, ran 2 commands, read a file
-
-Start with eval_retrieval.py — it only needs your embedding server on :8082, nothing else running:
-
+```
 python eval_retrieval.py --endpoint http://127.0.0.1:8082
+```
 
-Five seconds, and you get a threshold sweep from 0.30 to 0.94 with recall rate and false-fire rate at each step, plus retrieval_sweep.csv to plot.
+Five seconds for a threshold sweep from 0.30 to 0.94 with a recall rate and a
+false-fire rate at each step, plus `retrieval_sweep.csv` to plot. `--fake`
+self-tests the harness with a bag-of-words embedder and no servers running; the
+shape it produces is the check that the harness measures what it claims —
+`exact` scores 1.00, `trap` scores high because it shares most of its
+vocabulary, and `crosslingual` collapses to noise.
 
-The corpus design is the actual work
+## The corpus is the actual work
 
-The scripts are mechanical. What makes an eval honest is the corpus, and the trick is that every family needs adversarial members. Six relation types:
+The scripts are mechanical. What makes an eval honest is the corpus, and every
+family needs adversarial members. Six relation types:
 
-exact — identical restatement. Must recall. If this fails, something is broken.
-paraphrase — same problem, different words. Must recall. This is the real target.
-crosslingual — same problem in Azerbaijani. Must recall. You already flagged this as not working; now you can quantify how badly.
-trap — same vocabulary, different answer. Phase 1 works but phase 2 fails; digest auth vs basic auth. Retrieval firing here is correct. Blindly reusing the old conclusion is the failure. This family is the whole reason to hand-grade.
-distractor — high lexical overlap, unrelated problem. Must not fire.
-control — nothing to do with anything. Must not fire.
+| relation | requirement |
+|---|---|
+| `exact` | identical restatement. Must recall — if this fails something is broken |
+| `paraphrase` | same problem, different words. Must recall. This is the real target |
+| `crosslingual` | same problem in Azerbaijani. Must recall |
+| `trap` | same vocabulary, different answer — phase 1 solved, phase 2 not; digest auth against basic auth. Retrieval firing here is *correct*; blindly reusing the old conclusion is the failure. This family is the whole reason to hand-grade |
+| `distractor` | high lexical overlap, unrelated problem. Must not fire |
+| `control` | nothing to do with anything. Must not fire |
 
-Almost everyone building this measures only "does recall fire." The number nobody publishes is the false-fire rate, and that's the one that makes your post credible. The distractor prompts in the corpus are deliberately written to share surface words with a real family while meaning something completely different — that's what separates a real embedding evaluation from a vibe check.
+Most published work in this area measures only whether recall fires. The number
+nobody reports is the **false-fire rate**, and it is the one that decides whether
+the rest is credible. The distractor prompts are written deliberately to share
+surface words with a real family while meaning something entirely different —
+that is what separates an embedding evaluation from a vibe check.
 
-Twenty-five rows is enough to start. Get to ~60 (10 families × 6) before you publish anything.
+Twenty-five rows is enough to start; ~60 (10 families × 6) before publishing
+anything.
 
-Where to get prompts
+## Where the prompts come from
 
-Write them yourself, from your own work. That's not a fallback — it's the better option:
+Written by hand, from real recurring work — not as a fallback but because it is
+the better option. Correctness can be graded, which is the hard part of any eval,
+and the distribution matches the traffic the system actually serves: this store
+holds infrastructure debugging, so a math benchmark would measure the wrong thing
+entirely. The seeded families come from problems that genuinely recur here —
+ADVPN routing, DKIM selectors, nginx failover, rclone mounts, digest auth.
 
-You can grade correctness, which is the hard part of any eval
-Your traffic is infra debugging, so a math benchmark would measure the wrong distribution entirely
-You have years of real recurring problems: FortiGate ADVPN, DKIM selectors, nginx failover, rclone mounts, digest auth. The corpus already has six families seeded from those.
+For an auto-graded objective layer on top, MBPP or HumanEval are the right
+choice: Python problems with unit tests, so correctness needs no human. Grouping
+them into families by technique (dynamic programming, string parsing, recursion)
+gives reasoning that really is reusable within a family. GSM8K is the wrong
+choice — arithmetic reasoning does not transfer the way this design assumes.
 
-If you want an auto-graded objective layer on top, MBPP or HumanEval are the right choice — Python problems with unit tests, so correctness needs no human. Group them into families by technique (dynamic programming, string parsing, recursion) and the reasoning genuinely is reusable across a family. Skip GSM8K; arithmetic reasoning doesn't transfer the way you're claiming yours does.
+One rule worth stating: **do not use a larger model to generate the paraphrases
+unmonitored.** Model paraphrases share embedding-space structure with the
+original in ways human rewording does not, and the result is an inflated recall
+rate. Write them by hand, or generate and then rewrite each one.
 
-Do not use a bigger LLM to generate your paraphrases unmonitored. LLM paraphrases share embedding-space structure with the original in ways human rewording doesn't, and you'll measure an inflated recall rate. Write them by hand, or generate then rewrite each one.
+## Protocol details that decide whether the numbers mean anything
 
-Protocol details that decide whether the numbers mean anything
+**The baseline arm bypasses the middleware entirely** — point it at `:8080`
+directly. No config flag, no code path that might differ. Two URLs, same model,
+same seed.
 
-Baseline arm bypasses the middleware entirely — point at :8080 directly. No config flag, no code path that might differ. Two URLs, same model, same seed.
+**Wipe the store between repeats.** The tmpfs blocks, the SQLite index and the
+snapshot all have to go, or repeat 2 starts warm and the numbers drift.
 
-Wipe the store between repeats. The script pauses and waits for you to do it. tmpfs blocks, the SQLite index, and the NVMe snapshot all have to go, or repeat 2 starts warm and your numbers drift.
+**`temperature: 0` and a fixed seed**, while expecting residual nondeterminism
+from llama.cpp batching — hence `--repeats 3` and medians rather than means.
 
-temperature: 0 and a fixed seed, but expect residual nondeterminism from llama.cpp batching. Hence --repeats 3 and medians.
+**Paired analysis, not group means.** `analyse.py` pairs each probe against
+itself across arms. Between-prompt variance is enormous — some questions produce
+800 tokens of reasoning, others 12,000 — so comparing group averages across 20
+prompts would drown any real effect. The bootstrap CI is flagged with `*` only
+when it excludes zero.
 
-Paired analysis, not group means. analyse.py pairs each probe against itself across arms. Between-prompt variance is enormous — some questions produce 800 tokens of reasoning, others 12,000 — and comparing group averages across 20 prompts would drown any real effect. The bootstrap CI flags with * only when it excludes zero.
+## The metrics that matter
 
-The metrics that matter
-Metric	Where	What it tells you
-recall rate vs false-fire rate	retrieval	the threshold answer
-mean top-sim per relation	retrieval	whether crosslingual is near firing or nowhere close
-Δ think_chars, paired	e2e	the headline "saves N% of reasoning" claim
-Δ latency	e2e	whether recall overhead eats the savings
-trap-family answer quality	hand-graded	anchoring failures
+| metric | where | what it tells you |
+|---|---|---|
+| recall rate against false-fire rate | retrieval | the threshold answer |
+| mean top similarity per relation | retrieval | whether crosslingual is near firing or nowhere close |
+| Δ `think_chars`, paired | e2e | the "saves N% of reasoning" claim |
+| Δ latency | e2e | whether recall overhead eats the savings |
+| trap-family answer quality | hand-graded | anchoring failures |
 
-That last row has no script because it can't have one. Read the twelve trap-family answers. If the model recalls the phase-1 block and confidently tells you to check phase-1 proposals when the question was about phase 2, you've found the real limitation of the design — and writing that up honestly will get you more respect on r/LocalLLaMA than any speedup number.
-
-Run the retrieval sweep first, tonight. It's fast, it produces a chart, and "here is the precision/recall curve for semantic recall on paraphrased technical questions, including the false-fire rate" is a far better second post than anything else you could write.
+The last row has no script because it cannot have one. The trap-family answers
+have to be read: if the model recalls the phase-1 block and confidently answers
+about phase 1 when the question was about phase 2, that is the real limitation of
+the design, and no counter will surface it.
 
 ---
 
@@ -195,3 +221,137 @@ python eval_correction.py
 them. They bound the shape of the problem, not the rate. `--from-chats` mines
 real user messages out of a live `chats.db` for labelling, which is the only way
 the negative half stops reflecting what someone thought to test.
+
+## End to end: does having the block help?
+
+Measured 4 August 2026. Gemma4-26B-A4B-QAT-Uncensored-HauhauCS-Balanced-Q4_K_M
+as the reasoning model, `threshold: 0.48`, `judge_enabled: true`, `k: 4`.
+
+The honest headline: **retrieval works, the cost is now known, and the benefit
+is still unmeasured.** A recalled block costs about 1,300 prompt tokens and
+several seconds a turn -- that part is solid. Whether it shortens the reasoning
+trace this run cannot say: the median moved the wrong way but the confidence
+interval spans zero on 9 usable pairs. That is an underpowered result, not a
+negative one, and the difference matters. One outright anchoring failure turned
+up in four hand-graded traps.
+
+What would settle it: more probes, `max_tokens` high enough that nothing is
+censored (11 of 32 rows hit the cap here), and a store the size of a real one
+rather than the 6 seeds this used. A model that emits `<think>` inline would
+also remove the field-parsing hazard described below.
+
+### A third arm, because two cannot answer it
+
+The shipped two-arm design compares the middleware against a bare
+`llama-server`, which varies the memory *and* the ~184 prompt tokens of
+`web_search` / `web_fetch` definitions the middleware injects. Those were
+measured apart by adding a middleware instance with recall disabled (`k: 0`,
+`threshold: 0.99`, its own empty store, port 8011):
+
+| | median delta | 95% CI |
+|---|---|---|
+| middleware + tool definitions, no memory | +184 prompt tokens, +0.6 s | tight |
+| memory on top of that | +1,334 prompt tokens, +6.4 s | [874, 1458], [0.0, 8.9] |
+
+This run never wiped the live store. It ran against a second middleware instance
+on its own store, sharing the three llama servers -- the protocol wants an empty
+store per repeat, and 1,812 real blocks carrying recall counts, pins and
+verification history are not something `/admin/import` can put back (new ids,
+verification reset by design, every block landing `truncated`).
+
+### Does memory reach the model
+
+Read off the prompt-token gap against the same probe with recall off, so it is
+measured rather than asserted. 35 probes, one repeat:
+
+| relation | fired | median tokens injected |
+|---|---|---|
+| exact (6) | 6/6 | 1,716 |
+| paraphrase (6) | 6/6 | 1,466 |
+| crosslingual (6) | **6/6** | 1,464 |
+| trap (6) | 5/6 | 1,656 |
+| distractor (6) | 3/6 | 1,148 |
+| control (5) | 3/5 | 2,081 |
+
+The judge refused 58 of 134 candidates (43%). Crosslingual firing 6 of 6 is the
+`retrieval_sweep` claim reproduced on live traffic rather than synthetic
+vectors, and it is the strongest result here.
+
+The distractor and control rows are **not** a false-fire measurement and must
+not be read as one. The treatment arm writes its own blocks as it goes, so by
+the late probes the store held ~84 blocks rather than the 6 seeds, and a fire
+there may be legitimate recall of an earlier probe. The shipped harness has the
+same property; it wipes between repeats, not between probes. Measuring false
+fires end to end needs a store frozen after warm.
+
+### Does it shorten the reasoning
+
+Undetermined, and the run is too small to settle it. Re-measured on a store
+wiped and re-warmed to exactly the 6 seeds, so only a seed could be recalled,
+`max_tokens` 2048, 16 probes:
+
+| relation | n | median delta think_chars | 95% CI |
+|---|---|---|---|
+| ALL | 9 | **+395** | [-604, +1012] |
+| exact | 2 | +867 | [388, 1345] |
+| paraphrase | 2 | +704 | [395, 1012] |
+| crosslingual | 2 | -1,906 | [-3612, -200] |
+| trap | 3 | +511 | [-604, 889] |
+
+Negative would mean memory made the model think less. The overall interval
+spans zero, and the two families memory is supposed to help most -- exact and
+paraphrase restatements -- move the wrong way.
+
+Two limits sit on top of that and both cut against reading it as a firm result.
+**n is 2 or 3 per family**: a bootstrap CI on two points resamples between two
+numbers and the stars it prints mean nothing, which is why only the ALL row is
+worth quoting. And **11 of 32 rows hit the 2048-token cap**; censored pairs are
+excluded from the length comparison, which is what shrinks n from 16 to 9. What
+this run establishes is that the effect is not large and not reliably negative,
+not that it is exactly +395.
+
+### The metric that was silently zero
+
+This model's think trace arrives in `message.reasoning_content`, not wrapped in
+`<think>` tags inside `content` -- llama.cpp parses it out for any model whose
+template declares reasoning. `eval_e2e.py` regexed the tags out of `content`
+only, so `think_chars` read 0 in every arm on this stack, which is
+indistinguishable from "memory changed nothing" and was in fact the harness not
+looking. A first attempt at this run also capped generation at 512 tokens, and
+since the trace never finished, `content` came back empty in 102 of 105 rows and
+every length metric read as a flat zero. Both are fixed; the middleware itself
+always read both fields.
+
+### Trap answers, hand graded
+
+Four traps, read rather than counted, because no script catches a model
+anchoring on a block that did not apply:
+
+| trap | verdict |
+|---|---|
+| `ocr1-trap` | **memory helped.** Asked for a server-side endpoint, it built one, and correctly cited the existing client-side camera work as context. Recall off invented a history that was never given ("since you specified FastAPI and OpenCV"). |
+| `ssh1-trap` | **memory helped.** Answered rule 8 (read-only) correctly and listed rule 10 (destructive) beside it as genuine prior context, without confusing the two. |
+| `phase3-trap` | **anchoring failure.** The probe asked to *add* OCR properties; the stored seed said *remove* them. Recall off implemented adding. Recall on opened "The goal is to remove OCR-related properties" -- the seed's fact asserted over the question asked. |
+| `git-trap` | **neutral to worse.** Only 94 tokens were admitted, so there was effectively no memory; the answer degraded from 2,336 characters of actionable conflict-resolution steps to a 471-character restatement. |
+
+Two helped, one failed the way the family was designed to catch, one was noise.
+That is the real shape of the thing: recall buys **continuity**, and it can also
+overwrite the question.
+
+### What this says about the design
+
+Not "the thesis is dead" -- nothing here is powered enough to say that. What it
+says is that the reasoning-savings claim is **still unproven after being
+measured once**, which is different from both "proven" and "refuted", and that
+the cost side is no longer in doubt.
+
+One thing the run did show positively, and it was not what it set out to test:
+recall supplies continuity a fresh context cannot. The recall-off arm invented a
+history it was never given ("since you specified FastAPI and OpenCV"); the
+recall-on arm cited the real prior work and answered the new question. That is a
+benefit worth naming even though no counter measures it.
+
+Reproducing: `evaluate/results.jsonl` (run 1, three arms, 35 probes) and
+`results_run2.jsonl` (run 2, two arms, 16 probes, reasoning trace captured).
+Run 1's output-length columns are void for the reason above; its prompt-token
+and latency columns are not.
