@@ -81,9 +81,9 @@ REASONING_CATALOG = [
     },
     {
         "num": 6,
-        "label": "Hermes3.6-35B-A3B Unc Genesis V5     17.4 GB  MoE, experts in RAM",
-        "repo": "LuffyTheFox/Qwen3.6-35B-A3B-Uncensored-Genesis-Hermes-V5-GGUF",
-        "file": "Hermes3.6-35B-A3B-Uncensored-Genesis-V5-APEX-Compact.gguf",
+        "label": "Qwen3.6-35B-A3B (Q4)             19.4 GB  MoE, experts in RAM",
+        "repo": "unsloth/Qwen3.6-35B-A3B-GGUF",
+        "file": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
         "moe": True,
     },
 ]
@@ -132,14 +132,16 @@ MODEL_MANIFEST = [
 # a 60,000-token prompt succeeds where 16,001 had failed. This is a single-user
 # stack, the VRAM sizing already assumes one conversation, and it costs nothing.
 SERVER_DEFAULTS = {
-    "reasoning": {"port": 8080, "extra": ["--ctx-size", "32768", "--n-gpu-layers", "99", "--metrics", "--jinja", "-np", "1"]},
+    "reasoning": {"port": 8080, "extra": ["--ctx-size", "32768", "--n-gpu-layers", "99", "--metrics", "--jinja", "-np", "1", "-fa", "on", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "--temp", "0.6"]},
     "judge":     {"port": 8081, "extra": ["--ctx-size", "8192", "--n-gpu-layers", "0", "--metrics", "-np", "1"]},
     # Embeddings need the whole sequence in one micro-batch; the default
     # --ubatch-size (512) makes any input over ~512 tokens 500. Match batch
     # sizes to the context so larger inputs embed instead of erroring.
+    # Weights go on the GPU (the reasoning autosizer already reserves that
+    # VRAM); the KV/context stays in RAM via --no-kv-offload.
     "embed":     {"port": 8082, "extra": ["--embedding", "--ctx-size", "8192",
                                           "--batch-size", "8192", "--ubatch-size", "8192",
-                                          "--n-gpu-layers", "0", "--no-kv-offload", "--metrics"]},
+                                          "--n-gpu-layers", "99", "--no-kv-offload", "--metrics"]},
 }
 
 
