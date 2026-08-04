@@ -449,6 +449,27 @@ class VectorIndex:
             """, (now - min_age_s, now - rejudge_interval_s, limit)).fetchall()
         return [r[0] for r in rows]
 
+    def blocks_without_vectors(self, limit: int = 100000) -> List[str]:
+        """Recallable-by-status blocks that have no embedding, oldest first.
+
+        Blocks are embedded once, at creation, and a failure there is logged
+        and dropped -- so a block written while the embedding server was
+        restarting stays `shelved`, keeps its text, appears in the admin table,
+        and can never be retrieved. Status cannot express that, which is why
+        nothing surfaced it: 729 of 1,812 blocks in one real store were in this
+        state, 57 of them holding content.
+        """
+        with self._lock:
+            rows = self._conn.execute("""
+                SELECT b.block_id FROM blocks b
+                WHERE b.status IN ('shelved', 'truncated')
+                  AND NOT EXISTS (SELECT 1 FROM block_vec v
+                                  WHERE v.block_id = b.block_id)
+                ORDER BY b.created_at ASC
+                LIMIT ?
+            """, (limit,)).fetchall()
+        return [r[0] for r in rows]
+
     def decay_candidates(self, purge_age_s: float,
                          limit: int = 1000) -> List[str]:
         """Blocks arithmetic alone can condemn -- no model call involved.
