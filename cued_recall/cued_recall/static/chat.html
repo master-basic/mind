@@ -2,13 +2,19 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#161b22">
 <title>Cued Recall — Chat</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
-html, body { height: 100%; }
-body { font-family: -apple-system, 'Segoe UI', system-ui, sans-serif; background: #0d1117; color: #c9d1d9; display: flex; flex-direction: column; }
-header { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid #30363d; background: #161b22; }
+html { height: 100%; }
+/* 100dvh rather than 100%: on a phone the layout viewport is taller than the
+   part you can see, so a 100%-tall body parked the composer permanently under
+   the browser toolbar with no way to scroll to it (#messages is the only
+   scroller). overscroll-behavior kills pull-to-refresh, which would reload the
+   page and throw away the in-memory history mid-conversation. */
+body { height: 100vh; height: 100dvh; overscroll-behavior-y: none; -webkit-tap-highlight-color: transparent; font-family: -apple-system, 'Segoe UI', system-ui, sans-serif; background: #0d1117; color: #c9d1d9; display: flex; flex-direction: column; }
+header { display: flex; align-items: center; gap: 12px; padding: 12px calc(16px + env(safe-area-inset-right, 0px)) 12px calc(16px + env(safe-area-inset-left, 0px)); border-bottom: 1px solid #30363d; background: #161b22; }
 header h1 { font-size: 16px; color: #58a6ff; font-weight: 600; }
 header .status { font-size: 12px; color: #8b949e; margin-left: auto; }
 header a { color: #8b949e; font-size: 12px; text-decoration: none; border: 1px solid #30363d; padding: 4px 10px; border-radius: 6px; }
@@ -17,10 +23,15 @@ header a:hover { color: #c9d1d9; border-color: #8b949e; }
 #dot.ok { background:#3fb950; }
 /* header on top, then sidebar + conversation side by side. min-height:0 on
    the flex children is what lets the inner panes scroll instead of the page. */
-#shell { flex: 1; display: flex; min-height: 0; }
+/* position:relative so the mobile drawer can anchor to top/bottom of the shell
+   instead of hardcoding the header's height. */
+#shell { flex: 1; display: flex; min-height: 0; position: relative; }
 #main { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 #sidebar { width: 260px; flex: 0 0 260px; border-right: 1px solid #30363d; background: #0b0f14; display: flex; flex-direction: column; min-height: 0; }
-#sidebar.hidden { display: none; }
+/* `open` is the single source of truth for the sidebar at both breakpoints;
+   JS sets the initial value from the viewport width (closed on a phone). */
+#sidebar:not(.open) { display: none; }
+#backdrop { position: absolute; inset: 0; z-index: 25; background: rgba(1,4,9,.6); display: none; }
 .side-head { padding: 10px; border-bottom: 1px solid #21262d; }
 #new-chat { width: 100%; padding: 8px 0; font-size: 13px; border-radius: 6px; }
 #conv-list { flex: 1; overflow-y: auto; padding: 6px; }
@@ -31,29 +42,31 @@ header a:hover { color: #c9d1d9; border-color: #8b949e; }
 .conv .title { font-size: 13px; color: #c9d1d9; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .conv.active .title { color: #f0f6fc; }
 .conv .meta { font-size: 11px; color: #484f58; margin-top: 2px; }
-.conv .del { color: #484f58; font-size: 13px; padding: 0 3px; border-radius: 4px; visibility: hidden; }
+.conv .del { color: #484f58; font-size: 13px; border-radius: 4px; visibility: hidden; flex: none; display: flex; align-items: center; justify-content: center; min-width: 32px; min-height: 32px; margin: -6px -3px -6px 0; }
 .conv:hover .del { visibility: visible; }
 .conv .del:hover { color: #f85149; background: #21262d; }
+.conv:active { background: #161b22; }
+/* Touchscreens have no hover, so the delete button was unreachable there. */
+@media (hover: none) { .conv .del { visibility: visible; } }
 .side-empty { padding: 14px 10px; font-size: 12px; color: #484f58; }
 .badge-src { font-size: 10px; color: #8b949e; border: 1px solid #30363d; border-radius: 8px; padding: 0 5px; margin-left: 4px; }
-#toggle-side { background: #21262d; color: #c9d1d9; padding: 4px 10px; font-size: 13px; border-radius: 6px; }
-#toggle-side:hover { background: #30363d; }
-@media (max-width: 720px) {
-  #sidebar { position: absolute; z-index: 20; height: calc(100% - 49px); }
-}
-#messages { flex: 1; overflow-y: auto; padding: 20px 16px; display: flex; flex-direction: column; gap: 14px; }
+#toggle-side { background: #21262d; color: #c9d1d9; padding: 4px 10px; font-size: 13px; border-radius: 6px; flex: none; }
+#toggle-side:hover, #toggle-side:active { background: #30363d; }
+#messages { flex: 1; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; padding: 20px 16px; display: flex; flex-direction: column; gap: 14px; }
 .msg { max-width: 780px; width: 100%; margin: 0 auto; display: flex; gap: 10px; }
 .msg .who { flex: 0 0 64px; font-size: 12px; color: #8b949e; text-transform: uppercase; letter-spacing: .5px; padding-top: 3px; }
-.msg .body { flex: 1; white-space: pre-wrap; word-wrap: break-word; line-height: 1.55; }
+.msg .body { flex: 1; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.55; }
 .msg.user .body { color: #f0f6fc; }
 .msg.assistant .body { color: #c9d1d9; }
 .think { margin: 6px 0; border: 1px solid #30363d; border-radius: 6px; background: #161b22; }
 .think summary { cursor: pointer; padding: 6px 10px; font-size: 12px; color: #a371f7; user-select: none; }
 .think .think-body { padding: 8px 10px; border-top: 1px solid #30363d; font-size: 13px; color: #8b949e; white-space: pre-wrap; }
 .recall-note { max-width: 780px; margin: 0 auto; width: 100%; font-size: 12px; color: #d29922; }
-footer { border-top: 1px solid #30363d; background: #161b22; padding: 12px 16px; }
+footer { border-top: 1px solid #30363d; background: #161b22; padding: 12px calc(16px + env(safe-area-inset-right, 0px)) calc(12px + env(safe-area-inset-bottom, 0px)) calc(16px + env(safe-area-inset-left, 0px)); }
 .composer { max-width: 780px; margin: 0 auto; display: flex; gap: 8px; }
-textarea { flex: 1; resize: none; background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 8px; padding: 10px 12px; font-size: 14px; font-family: inherit; line-height: 1.4; max-height: 200px; }
+/* 16px is the floor: anything smaller makes iOS Safari zoom the whole page on
+   focus, which pushes the layout wider than the viewport. */
+textarea { flex: 1; min-width: 0; resize: none; background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 8px; padding: 10px 12px; font-size: 16px; font-family: inherit; line-height: 1.4; max-height: 200px; }
 textarea:focus { outline: none; border-color: #58a6ff; }
 button { background: #238636; color: #fff; border: none; border-radius: 8px; padding: 0 18px; font-size: 14px; cursor: pointer; font-weight: 600; }
 button:hover { background: #2ea043; }
@@ -66,27 +79,71 @@ button.stop:hover { background: #f85149; }
 .attachments { max-width: 780px; margin: 0 auto 8px; display: flex; flex-wrap: wrap; gap: 6px; }
 .attachments:empty { display: none; }
 .chip { display: inline-flex; align-items: center; gap: 6px; background: #161b22; border: 1px solid #30363d; border-radius: 14px; padding: 3px 10px; font-size: 12px; color: #c9d1d9; }
-.chip-x { cursor: pointer; color: #8b949e; font-size: 11px; }
+.chip-x { cursor: pointer; color: #8b949e; font-size: 11px; display: inline-flex; align-items: center; justify-content: center; min-width: 24px; min-height: 24px; margin: -4px -6px -4px 0; }
 .chip-x:hover { color: #f85149; }
 .msg-files { font-size: 11px; color: #8b949e; margin-top: 4px; }
 .hint { max-width: 780px; margin: 6px auto 0; font-size: 11px; color: #484f58; }
 .err { color: #f85149; }
+
+/* In-page replacement for window.confirm()/alert(), same as the admin page:
+   Firefox's "Block dialogs" site permission makes confirm() return false
+   silently, and native dialogs are especially jarring on a phone. */
+.modal-overlay { position: fixed; inset: 0; background: rgba(1,4,9,.65); display: flex; align-items: center; justify-content: center; z-index: 100; padding: 16px; }
+.modal-overlay[hidden] { display: none; }
+.modal-box { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 20px; max-width: 440px; width: 100%; box-shadow: 0 12px 40px rgba(0,0,0,.5); }
+.modal-msg { font-size: 13px; color: #c9d1d9; white-space: pre-wrap; overflow-wrap: anywhere; margin-bottom: 18px; line-height: 1.5; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.modal-actions button { background: #30363d; color: #c9d1d9; border: 1px solid #484f58; border-radius: 4px; padding: 8px 14px; min-height: 40px; cursor: pointer; font-size: 13px; }
+.modal-actions button:hover, .modal-actions button:active { background: #484f58; }
+.modal-actions .btn-danger { background: #da3633; border-color: #da3633; color: #fff; }
+.modal-actions .btn-danger:hover, .modal-actions .btn-danger:active { background: #f85149; }
+
+@media (max-width: 720px) {
+  /* The sidebar becomes an off-canvas drawer: parked outside the viewport
+     until ☰ is pressed, then slid over the conversation with a backdrop.
+     top/bottom:0 against #shell is what replaced the old hardcoded header
+     height. The display rules override the desktop `:not(.open){display:none}`
+     so the drawer can animate instead of popping in and out. */
+  #sidebar { position: absolute; top: 0; left: 0; bottom: 0; z-index: 30; width: min(84vw, 300px); box-shadow: 2px 0 16px rgba(0,0,0,.5); transition: transform .22s ease, visibility .22s; }
+  #sidebar:not(.open) { display: flex; visibility: hidden; transform: translateX(-100%); }
+  #sidebar.open { visibility: visible; transform: none; }
+  #backdrop.show { display: block; }
+  header { padding: 10px calc(12px + env(safe-area-inset-right, 0px)) 10px calc(12px + env(safe-area-inset-left, 0px)); gap: 8px; }
+  header h1 { font-size: 14px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #messages { padding: 14px 12px; }
+  /* Stack the role label above the text: the fixed 64px gutter was ~18% of a
+     360px screen. */
+  .msg { flex-direction: column; gap: 2px; }
+  .msg .who { flex: none; padding-top: 0; }
+  footer { padding-left: calc(12px + env(safe-area-inset-left, 0px)); padding-right: calc(12px + env(safe-area-inset-right, 0px)); }
+  #toggle-side, .attach, #send { min-height: 44px; }
+  #toggle-side, .attach { min-width: 44px; }
+  #new-chat { min-height: 44px; }
+  .hint { display: none; }
+}
+@media (max-width: 480px) {
+  #status-text { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  #sidebar { transition: none; }
+}
 </style>
 </head>
 <body>
 
 <header>
-  <button id="toggle-side" title="Show/hide history">☰</button>
+  <button id="toggle-side" type="button" title="Show/hide history" aria-label="Show/hide history" aria-expanded="false" aria-controls="sidebar">☰</button>
   <h1>⬡ Cued Recall Chat</h1>
-  <span class="status"><span id="dot"></span><span id="status-text">connecting…</span></span>
+  <span class="status" id="status"><span id="dot"></span><span id="status-text">connecting…</span></span>
   <a href="/admin">Admin</a>
 </header>
 
 <div id="shell">
   <aside id="sidebar">
-    <div class="side-head"><button id="new-chat">+ New chat</button></div>
+    <div class="side-head"><button id="new-chat" type="button">+ New chat</button></div>
     <div id="conv-list"></div>
   </aside>
+  <div id="backdrop"></div>
 
   <div id="main">
 <div id="messages"></div>
@@ -96,14 +153,24 @@ button.stop:hover { background: #f85149; }
   <div class="composer">
     <input type="file" id="file" multiple hidden
       accept=".txt,.md,.markdown,.py,.js,.ts,.json,.csv,.tsv,.log,.html,.css,.xml,.yaml,.yml,.ini,.cfg,.conf,.sh,.bat,.c,.cpp,.h,.hpp,.java,.go,.rs,.rb,.php,.sql,text/*">
-    <button id="attach" class="attach" title="Attach text or code files">📎</button>
-    <textarea id="input" rows="1" placeholder="Send a message…  (Enter to send, Shift+Enter for newline)"></textarea>
-    <button id="send">Send</button>
+    <button id="attach" class="attach" type="button" title="Attach text or code files" aria-label="Attach text or code files">📎</button>
+    <textarea id="input" rows="1" enterkeyhint="enter" placeholder="Send a message…"></textarea>
+    <button id="send" type="button">Send</button>
   </div>
-  <div class="hint">Goes through the memory middleware on this port. Attach text/code files with 📎 (their contents are read and included). Conversations are saved — pick one from the sidebar to continue it.</div>
+  <div class="hint">Enter sends, Shift+Enter for a newline. Goes through the memory middleware on this port. Attach text/code files with 📎 (their contents are read and included). Conversations are saved — pick one from the sidebar to continue it.</div>
 </footer>
   </div><!-- #main -->
 </div><!-- #shell -->
+
+<div class="modal-overlay" id="confirm-overlay" hidden>
+  <div class="modal-box" role="alertdialog" aria-modal="true" aria-labelledby="confirm-msg">
+    <div class="modal-msg" id="confirm-msg"></div>
+    <div class="modal-actions">
+      <button id="confirm-cancel" type="button">Cancel</button>
+      <button id="confirm-ok" class="btn-danger" type="button">Confirm</button>
+    </div>
+  </div>
+</div>
 
 <script>
 const API = '';
@@ -125,6 +192,55 @@ const $attachments = document.getElementById('attachments');
 
 const attachments = [];   // { name, content } read from disk, cleared on send
 
+// Touch devices get mobile behaviour: no Enter-to-send (the on-screen Return
+// key types a newline instead), and no programmatic focus that would throw the
+// keyboard open over a screen the user has not read yet.
+const isTouch = matchMedia('(pointer: coarse)').matches;
+const mqMobile = matchMedia('(max-width: 720px)');
+
+function focusInput() {
+  if (!isTouch) $input.focus();
+}
+
+// window.confirm() resolves false -- silently, no dialog -- once Firefox's
+// "Block dialogs" site permission is on, and native dialogs interrupt badly on
+// a phone. Same in-page question as the admin page asks.
+// okOnly: a notice with a single dismiss button, replacing alert().
+function confirmDialog(message, okOnly) {
+  return new Promise(resolve => {
+    const overlay = document.getElementById('confirm-overlay');
+    const msgEl = document.getElementById('confirm-msg');
+    const ok = document.getElementById('confirm-ok');
+    const cancel = document.getElementById('confirm-cancel');
+    msgEl.textContent = message;
+    ok.textContent = okOnly ? 'OK' : 'Confirm';
+    ok.classList.toggle('btn-danger', !okOnly);
+    cancel.hidden = !!okOnly;
+    const onKey = (e) => { if (e.key === 'Escape') done(false); };
+    function done(val) {
+      overlay.hidden = true;
+      ok.onclick = cancel.onclick = null;
+      overlay.onclick = null;
+      document.removeEventListener('keydown', onKey);
+      resolve(val);
+    }
+    ok.onclick = () => done(true);
+    cancel.onclick = () => done(false);
+    overlay.onclick = (e) => { if (e.target === overlay) done(false); };
+    document.addEventListener('keydown', onKey);
+    overlay.hidden = false;
+    ok.focus();
+  });
+}
+
+function notify(message) { return confirmDialog(message, true); }
+
+// Only pin to the bottom when the reader is already there -- otherwise every
+// streamed token yanks them back down from whatever they scrolled up to read.
+function nearBottom() {
+  return $messages.scrollHeight - $messages.scrollTop - $messages.clientHeight < 80;
+}
+
 $attach.addEventListener('click', () => $file.click());
 $file.addEventListener('change', () => {
   for (const f of $file.files) {
@@ -133,7 +249,7 @@ $file.addEventListener('change', () => {
       attachments.push({ name: f.name, content: String(reader.result || '') });
       renderAttachments();
     };
-    reader.onerror = () => alert('Could not read ' + f.name);
+    reader.onerror = () => notify('Could not read ' + f.name);
     reader.readAsText(f);
   }
   $file.value = '';   // allow re-selecting the same file
@@ -152,15 +268,19 @@ function renderAttachments() {
   });
 }
 
+function setStatus(ok, text) {
+  document.getElementById('dot').className = ok ? 'ok' : '';
+  document.getElementById('status-text').textContent = text;
+  // The wording is hidden on narrow screens, so keep it on the dot's tooltip.
+  document.getElementById('status').title = text;
+}
+
 async function checkHealth() {
   try {
     const r = await fetch(API + '/health');
-    const ok = r.ok;
-    document.getElementById('dot').className = ok ? 'ok' : '';
-    document.getElementById('status-text').textContent = ok ? 'connected' : 'unreachable';
+    setStatus(r.ok, r.ok ? 'connected' : 'unreachable');
   } catch {
-    document.getElementById('dot').className = '';
-    document.getElementById('status-text').textContent = 'offline';
+    setStatus(false, 'offline');
   }
 }
 
@@ -172,13 +292,14 @@ function el(tag, cls, text) {
 }
 
 function addMessage(role, text) {
+  const stick = nearBottom();   // measured before the node changes the height
   const wrap = el('div', 'msg ' + role);
   wrap.appendChild(el('div', 'who', role === 'user' ? 'You' : 'AI'));
   const body = el('div', 'body');
   body.textContent = text || '';
   wrap.appendChild(body);
   $messages.appendChild(wrap);
-  $messages.scrollTop = $messages.scrollHeight;
+  if (stick) $messages.scrollTop = $messages.scrollHeight;
   return body;   // caller updates .textContent as tokens stream
 }
 
@@ -200,6 +321,7 @@ function splitThink(text) {
 }
 
 function renderAssistant(bodyEl, fullText, separateReasoning) {
+  const stick = nearBottom();   // measured before this render grows the pane
   const { reasoning, answer } = splitThink(fullText);
   // Reasoning may arrive inline as <think>… or via a separate field.
   let allReasoning = (separateReasoning || '').trim();
@@ -227,7 +349,7 @@ function renderAssistant(bodyEl, fullText, separateReasoning) {
     bodyEl.appendChild(bodyEl._answer);
   }
   bodyEl._answer.textContent = answer || (allReasoning ? '' : fullText);
-  $messages.scrollTop = $messages.scrollHeight;
+  if (stick) $messages.scrollTop = $messages.scrollHeight;
 }
 
 let controller = null;
@@ -339,7 +461,7 @@ async function send() {
     // after it lands -- this is what makes a brand new chat appear in the
     // sidebar, and bumps an existing one to the top.
     loadConversations();
-    $input.focus();
+    focusInput();
   }
 }
 
@@ -348,10 +470,11 @@ $send.addEventListener('click', () => {
   send();
 });
 $input.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault();
-    if (!generating) send();
-  }
+  // isComposing: an IME's confirm-Enter would otherwise fire a half-typed send.
+  // isTouch: on a phone the keyboard's Return types a newline and Send sends.
+  if (e.key !== 'Enter' || e.shiftKey || e.isComposing || isTouch) return;
+  e.preventDefault();
+  if (!generating) send();
 });
 $input.addEventListener('input', () => {
   $input.style.height = 'auto';
@@ -361,6 +484,19 @@ $input.addEventListener('input', () => {
 // ---- conversation history sidebar -------------------------------------
 const $convList = document.getElementById('conv-list');
 const $sidebar = document.getElementById('sidebar');
+const $backdrop = document.getElementById('backdrop');
+const $toggleSide = document.getElementById('toggle-side');
+
+// Below 720px the sidebar is an overlay drawer, so it starts closed -- opening
+// it on top of a 360px conversation is how the phone layout used to look
+// broken on first paint. On a wide screen it stays open as before.
+function setSidebar(open) {
+  $sidebar.classList.toggle('open', open);
+  $backdrop.classList.toggle('show', open);
+  $toggleSide.setAttribute('aria-expanded', String(open));
+}
+function sidebarIsOverlay() { return mqMobile.matches; }
+function closeSidebarOnMobile() { if (sidebarIsOverlay()) setSidebar(false); }
 
 function relTime(ts) {
   const s = Math.floor(Date.now() / 1000 - (ts || 0));
@@ -428,11 +564,14 @@ async function openConversation(id) {
         addMessage(m.role, m.content);
       }
     }
+    // Loading a conversation should land at its end regardless of where the
+    // previous scroll position was.
     $messages.scrollTop = $messages.scrollHeight;
     loadConversations();
-    $input.focus();
+    closeSidebarOnMobile();   // otherwise the drawer stays parked over the chat
+    focusInput();
   } catch (e) {
-    alert('Could not open conversation: ' + e.message);
+    notify('Could not open conversation: ' + e.message);
   }
 }
 
@@ -442,29 +581,54 @@ function newChat() {
   history = [];
   $messages.innerHTML = '';
   loadConversations();
-  $input.focus();
+  closeSidebarOnMobile();
+  focusInput();
 }
 
 async function deleteConversation(id, title) {
-  if (!confirm('Delete "' + (title || id) + '"?\n\nThe transcript goes; memory blocks learned from it are kept.')) return;
+  if (!(await confirmDialog('Delete "' + (title || id) + '"?\n\nThe transcript goes; memory blocks learned from it are kept.'))) return;
   try {
     const r = await fetch(API + '/chats/' + encodeURIComponent(id), { method: 'DELETE' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     if (id === conversationId) newChat();
     else loadConversations();
   } catch (e) {
-    alert('Delete failed: ' + e.message);
+    notify('Delete failed: ' + e.message);
   }
 }
 
 document.getElementById('new-chat').addEventListener('click', newChat);
-document.getElementById('toggle-side').addEventListener('click',
-  () => $sidebar.classList.toggle('hidden'));
+$toggleSide.addEventListener('click',
+  () => setSidebar(!$sidebar.classList.contains('open')));
+$backdrop.addEventListener('click', closeSidebarOnMobile);
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeSidebarOnMobile();
+});
+setSidebar(!sidebarIsOverlay());
+// Crossing the breakpoint (rotating the phone, resizing a window) re-applies
+// the default for the new layout rather than leaving a drawer stuck open.
+mqMobile.addEventListener('change', (e) => setSidebar(!e.matches));
+
+// An on-screen keyboard overlays the layout viewport instead of shrinking it,
+// which is what buries the composer. Track the visual viewport so the shell is
+// only ever as tall as the part actually on screen.
+if (isTouch && window.visualViewport) {
+  const vv = window.visualViewport;
+  const syncViewport = () => {
+    const stick = nearBottom();
+    document.body.style.height = vv.height + 'px';
+    // iOS scrolls the layout viewport instead of resizing it; undo that.
+    window.scrollTo(0, 0);
+    if (stick) $messages.scrollTop = $messages.scrollHeight;
+  };
+  vv.addEventListener('resize', syncViewport);
+  vv.addEventListener('scroll', syncViewport);
+}
 
 checkHealth();
 setInterval(checkHealth, 10000);
 loadConversations();
-$input.focus();
+focusInput();
 </script>
 </body>
 </html>
