@@ -44,6 +44,13 @@ tr:hover td { background: #161b22; }
 .badge-gpu { background: #3fb95020; color: #3fb950; border: 1px solid #3fb95040; }
 .badge-cpu { background: #58a6ff20; color: #58a6ff; border: 1px solid #58a6ff40; }
 .badge-off { background: #8b949e20; color: #8b949e; border: 1px solid #8b949e40; }
+.badge-memory { background: #3fb95020; color: #3fb950; border: 1px solid #3fb95040; }
+.badge-passthrough { background: #d2992220; color: #d29922; border: 1px solid #d2992240; }
+.badge-unknown { background: #8b949e20; color: #8b949e; border: 1px solid #8b949e40; }
+#mode-card button { background: #30363d; color: #c9d1d9; border: 1px solid #484f58; border-radius: 4px; padding: 4px 12px; cursor: pointer; font-size: 12px; margin-right: 6px; }
+#mode-card button:hover:not(:disabled) { background: #484f58; }
+#mode-card button:disabled { opacity: .4; cursor: default; }
+#mode-card .mode-result { font-size: 11px; color: #8b949e; margin-top: 8px; }
 .proc-row { display: flex; justify-content: space-between; font-size: 11px; color: #8b949e; margin-top: 3px; }
 .proc-row b { color: #c9d1d9; font-weight: 500; }
 .note { font-size: 11px; color: #484f58; margin: -8px 0 12px; }
@@ -85,6 +92,9 @@ tr:hover td { background: #161b22; }
 <!-- Deliberately outside the tab panels: a wedged inference queue must be
      visible from wherever you are, not hideable behind an unselected tab. -->
 <div id="wedge-banner"></div>
+<!-- Same reasoning as the wedge banner: "memory is off" changes what every
+     other number on this page means, so it cannot be hidden behind a tab. -->
+<div id="mode-banner"></div>
 <div id="last-updated"></div>
 
 <nav class="tabs" role="tablist">
@@ -94,6 +104,10 @@ tr:hover td { background: #161b22; }
 </nav>
 
 <section class="tab-panel" data-tab="live">
+
+<h2>Mode</h2>
+<div class="models-grid"><div class="model-card" id="mode-card">Loading…</div></div>
+<div class="note">Disabled makes :8000 a plain proxy to the reasoning model — nothing recalled, nothing injected, nothing stored. Use it while coding.</div>
 
 <h2>Models — context usage</h2>
 <div class="models-grid" id="models-grid"></div>
@@ -608,6 +622,78 @@ async function restartServer(name) {
   }
 }
 
+// Request mode. Enabled = the full pipeline; Disabled = :8000 is a plain proxy
+// to the reasoning server, which is what a coding agent wants, since the recall
+// preamble and the injected tools only degrade its prompt.
+let modeInFlight = false;
+
+function renderMode(d) {
+  const card = document.getElementById('mode-card');
+  const banner = document.getElementById('mode-banner');
+  const mode = d && d.mode;
+  const on = mode === 'memory';
+  const known = on || mode === 'passthrough';
+  const label = on ? 'Memory active'
+    : mode === 'passthrough' ? 'Passthrough — memory off'
+    : 'Unknown';
+  card.innerHTML = `
+    <div class="head">
+      <span class="badge badge-${known ? esc(mode) : 'unknown'}">${esc(label)}</span>
+    </div>
+    <div class="meta">${on
+      ? 'Recall, injection and block creation are running.'
+      : `Forwarded untouched to ${esc((d && d.reasoning_endpoint) || 'the reasoning server')}.`}</div>
+    <button id="mode-on" ${on ? 'disabled' : ''}>Enable memory</button>
+    <button id="mode-off" ${mode === 'passthrough' ? 'disabled' : ''}>Disable (passthrough)</button>
+    <div class="mode-result" id="mode-result"></div>`;
+  document.getElementById('mode-on').onclick = () => setMode('memory');
+  document.getElementById('mode-off').onclick = () => setMode('passthrough');
+  banner.innerHTML = mode === 'passthrough' ? `
+    <div class="model-card" style="border-color:#d29922;margin-bottom:12px">
+      <div class="head">
+        <span class="badge badge-passthrough">Memory disabled</span>
+        <span class="name" style="text-transform:none">:8000 is a plain proxy right now</span>
+      </div>
+      <div class="meta">Nothing is being recalled or stored. Re-enable it under Live → Mode when you are done coding.</div>
+    </div>` : '';
+}
+
+async function loadMode() {
+  // Skipped mid-toggle: the POST's own render is newer than this poll's.
+  if (modeInFlight) return;
+  try {
+    renderMode(await getJSON('/admin/mode'));
+  } catch (e) {
+    document.getElementById('mode-card').innerHTML =
+      `<div class="meta">Mode unavailable: ${esc(e.message)}</div>`;
+    document.getElementById('mode-banner').innerHTML = '';
+  }
+}
+
+async function setMode(next) {
+  if (modeInFlight) return;
+  modeInFlight = true;
+  try {
+    const r = await fetch(API + '/admin/mode', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({mode: next}),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || ('HTTP ' + r.status));
+    renderMode(d);
+    document.getElementById('mode-result').textContent = d.persisted
+      ? 'Saved — this survives a restart.'
+      : 'Switched, but it could not be saved: a restart will go back to memory.';
+  } catch (e) {
+    const el = document.getElementById('mode-result');
+    if (el) el.textContent = 'Could not switch: ' + e.message;
+    else alert('Could not switch mode: ' + e.message);
+  } finally {
+    modeInFlight = false;
+  }
+}
+
 async function loadHealth() {
   try {
     const d = await getJSON('/admin/stats/recall?top=10');
@@ -921,7 +1007,7 @@ async function clearKv() {
         : `${name}: cleared ${info.cleared}/${info.slots} slot(s)`);
     }
     alert(`KV cache: ${data.cleared_slots || 0} slot(s) cleared\n\n${lines.join('\n')}`);
-    refresh();
+    refreshGlobal();
   } catch (e) {
     alert('Error: ' + e.message);
   }
@@ -942,7 +1028,7 @@ async function runJudge() {
     if (data.elapsed_s != null) parts.push(`${data.elapsed_s}s`);
     if (data.stopped_early) parts.push('stopped at the time limit — run again to continue');
     alert('Judge pass: ' + (data.status || 'done') + '\n' + parts.join('\n'));
-    refresh();
+    refreshGlobal();
   } catch (e) {
     alert('Error: ' + e.message);
   }
@@ -952,7 +1038,7 @@ async function runJudge() {
 // matter which tab is open -- see the comment on #wedge-banner in the markup.
 async function refreshGlobal() {
   document.getElementById('last-updated').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
-  await Promise.all([loadServerInfo(), loadWedge()]);
+  await Promise.all([loadServerInfo(), loadWedge(), loadMode()]);
 }
 
 // Any change to what is being listed puts you back on page 1 -- staying on

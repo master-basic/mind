@@ -219,6 +219,16 @@ address when started with `--host 0.0.0.0`).
 | `GET` | `/admin/system` | GPU/CPU telemetry, uptime |
 | `GET` | `/admin/wedge` | Is a server's inference queue blocked? |
 | `POST` | `/admin/server/restart` | Ask the launcher to restart a llama server (503 without one) |
+| `GET` | `/admin/mode` | Current request mode (`memory` or `passthrough`) |
+| `POST` | `/admin/mode` | Switch mode — `{"mode": "memory"\|"passthrough"}` |
+
+**Passthrough mode.** Live → Mode in the admin GUI has an Enable/Disable switch.
+Disabled turns `:8000` into a plain proxy to the reasoning server: the request is
+forwarded byte-for-byte, nothing is recalled or injected, nothing is stored, and the
+idle judge pass stays out of the way. It exists for coding agents, whose prompts are
+already exactly what they should be — anything this middleware adds to them makes the
+output worse. The choice is written to `mode.json` in the store, so it survives a
+restart.
 
 ### Utility
 

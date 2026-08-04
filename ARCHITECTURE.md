@@ -164,6 +164,13 @@ The judge previously asked the model for a three-way `keep`/`truncate`/`purge_ca
 ```
 User sends /v1/chat/completions
 │
+├─ mode == "passthrough"?  →  forwarded verbatim to the reasoning server, and
+│   nothing below this line runs. The branch sits at the very top because
+│   everything under it -- the correction scan, the shelve, process_turn -- is
+│   memory work. Toggled from Live → Mode in the admin page, persisted in
+│   mode.json in the store. For coding agents: their prompt is already what it
+│   should be, and augmenting it degrades the code that comes back.
+│
 ├─ detect_and_apply_correction()
 │   Matches the user message against correction_patterns (17 anchored
 │   regexes, EN + AZ). If it hits, marks the previous turn's blocks
@@ -480,7 +487,7 @@ was on screen:
 
 | Tab | Shows | Endpoints |
 |---|---|---|
-| Live | Per-server context usage, GPU/system telemetry, uptime, block stats, throughput | `/admin/models`, `/admin/system`, `/admin/stats`, `/admin/tps`, `/admin/wedge` |
+| Live | Memory/passthrough switch, per-server context usage, GPU/system telemetry, uptime, block stats, throughput | `/admin/mode`, `/admin/models`, `/admin/system`, `/admin/stats`, `/admin/tps`, `/admin/wedge` |
 | Memory | Memory health, per-turn recall budget decisions, token distribution, store growth, most-recalled blocks | `/admin/stats/budget`, `/admin/stats/distribution`, `/admin/stats/growth`, `/admin/stats/recall` |
 | Blocks | Paged, filterable block table; pin toggle per row, bulk restore and delete | `/admin/blocks`, `/admin/blocks/{id}`, `/admin/blocks/{id}/pin`, `/admin/blocks/restore`, `/admin/blocks/delete` |
 

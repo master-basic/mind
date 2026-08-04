@@ -10,7 +10,7 @@ import uvicorn
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import Response, StreamingResponse, JSONResponse
 
 from .chats import ChatStore
 from .config import Config
@@ -78,6 +78,15 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
     judge_tokens = [0]
     last_turn_at = [0.0]
     last_judge_at = [time.time()]
+
+    # Request mode. In passthrough, :8000 is a plain proxy to the reasoning
+    # server: nothing recalled, nothing injected, nothing stored. It exists
+    # because a coding agent's prompt is already exactly what it should be, and
+    # everything this middleware adds to it makes the code worse. Persisted, so
+    # a restart mid-session does not silently switch memory back on.
+    mode_file = store_path / "mode.json"
+    mode_state = [_load_mode(mode_file)]
+    mode_changed_at = [0.0]
 
     async def run_judge_pass(min_age=None):
         if judge_running[0]:
@@ -492,6 +501,42 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
                 "note": "The launcher picks this up within ~15s; the model "
                         "then reloads, which takes up to a minute."}
 
+    @app.get("/admin/mode")
+    async def get_mode():
+        return {
+            "mode": mode_state[0],
+            "changed_at": mode_changed_at[0] or None,
+            "reasoning_endpoint": cfg.reasoning_endpoint,
+        }
+
+    @app.post("/admin/mode")
+    async def set_mode(body: dict):
+        """Switch between the full memory pipeline and raw passthrough.
+
+        Runtime state rather than a config key: config.yaml is rewritten by
+        run.py on every launch, and this is something you flip several times a
+        day -- once per switch between chatting and coding.
+        """
+        mode = body.get("mode")
+        if mode not in (MODE_MEMORY, MODE_PASSTHROUGH):
+            raise HTTPException(
+                status_code=400,
+                detail=f"mode must be '{MODE_MEMORY}' or '{MODE_PASSTHROUGH}'",
+            )
+        mode_state[0] = mode
+        mode_changed_at[0] = time.time()
+        persisted = _save_mode(mode_file, mode)
+        wal.write({"event": "admin_mode_change", "mode": mode,
+                   "persisted": persisted, "timestamp": time.time()})
+        # A failed write still leaves the live mode switched -- the caller only
+        # needs to know it will not survive a restart.
+        # Same shape as GET, so the caller can render the reply directly
+        # instead of following it with a second round trip.
+        return {"status": "ok", "mode": mode,
+                "changed_at": mode_changed_at[0],
+                "reasoning_endpoint": cfg.reasoning_endpoint,
+                "persisted": persisted}
+
     admin_router = build_admin_router(index, store, wal, run_judge_pass, tps_ring, embed,
                                       reasoning_endpoint=cfg.reasoning_endpoint)
     app.include_router(admin_router)
@@ -618,7 +663,11 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
                     # sweep that decay is overdue even on a quiet week.
                     due = (judge_tokens[0] >= cfg.judge.interval_tokens
                            or now - last_judge_at[0] >= cfg.judge.sweep_interval_s)
+                    # Never in passthrough: that mode is chosen precisely when
+                    # the machine is busy with work the user is waiting on, and
+                    # a pass would spend the CPU the reasoning model needs.
                     if (due and not judge_running[0]
+                            and mode_state[0] == MODE_MEMORY
                             and idle_for >= cfg.judge.idle_trigger_s):
                         judge_tokens[0] = 0
                         last_judge_at[0] = now
@@ -686,10 +735,67 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
         turn_index = max(0, n_user - 1)
         return conv, turn_index
 
+    async def _passthrough(body: dict):
+        """Forward the request to the reasoning server untouched.
+
+        Deliberately not Pipeline.forward_stream/forward_nonstream: those
+        rewrite `messages`/`stream` and drop the upstream status code. The
+        point here is that the bytes the client sent are the bytes the model
+        sees, and the bytes the model returns are the bytes the client gets --
+        no SSE re-framing, no <think> splitting, no tool-call filtering.
+        """
+        import httpx
+
+        url = f"{cfg.reasoning_endpoint}/v1/chat/completions"
+
+        if not body.get("stream", False):
+            async with httpx.AsyncClient() as client:
+                r = await client.post(url, json=body, timeout=300)
+            try:
+                return JSONResponse(content=r.json(), status_code=r.status_code)
+            except ValueError:
+                return Response(content=r.content, status_code=r.status_code,
+                                media_type=r.headers.get("content-type"))
+
+        async def relay():
+            # The client has to outlive the generator, so it is opened here
+            # rather than around the StreamingResponse.
+            async with httpx.AsyncClient() as client:
+                async with client.stream("POST", url, json=body,
+                                         timeout=300) as resp:
+                    if resp.status_code != 200:
+                        detail = (await resp.aread()).decode(
+                            "utf-8", "replace")[:2000]
+                        # Fail loudly in-band: an SSE client that gets a silent
+                        # close on an upstream error just hangs.
+                        yield ("data: " + json.dumps({"error": {
+                            "message": detail,
+                            "code": resp.status_code}}) + "\n\n").encode()
+                        yield b"data: [DONE]\n\n"
+                        return
+                    async for chunk in resp.aiter_raw():
+                        yield chunk
+
+        return StreamingResponse(relay(), media_type="text/event-stream")
+
     @app.api_route("/v1/chat/completions", methods=["POST"])
     async def chat_completions(request: Request):
         body = await request.json()
         stream = body.get("stream", False)
+
+        if mode_state[0] == MODE_PASSTHROUGH:
+            # Ahead of the incoming_request log and everything below it: the
+            # correction scan, the shelve and process_turn are all memory work,
+            # so a real bypass has to branch before any of them. One compact WAL
+            # line so the timeline still shows the traffic, without content.
+            last_turn_at[0] = time.time()
+            wal.write({
+                "event": "passthrough_request",
+                "messages_count": len(body.get("messages", [])),
+                "stream": stream,
+                "timestamp": time.time(),
+            })
+            return await _passthrough(body)
 
         msgs = body.get("messages", [])
         last_user = None
@@ -799,6 +905,37 @@ def _clamp_context_budget(cfg: Config):
             f"reasoning server's context ({n_ctx}); clamping to {ceiling}"
         )
         cfg.max_context_tokens = ceiling
+
+
+MODE_MEMORY = "memory"
+MODE_PASSTHROUGH = "passthrough"
+
+
+def _load_mode(path: Path) -> str:
+    """Read the persisted request mode, defaulting to full memory.
+
+    Never raises: a missing, unreadable or corrupt file means "we don't know",
+    and the safe unknown is the normal mode -- a middleware that refused to
+    start because a one-key state file was truncated would be worse than one
+    that quietly turns memory back on.
+    """
+    try:
+        mode = json.loads(path.read_text(encoding="utf-8")).get("mode")
+    except (OSError, ValueError, AttributeError):
+        return MODE_MEMORY
+    return mode if mode in (MODE_MEMORY, MODE_PASSTHROUGH) else MODE_MEMORY
+
+
+def _save_mode(path: Path, mode: str) -> bool:
+    """Persist the mode so it survives a restart. False if it could not be."""
+    try:
+        path.write_text(
+            json.dumps({"mode": mode, "changed_at": time.time()}),
+            encoding="utf-8",
+        )
+        return True
+    except OSError:
+        return False
 
 
 def _endpoint_port(value: str) -> int:
