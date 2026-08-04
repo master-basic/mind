@@ -67,6 +67,15 @@ tr:hover td { background: #161b22; }
 .tabs button[aria-selected="true"] { color: #58a6ff; border-bottom-color: #58a6ff; }
 .tab-panel[hidden] { display: none; }
 .tab-panel > h2:first-child { margin-top: 0; }
+.modal-overlay { position: fixed; inset: 0; background: rgba(1,4,9,.65); display: flex; align-items: center; justify-content: center; z-index: 100; }
+.modal-overlay[hidden] { display: none; }
+.modal-box { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 20px; max-width: 440px; width: 90%; box-shadow: 0 12px 40px rgba(0,0,0,.5); }
+.modal-msg { font-size: 13px; color: #c9d1d9; white-space: pre-wrap; margin-bottom: 18px; line-height: 1.5; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.modal-actions button { background: #30363d; color: #c9d1d9; border: 1px solid #484f58; border-radius: 4px; padding: 6px 14px; cursor: pointer; font-size: 12px; }
+.modal-actions button:hover { background: #484f58; }
+.modal-actions .btn-danger { background: #da3633; border-color: #da3633; color: #fff; }
+.modal-actions .btn-danger:hover { background: #f85149; }
 </style>
 </head>
 <body>
@@ -217,6 +226,19 @@ tr:hover td { background: #161b22; }
 
 </section>
 
+<!-- In-page replacement for window.confirm(): Firefox's "Block dialogs" site
+     permission makes confirm() return false silently, which would silently
+     cancel every destructive action on this page. -->
+<div class="modal-overlay" id="confirm-overlay" hidden>
+  <div class="modal-box" role="alertdialog" aria-modal="true" aria-labelledby="confirm-msg">
+    <div class="modal-msg" id="confirm-msg"></div>
+    <div class="modal-actions">
+      <button id="confirm-cancel" type="button">Cancel</button>
+      <button id="confirm-ok" class="btn-danger" type="button">Confirm</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const API = '';
 const selected = new Set();
@@ -226,6 +248,34 @@ function updateSelUI() {
   document.getElementById('sel-count').textContent = n ? `(${n})` : '';
   document.getElementById('btn-delete').disabled = n === 0;
   document.getElementById('btn-restore').disabled = n === 0;
+}
+
+// window.confirm() resolves false -- silently, no dialog -- once Firefox's
+// "Block dialogs" site permission is on, which made every gated action here
+// appear to do nothing. This is the same question asked in-page, where a
+// browser permission cannot veto it.
+function confirmDialog(message) {
+  return new Promise(resolve => {
+    const overlay = document.getElementById('confirm-overlay');
+    const msgEl = document.getElementById('confirm-msg');
+    const ok = document.getElementById('confirm-ok');
+    const cancel = document.getElementById('confirm-cancel');
+    msgEl.textContent = message;
+    const onKey = (e) => { if (e.key === 'Escape') done(false); };
+    function done(val) {
+      overlay.hidden = true;
+      ok.onclick = cancel.onclick = null;
+      overlay.onclick = null;
+      document.removeEventListener('keydown', onKey);
+      resolve(val);
+    }
+    ok.onclick = () => done(true);
+    cancel.onclick = () => done(false);
+    overlay.onclick = (e) => { if (e.target === overlay) done(false); };
+    document.addEventListener('keydown', onKey);
+    overlay.hidden = false;
+    ok.focus();
+  });
 }
 
 async function loadServerInfo() {
@@ -544,7 +594,7 @@ async function loadWedge() {
 
 async function restartServer(name) {
   if (restartInFlight) return;
-  if (!confirm(`Restart the ${name} server?\n\nThis aborts anything currently generating and the model reload takes up to a minute.`)) return;
+  if (!(await confirmDialog(`Restart the ${name} server?\n\nThis aborts anything currently generating and the model reload takes up to a minute.`))) return;
   restartInFlight = true;
   try {
     const r = await fetch(API + '/admin/server/restart?name=' + encodeURIComponent(name), { method: 'POST' });
@@ -860,7 +910,7 @@ document.getElementById('import-file').addEventListener('change', async function
 });
 
 async function clearKv() {
-  if (!confirm('Clear the llama-server KV caches?\n\nThis drops cached prompt prefixes, so the next message re-processes its full history (slower for one turn). It does not free VRAM and does not delete any stored memory blocks.')) return;
+  if (!(await confirmDialog('Clear the llama-server KV caches?\n\nThis drops cached prompt prefixes, so the next message re-processes its full history (slower for one turn). It does not free VRAM and does not delete any stored memory blocks.'))) return;
   try {
     const r = await fetch(API + '/admin/kv/clear', { method: 'POST' });
     const data = await r.json();
@@ -878,7 +928,7 @@ async function clearKv() {
 }
 
 async function runJudge() {
-  if (!confirm('Force a judge pass? This may take a while.')) return;
+  if (!(await confirmDialog('Force a judge pass? This may take a while.'))) return;
   try {
     const r = await fetch(API + '/admin/judge/run', { method: 'POST' });
     const data = await r.json();
@@ -1033,7 +1083,7 @@ async function restoreSelected() {
 async function deleteSelected() {
   const ids = [...selected];
   if (!ids.length) return;
-  if (!confirm(`Delete ${ids.length} block(s)? This cannot be undone.`)) return;
+  if (!(await confirmDialog(`Delete ${ids.length} block(s)? This cannot be undone.`))) return;
   try {
     const r = await fetch(API + '/admin/blocks/delete', {
       method: 'POST',
