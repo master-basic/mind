@@ -1,5 +1,12 @@
 ﻿__pycache__/
-run_settings.txt
+# Whatever the last launch resolved: local drive letters, absolute paths, the
+# chosen model. Machine-specific, and the " - Copy" variants Windows leaves
+# behind are the same thing.
+run_settings*.txt
+run_settings*.TXT
+# Editor scratch.
+.vscode/
+.idea/
 data/
 models/
 snapshots/

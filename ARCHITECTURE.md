@@ -572,11 +572,12 @@ implemented; the sweep data needed to choose that floor is already in
 
 ---
 
-## Author's notes on architecture understanding
+## Notes on the shape of the codebase
 
-This document was reverse-engineered from reading every source file in `cued_recall/`. The codebase has no formal architecture document — the closest is the ASCII diagram in `README.md`. Key insights from reading code rather than docs:
+Five things about this code are worth knowing before changing it, because none of
+them are visible from any single file:
 
-- **The block lifecycle** is the backbone, but its three phases (creation, shelving, judging) are spread across `pipeline.py`, `main.py`, and `judge.py` with no single document connecting them.
+- **The block lifecycle** is the backbone, but its three phases (creation, shelving, judging) are spread across `pipeline.py`, `main.py`, and `judge.py`, and no one file shows the whole path.
 - **The judge splits forgetting from compressing** — decay is arithmetic over age and recall count and runs without a model call; the model only ever rewrites. An earlier design asked a 1.5B model for a three-way verdict with no criteria attached and got `keep` 142 times out of 142.
 - **Token counting** was word-count-based throughout (`len(text.split())`) and ran well under the model's own tokenizer. Block counts and the prompt budget now use `/tokenize` where it matters; see **Prompt assembly and the KV prefix** for which path uses which method and why.
 - **Streaming and non-streaming** paths in `pipeline.py` share ~70% of logic but are separate methods with subtle differences.
