@@ -139,9 +139,17 @@ recall:
   # gist and tags, both already in the index (index.keyword_query). Used when
   # the embed server errors, so an outage degrades recall to keyword overlap
   # rather than silently recalling nothing; the relevance judge still
-  # arbitrates the keyword candidates. Phase 5.1 extends this channel into the
-  # normal retrieval path, which is when this knob's default matters most.
+  # arbitrates the keyword candidates.
   tag_channel: true
+  # The same channel as a SECOND candidate source on the normal path: vector
+  # hits miss probes whose wording shares no tokens with a stored block but
+  # whose gist/tags overlap, and this fixes that class. Keyword hits join the
+  # judge pool and the judge arbitrates both channels (keyword candidates are
+  # shown their gist/tags). Off by default: the vector operating point is a
+  # measured result, and this needs the corpus rows where overlap fires recall
+  # and overlap-with-different-content is still rejected before it is safe to
+  # enable.
+  tag_second_source: false
 judge:
   # New material since the last pass before another one is worth running.
   interval_tokens: 20000

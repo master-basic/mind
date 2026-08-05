@@ -132,7 +132,7 @@ class TestFloorShortCircuit:
         judge_calls = []
 
         def set_scores(scores):
-            async def fake(question, candidates):
+            async def fake(question, candidates, keyword_ids=None):
                 judge_calls.append(len(candidates))
                 return [(b, sim, scores[b.block_id]) for b, sim in candidates]
             monkeypatch.setattr(pipeline, "_score_by_relevance", fake)
@@ -182,7 +182,7 @@ class TestFloorShortCircuit:
                             type("E", (), {"embed": staticmethod(
                                 lambda t: [0.0, 0.0, 0.0, 1.0])})())
 
-        async def fake(question, candidates):
+        async def fake(question, candidates, keyword_ids=None):
             return [(b, sim, 0.95) for b, sim in candidates]
         monkeypatch.setattr(pipeline, "_score_by_relevance", fake)
         got = await pipeline.recall_blocks("q")
@@ -209,7 +209,7 @@ class TestEmbedFailureFallback:
         monkeypatch.setattr(p.index, "keyword_query",
                             lambda q, k: [("kw", 1.0)])
 
-        async def fake(question, candidates):
+        async def fake(question, candidates, keyword_ids=None):
             return [(b, sim, 0.9) for b, sim in candidates]
         monkeypatch.setattr(p, "_score_by_relevance", fake)
 
@@ -231,7 +231,7 @@ class TestEmbedFailureFallback:
                             lambda q, k: [("kw", 1.0)])
         judged = []
 
-        async def fake(question, candidates):
+        async def fake(question, candidates, keyword_ids=None):
             judged.extend(b.block_id for b, _ in candidates)
             return [(b, sim, 0.9) for b, sim in candidates]
         monkeypatch.setattr(p, "_score_by_relevance", fake)

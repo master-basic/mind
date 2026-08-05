@@ -549,6 +549,7 @@ class Pipeline:
         query_text = truncate_tokens(user_message, 512)
         cfg = self.config.recall
         source = "vector"
+        vector_best = None
         # Recall is best-effort: if the embed server errors (e.g. input still
         # too large, or the server down), skip recall for this turn rather
         # than 500 the whole chat. With the keyword channel on, an embed
@@ -575,6 +576,7 @@ class Pipeline:
                 )
             except Exception:
                 return []
+            kw_ids = {bid for bid, _ in results}
         else:
             results = await asyncio.to_thread(
                 self.index.query,
@@ -587,6 +589,7 @@ class Pipeline:
             # here" (measured, evaluate/throughput.md). The floor trades that
             # tax for whatever recall lived below it, which is why it defaults
             # off -- config.example.yaml explains what a safe value would need.
+            floor_fired = False
             if (cfg.judge_enabled and results
                     and results[0][1] < cfg.floor):
                 self.wal.write({
@@ -596,6 +599,30 @@ class Pipeline:
                     "timestamp": time.time(),
                 })
                 results = []
+                floor_fired = True
+            # The best cosine this turn saw, captured before the merge so the
+            # WAL keeps reporting a true similarity rather than a keyword
+            # fraction from a pool that may now mix channels.
+            vector_best = results[0][1] if results else None
+            # The second candidate source (Phase 5.1 / F3, F11): vector hits
+            # miss probes whose wording shares no tokens with a stored block
+            # but whose gist/tags overlap. Keyword hits enter the judge pool
+            # alongside the vector hits, deduped, and the judge arbitrates
+            # both. Off by default -- see config.example.yaml. Skipped when
+            # the floor fired: that is the verdict that this turn is
+            # off-topic, and keyword hits would only drag the judge back into
+            # the tax the floor exists to remove.
+            kw_ids = set()
+            if cfg.tag_channel and cfg.tag_second_source and not floor_fired:
+                try:
+                    kw = await asyncio.to_thread(
+                        self.index.keyword_query, query_text, cfg.k)
+                except Exception:
+                    kw = []
+                if kw:
+                    kw_ids = {bid for bid, _ in kw}
+                    source = "vector+keywords" if results else "keywords"
+                    results = self._merge_keyword_hits(results, kw)
         # Why a candidate did not make it into the prompt was invisible: the
         # turn log recorded only how many blocks were admitted. Counted here so
         # the admin panel can show budget pressure -- a high skipped_oversized
@@ -623,7 +650,8 @@ class Pipeline:
         # means the tokens go to what applies rather than to what is nearest.
         rejected_by_judge = 0
         if cfg.judge_enabled and candidates:
-            scored = await self._score_by_relevance(query_text, candidates)
+            scored = await self._score_by_relevance(
+                query_text, candidates, kw_ids or None)
             kept = [t for t in scored if t[2] >= cfg.judge_score_floor]
             rejected_by_judge = len(scored) - len(kept)
         else:
@@ -667,8 +695,11 @@ class Pipeline:
             "skipped_oversized": skipped_oversized,
             "tokens_used": total_tokens,
             # "vector" normally; "keywords" when the embed server was down and
-            # recall degraded to the gist/tag channel.
+            # recall degraded to the gist/tag channel, or when only the second
+            # source found anything; "vector+keywords" when both channels
+            # contributed candidates to the pool.
             "source": source,
+            "keyword_candidates": len(kw_ids),
             # The best relevance score this turn saw. A run of low ones with
             # blocks still admitted is the signal that judge_score_floor is
             # too generous for this store.
@@ -676,13 +707,56 @@ class Pipeline:
             # Carried per event so a historical turn shows the budget that was
             # actually in force when it ran.
             "budget_tokens": self.config.recall.budget_tokens,
-            "top_similarity": round(results[0][1], 4) if results else None,
+            "top_similarity": round(vector_best, 4) if vector_best is not None
+                              else None,
             "timestamp": time.time(),
         })
         return blocks
 
+    @staticmethod
+    def _merge_keyword_hits(
+        vector_results: List[Tuple[str, float]],
+        kw_results: List[Tuple[str, float]],
+    ) -> List[Tuple[str, float]]:
+        """Vector hits first, keyword hits after, deduped (Phase 5.1).
+
+        A block found by both channels keeps its cosine: the vector stage is
+        the measured primary channel, and its similarity is what the keyword
+        fraction is not -- the two are on different scales, and the pool is
+        ordered on them before the judge runs. Keyword hits ride at their
+        match fraction (0..1); the judge replaces similarity with relevance
+        once the pool is scored.
+        """
+        seen = {bid for bid, _ in vector_results}
+        out = list(vector_results)
+        for bid, frac in kw_results:
+            if bid not in seen:
+                seen.add(bid)
+                out.append((bid, frac))
+        return out
+
+    @staticmethod
+    def _taxonomy_note(block: Block, note: str) -> str:
+        """Append a keyword-sourced candidate's gist and tags to its note.
+
+        The tag/gist channel matched on these, so they are the evidence the
+        judge must arbitrate: the block's own words can be worded entirely
+        differently from the probe. Empty gist/tags leave the note untouched
+        (a block the tagger never reached), so the fallback behaves exactly
+        like the vector path for those.
+        """
+        extras = []
+        if block.tags:
+            extras.append("Tags: " + ", ".join(block.tags))
+        if block.gist:
+            extras.append("Gist: " + block.gist)
+        if not extras:
+            return note
+        return note.rstrip() + "\n" + "\n".join(extras)
+
     async def _score_by_relevance(
-        self, question: str, blocks: List[Tuple[Block, float]]
+        self, question: str, blocks: List[Tuple[Block, float]],
+        keyword_ids: Optional[set] = None,
     ) -> List[Tuple[Block, float, float]]:
         """Score each candidate 0-1 on whether it applies to this question.
 
@@ -691,6 +765,13 @@ class Pipeline:
         block about phase 1 of a problem scores 0.841 against a question about
         phase 2, and a block sharing only vocabulary scores 0.708 -- both above
         the 0.62 threshold, both wrong to inject.
+
+        `keyword_ids` marks the candidates the tag/gist channel surfaced
+        (Phase 5.1 / F3, F11): their gist and tags are appended to the note so
+        the judge can arbitrate the second channel -- the block's own words may
+        be worded entirely differently from the probe, and the gist/tags are
+        the evidence that it matched. Vector candidates keep the exact note
+        the eval corpus was measured against.
 
         A score rather than a verdict, because the budget has to be spent in
         some order and relevance is a better order than nearness. It is P(yes)
@@ -717,16 +798,17 @@ class Pipeline:
                     async with httpx.AsyncClient(
                         timeout=self.config.recall.judge_timeout_s
                     ) as client:
+                        note = judge_note_text(
+                            block, self.config.recall.judge_note)
+                        if keyword_ids and block.block_id in keyword_ids:
+                            note = self._taxonomy_note(block, note)
                         payload = {
                             "messages": [
                                 {"role": "system",
                                  "content": RELEVANCE_SYSTEM},
                                 {"role": "user",
                                  "content": relevance_prompt(
-                                     question,
-                                     judge_note_text(
-                                         block,
-                                         self.config.recall.judge_note))},
+                                     question, note)},
                             ],
                             "temperature": 0,
                             "max_tokens": 4,

@@ -102,6 +102,17 @@ class RecallConfig:
         # 5.1 extends this channel into the normal retrieval path, which is
         # when this knob's default matters most.
         self.tag_channel: bool = bool(d.get("tag_channel", True))
+        # The keyword channel as a SECOND candidate source in the normal path
+        # (Phase 5.1 / F3, F11): vector hits alone miss probes whose wording
+        # shares no tokens with the stored block but whose gist/tags overlap,
+        # the "relevant but semantically distant wording" miss class. Keyword
+        # hits join the judge pool alongside the vector hits and the judge
+        # arbitrates both -- keyword-sourced candidates are shown their
+        # gist/tags in the prompt. Off by default, deliberately: the vector
+        # operating point is a measured result, and the acceptance rows that
+        # would justify this (overlap fires recall, content differs -> judge
+        # rejects, no false-fire increase) do not exist yet.
+        self.tag_second_source: bool = bool(d.get("tag_second_source", False))
 
 
 class JudgeConfig:

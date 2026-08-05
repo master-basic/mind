@@ -96,7 +96,7 @@ class TestRankedFill:
                                 lambda vec, k, thr: hits[:k])
 
         def set_scores(scores):
-            async def fake(question, candidates):
+            async def fake(question, candidates, keyword_ids=None):
                 return [(b, sim, scores[b.block_id]) for b, sim in candidates]
             monkeypatch.setattr(pipeline, "_score_by_relevance", fake)
 
@@ -162,7 +162,7 @@ class TestRankedFill:
         p.index.update_verification("bad", "corrected", "manual")
         judged = []
 
-        async def fake(question, candidates):
+        async def fake(question, candidates, keyword_ids=None):
             judged.extend(b.block_id for b, _ in candidates)
             return [(b, sim, 0.9) for b, sim in candidates]
         p._score_by_relevance = fake

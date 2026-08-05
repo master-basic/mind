@@ -68,7 +68,7 @@ one defect nobody had ranked turned out to be the largest.
 | 3.3 persist the acceptance signal | **done** | §11 |
 | 4.1 scope correction by block type | **done** | §4 |
 | 4.2 span-level corrections | **not done** | below |
-| 5.1 tag/gist as a retrieval channel | **not done** | below |
+| 5.1 tag/gist as a retrieval channel | **done** — by deepseek, 2026-08-05 | §16 |
 | 5.2 similarity floor + embed-failure fallback | **done** — by deepseek, 2026-08-05 | §14 |
 | 6.1 re-embed when text changes | **done** | §6 |
 | 6.2 consistent "user's question" | **done** | §5 |
@@ -85,7 +85,7 @@ one defect nobody had ranked turned out to be the largest.
 |---|---|---|
 | F1 | no prototype layer | **done** — merge pass, off by default (§12) |
 | F2 | symmetric retrieval / composite embedding | **measured, refuted**; the real defect was the judge's note (§8, §9) |
-| F3 | one flat level of representation | **open** — Phase 5.1 |
+| F3 | one flat level of representation | **done** — by deepseek, 2026-08-05 (§16) |
 | F4 | correction is all-or-nothing | **half** — turn scope fixed (§4); span-level open (4.2) |
 | F5 | decay is arithmetic, not utility | **done** (§11) |
 | F6 | budget filled by geometry before the judge | **done** (§10) |
@@ -93,7 +93,7 @@ one defect nobody had ranked turned out to be the largest.
 | F8 | blocks created after `[DONE]` | **done** — by deepseek, 2026-08-05 (§15) |
 | F9 | inconsistent "last user message" | **done** (§5) |
 | F10 | single embedding space, no fallback | **done** — by deepseek, 2026-08-05 (§14) |
-| F11 | tags/gist written but never used | **open** — Phase 5.1, and §9 found the gist carries real signal |
+| F11 | tags/gist written but never used | **done** — by deepseek, 2026-08-05 (§16) |
 | F12 | per-turn O(n) scans | **done** (§3) |
 | F13 | acceptance signal is in-memory | **done** (§11) |
 | F14 | pins do not help retrieval | **done** — by deepseek, 2026-08-05 (§13) |
@@ -124,6 +124,7 @@ All shipped with the measured value as the default. Documented in
 | `recall.pin_priority` | `true` | whether a pin breaks ties in the ranked recall fill (§13, by deepseek) |
 | `recall.floor` | `0.0` | cosine floor below which the judge is skipped; **off** — the plan's 0.30 cannot fire below the 0.48 threshold and no safe value is measured yet (§14, by deepseek) |
 | `recall.tag_channel` | `true` | the gist/tag keyword channel; used as the embed-failure fallback (§14, by deepseek) |
+| `recall.tag_second_source` | `false` | the same channel as a second candidate source on the normal path; off — the vector operating point is measured and the acceptance rows do not exist yet (§16, by deepseek) |
 
 The plan also names `recall.floor` and `recall.tag_channel`; those now exist —
 see §14 for why `floor` shipped disabled.
@@ -568,6 +569,47 @@ without touching the embedder, `_embed_blocks` runs the deferred embeds with
 the same fail-recorded contract as inline, and the default still embeds
 inline. `pytest` green at 257.
 
+### 16 — The tag/gist channel as a second candidate source (Phase 5.1 / F3, F11, by deepseek)
+
+Continued on 2026-08-05 by deepseek; recorded here for later audit.
+
+F11's complaint — the taxonomy written at 40-char gist + up to 3 tags per
+block is never read by retrieval — is fixed at the plumbing level: with
+`recall.tag_second_source: true`, `recall_blocks` runs `keyword_query` after
+the vector stage and merges the hits into the judge pool, deduped (a block
+found by both channels keeps its cosine; keyword hits ride at their match
+fraction, which the judge replaces with relevance anyway). The judge then
+arbitrates both channels, and keyword-sourced candidates get their gist and
+tags appended to the note — `_taxonomy_note` — because those are the evidence
+the channel matched on; vector candidates keep the exact note the eval corpus
+was measured against. The merge is skipped when the floor fires: the floor's
+verdict is "off-topic", and pulling keyword hits in would drag the judge back
+into the tax it removes. The embed-failure fallback (5.2) now flags its
+candidates the same way.
+
+**The knob ships off.** The plan's acceptance rows — probe wording sharing no
+tokens with the seed but tags/gist overlapping → recall fires; tags overlap
+but content differs → judge rejects, no false-fire increase — do not exist
+yet, and the vector operating point is a measured result. So
+`tag_second_source` defaults to `false` and the mechanism is exercised by
+unit tests instead: the keyword-only path (vector below threshold, gist
+overlap recalls — the "relevant but semantically distant wording" miss class
+in one case), the merged path, the dedupe, the floor interplay, and the
+default-off guarantee. Wiring it on is a config flip; the eval rows are the
+binding constraint, which is the corpus row work still listed under "Evals
+and docs".
+
+WAL: `recall_budget.source` is now `"vector" | "keywords" | "vector+keywords"`
+and a new `keyword_candidates` field counts keyword hits in the pool;
+`top_similarity` is captured before the merge so it stays a true cosine even
+on a mixed turn.
+
+Thirteen tests in `test_tag_second_source.py` (config defaults, merge, note,
+judge-pool/channel visibility, keyword-only recall, dedupe, floor interplay,
+default off). The `_score_by_relevance` signature gained `keyword_ids`, which
+is why the fakes in `test_recall_fallback.py` and `test_recall_ranking.py`
+now accept it. `pytest` green at 270.
+
 ---
 
 ## Not done
@@ -579,7 +621,6 @@ them.
 
 | Plan item | Size | Why not yet |
 |---|---|---|
-| **5.1** tag/gist as a retrieval channel (F3, F11) | medium | Newly interesting: §9 measured the gist at 17/18 recall and **0/6** trap leakage, the first evidence the taxonomy carries real signal rather than being decoration. §14's `keyword_query` is the channel; 5.1 wires it into the normal path as a second candidate source. |
 | **4.2** span-level corrections (F4) | large | Needs new output from `verifier.py` — a span, not a yes/no — so it is a model-output change, not a plumbing one. |
 | **3.1** decide whether to enable merging | judgement | Built and off. Snapshot, set `merge_enabled: true`, run a pass, read the `blocks_merged` and `merge_rejected` events. The one merge measured was factually wrong and correctly refused — a sample of one. |
 
