@@ -6,33 +6,9 @@ blocks are dropped from recall and start a purge clock, so the user's own
 source material was deleted as punishment for the model misusing it.
 """
 
-from pathlib import Path
-
 import pytest
 
-from cued_recall.config import Config
-from cued_recall.index import VectorIndex
 from cued_recall.models import Block, BlockStatus, BlockType, Verification
-from cued_recall.pipeline import Pipeline
-from cued_recall.store import BlockStore
-from cued_recall.wal import WAL
-
-EXAMPLE_CONFIG = Path(__file__).resolve().parent.parent / "config.example.yaml"
-
-
-@pytest.fixture
-def pipeline(tmp_path):
-    config = Config(EXAMPLE_CONFIG)
-    store = BlockStore(tmp_path)
-    index = VectorIndex(tmp_path, dim=4)
-    index.open()
-    wal = WAL(tmp_path / "wal.jsonl")
-    wal.open()
-    # embed is unused by the correction path -- it makes no vector calls.
-    p = Pipeline(config, store, index, embed=None, wal=wal)
-    yield p
-    wal.close()
-    index.close()
 
 
 def put(pipeline, block_id, type_, conversation_id="c1", turn_index=0):

@@ -1051,19 +1051,29 @@ class Pipeline:
         return body.get("messages", [])
 
     def get_last_user_message(self, body: dict) -> str:
+        """The text of the last real user turn.
+
+        Uses _newest_user_index rather than "last message with role=user", so
+        this agrees with build_messages about which message is the question.
+        It did not: an agentic client's turn ends with a <tool_response>-wrapped
+        user message, and recall was embedding *that* while the recalled blocks
+        were spliced into the message before it. The query and the target were
+        different texts -- so recall answered a question nobody had asked, and
+        injected the result somewhere else.
+        """
         messages = self.read_messages_from_body(body)
-        for msg in reversed(messages):
-            if msg.get("role") == "user":
-                content = msg.get("content", "")
-                if isinstance(content, list):
-                    text_parts = [
-                        p.get("text", "")
-                        for p in content
-                        if p.get("type") == "text"
-                    ]
-                    content = " ".join(text_parts)
-                return content
-        return ""
+        idx = self._newest_user_index(messages)
+        if idx is None:
+            return ""
+        content = messages[idx].get("content", "")
+        if isinstance(content, list):
+            text_parts = [
+                p.get("text", "")
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            ]
+            content = " ".join(text_parts)
+        return content
 
     def get_reading_content(self, body: dict) -> str:
         """Long-form material the user supplied on THIS turn.
@@ -1077,13 +1087,13 @@ class Pipeline:
         recalling, and both crowd the vector index with near-duplicates.
         """
         messages = self.read_messages_from_body(body)
-        last_user = None
-        for msg in reversed(messages):
-            if msg.get("role") == "user":
-                last_user = msg
-                break
-        if last_user is None:
+        # Same anchor as recall and injection: a <tool_response> is not a turn
+        # the user typed, and a long one would otherwise be archived as if the
+        # user had pasted it.
+        idx = self._newest_user_index(messages)
+        if idx is None:
             return ""
+        last_user = messages[idx]
 
         reading_parts = []
         content = last_user.get("content", "")
