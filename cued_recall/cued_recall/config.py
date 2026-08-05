@@ -286,11 +286,12 @@ class WebSearchConfig:
         self.fallback: bool = d.get("fallback", True)
         self.max_results: int = d.get("max_results", 5)
         self.fetch_top_n: int = d.get("fetch_top_n", 0)
-        # When the tool query is explicitly asking for the current date/time,
-        # answer against a live, keyless clock API (timeapi.io) instead of a
-        # scraped snippet -- search engines serve cached snapshots that are
-        # routinely weeks or months old, so the model kept answering with the
-        # wrong date. Empty time_timezone = auto-detect from the server's IP.
+# When the tool query is explicitly asking for the current date/time,
+        # answer against a live keyless clock (Akamai's edge servers, NTP-synced)
+        # instead of a scraped snippet -- search engines serve cached snapshots
+        # that are routinely weeks or months old, so the model kept answering
+        # with the wrong date. Empty time_timezone = auto-detect from the
+        # server's IP (ipapi.co), falling back to the machine's own local zone.
         self.time_intent: bool = d.get("time_intent", True)
         self.time_timezone: str = d.get("time_timezone", "")
         # Hard rule: if the user message matches any of these patterns, force

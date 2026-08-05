@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import datetime
 import html as html_lib
 import ipaddress
 import json
@@ -10,6 +11,11 @@ import time
 import uuid
 from typing import AsyncIterator, List, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - Windows Python < 3.9
+    ZoneInfo = None
 
 import httpx
 import numpy as np
@@ -1115,21 +1121,23 @@ class Pipeline:
         if ws.time_intent and _time_intent(query):
             tz = await self._resolve_timezone()
             now = await self._fetch_clock(tz)
-            if now:
+            if now is not None:
+                local_dt, tz_label, source = now
                 if self.wal:
                     self.wal.write({
                         "event": "web_search_time",
                         "query": query,
-                        "timezone": tz,
-                        "datetime": now.get("dateTime"),
+                        "timezone": tz_label,
+                        "datetime": local_dt.isoformat(),
+                        "source": source,
                         "timestamp": time.time(),
                     })
-                return self._format_clock(now, query)
+                return self._format_clock(local_dt, tz_label, source, query)
             if self.wal:
                 self.wal.write({
                     "event": "web_search_error",
                     "backend": "time_api",
-                    "error": f"clock API ('{tz}') unavailable; falling through to search",
+                    "error": f"clock API unavailable ('{tz}'); falling through to search",
                     "query": query,
                     "timestamp": time.time(),
                 })
@@ -1177,75 +1185,95 @@ class Pipeline:
         return "\n".join(lines).strip()
 
     @staticmethod
-    def _time_intent_pair() -> Tuple[str, str]:
-        """(the IANA timezone endpoint, ipapi timezone endpoint) for the clock.
+    def _clock_endpoint() -> str:
+        """Akamai's edge clock returns an authoritative UTC ISO instant. It is
+        the most reliable keyless source (their CDN edge servers keep tight
+        NTP), unlike timeapi.io whose clock drifted ~20 minutes slow and broke
+        the whole point of the backend.
         """
-        return (
-            "https://timeapi.io/api/Time/current/zone",
-            "https://ipapi.co/json/",
-        )
+        return "https://time.akamai.com/?iso"
 
     async def _resolve_timezone(self) -> str:
-        """Return an IANA timezone: a config override, or from the server's IP.
+        """Return the IANA zone to render the clock's local date in. Order:
+        1) explicit config override, 2) the server's IP (ipapi.co), 3) empty
+        string = the machine's own local zone (correct on the user's box).
         """
         override = (self.config.web_search.time_timezone or "").strip()
         if override:
             return override
         try:
-            url = self._time_intent_pair()[1]
             async with httpx.AsyncClient(timeout=8) as client:
                 r = await client.get(
-                    url, headers={"User-Agent": "cued-recall/1.0"})
-                r.raise_for_status()
-                return r.json().get("timezone") or "UTC"
-        except Exception:
-            return "UTC"
-
-    async def _fetch_clock(self, tz: str) -> Optional[dict]:
-        """Fetch the authoritative current date/time from the keyless clock API.
-        """
-        try:
-            url, _ = self._time_intent_pair()
-            async with httpx.AsyncClient(timeout=12) as client:
-                r = await client.get(
-                    url,
-                    params={"timeZone": tz},
+                    "https://ipapi.co/json/",
                     headers={"User-Agent": "cued-recall/1.0"},
                 )
                 r.raise_for_status()
-                data = r.json()
-            if not data.get("year"):
-                return None
-            return data
+                tz = r.json().get("timezone")
+                if tz:
+                    return tz
         except Exception:
-            return None
+            pass
+        return ""
+
+    async def _fetch_clock(
+        self, tz_name: str,
+    ) -> Optional[Tuple[datetime.datetime, str, str]]:
+        """Return (local_dt, tz_label, source). The authoritative UTC instant
+        comes from the internet (Akamai edge); if that is unreachable the
+        machine's own clock is used -- still accurate, never a stale snippet.
+        """
+        source = "Akamai edge clock (time.akamai.com)"
+        utc: Optional[datetime.datetime] = None
+        try:
+            async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
+                r = await client.get(self._clock_endpoint())
+            r.raise_for_status()
+            text = (r.text or "").strip()
+            if text:
+                utc = datetime.datetime.fromisoformat(text)
+                if utc.tzinfo is None:
+                    utc = utc.replace(tzinfo=datetime.timezone.utc)
+                utc = utc.astimezone(datetime.timezone.utc)
+        except Exception:
+            utc = None
+        if utc is None:
+            utc = datetime.datetime.now(datetime.timezone.utc)
+            source = "machine clock (system fallback)"
+
+        local = self._render_local(utc, tz_name)
+        return (local[0], local[1], source)
 
     @staticmethod
-    def _format_clock(now: dict, query: str) -> str:
+    def _render_local(utc: datetime.datetime, tz_name: str
+                      ) -> Tuple[datetime.datetime, str]:
+        if tz_name and ZoneInfo is not None:
+            try:
+                return utc.astimezone(ZoneInfo(tz_name)), tz_name
+            except Exception:
+                pass
+        local = utc.astimezone()
+        zone = local.tzinfo.tzname(local) if local.tzinfo else ""
+        return utc.astimezone(), zone or (tz_name or "local")
+
+    @staticmethod
+    def _format_clock(local_dt: datetime.datetime, tz_label: str, source: str,
+                      query: str) -> str:
         months = ["January", "February", "March", "April", "May", "June",
                   "July", "August", "September", "October", "November",
                   "December"]
-        try:
-            month = months[int(now.get("month", 1)) - 1]
-        except (ValueError, IndexError, TypeError):
-            month = ""
-        day = now.get("day")
-        year = now.get("year")
-        dow = now.get("dayOfWeek") or ""
-        today = f"Today is {dow}, {month} {day}, {year}." if month and dow else ""
+        month = months[local_dt.month - 1]
+        today = f"Today is {local_dt:%A}, {month} {local_dt.day}, {local_dt.year}."
+        utc = local_dt.astimezone(datetime.timezone.utc)
         return (
-            f"Authoritative current date/time read from the live clock API "
-            f"(timeapi.io), NOT a cached search snippet."
-            + (f"\n{today}" if today else "")
-            + f"\n- date: {year}-{int(now.get('month', 0)):02d}-"
-              f"{int(day or 0):02d}  (day of week: {dow})"
-            + f"\n- time: {now.get('time', '')} {now.get('timeZone', '')}"
-            + f"\n- exact: {now.get('dateTime', '')}"
-            + f"\nUse {year}-{int(now.get('month', 0)):02d}-"
-              f"{int(day or 0):02d} as the date/today. Ignore any older date "
-              "from memory, system hints, or other snippets: this is the "
-              "authoritative current date/time for the request "
-              f"'{query}'."
+            f"Authoritative current date/time read from the live clock "
+            f"({source}), NOT a cached search snippet.\n"
+            f"{today}\n"
+            f"- date: {local_dt:%Y-%m-%d}  (day of week: {local_dt:%A})\n"
+            f"- time: {local_dt:%H:%M} {tz_label}\n"
+            f"- exact: {utc:%Y-%m-%dT%H:%M:%SZ} UTC\n"
+            f"Use {local_dt:%Y-%m-%d} as the date/today. Ignore any older date "
+            f"from memory, system hints, or other snippets: this is the "
+            f"authoritative current date/time for the request '{query}'."
         )
 
     @staticmethod
