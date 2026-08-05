@@ -313,3 +313,11 @@ web_search:
   # configured rather than reporting "no results".
   fallback: true
   max_results: 5
+  # Date/time queries are answered against a live, keyless clock API
+  # (timeapi.io) instead of scraped snippets -- search engines serve cached
+  # snapshots that are routinely weeks or months out of date, so a "what is
+  # today's date" query used to come back with the wrong month. Set
+  # time_timezone to an IANA zone (e.g. "Asia/Baku") to pin it; leave empty
+  # to auto-detect from the server's IP.
+  time_intent: true
+  time_timezone: ''

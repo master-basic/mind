@@ -100,6 +100,37 @@ WEB_FETCH_TOOL = {
     },
 }
 
+# Phrases that mean "the current date / time" in the tool query. When the
+# reasoning model calls web_search about the clock it is fishing for a
+# timestamp the snippets usually get wrong or stale (search engines keep
+# cached snapshots). Route the call to a live, keyless clock API instead so the
+# answer can never be a month out of date.
+_TIME_INTENT_FRAGMENTS = (
+    "current date and time", "current date", "current time", "current day",
+    "today's date", "todays date", "today date", "date today", "to date today",
+    "what is the date", "what is today", "what date is it", "what day is it",
+    "what day is today", "what time is it", "what time is now",
+    "what is the time", "date and time", "time and date", "today's time",
+    "time right now", "today now", "now date", "now time",
+    # Azerbaijani
+    "hazırkı tarix", "bugünün tarixi", "bugünkü tarix", "indiki tarix",
+    "tarix və saat", "saat neçədir", "hazırda saat", "bu günün tarix",
+)
+
+
+def _time_intent(query: str) -> bool:
+    """True if the (tool) query is explicitly asking for the current date/time.
+
+    Deliberately narrow: only a short, clearly date/time-shaped query matches,
+    so an unrelated query that merely contains the words ("current status of the
+    volcano") is never hijacked into the clock backend.
+    """
+    q = (query or "").strip().lower()
+    if not q or len(q) > 90:
+        return False
+    return any(frag in q for frag in _TIME_INTENT_FRAGMENTS)
+
+
 WEB_SEARCH_TOOL = {
     "type": "function",
     "function": {
@@ -1079,6 +1110,29 @@ class Pipeline:
 
     async def _web_search(self, query: str) -> str:
         ws = self.config.web_search
+        # Date/time intent: answer against the live clock API, never a scraped
+        # snippet, which search engines serve from stale caches.
+        if ws.time_intent and _time_intent(query):
+            tz = await self._resolve_timezone()
+            now = await self._fetch_clock(tz)
+            if now:
+                if self.wal:
+                    self.wal.write({
+                        "event": "web_search_time",
+                        "query": query,
+                        "timezone": tz,
+                        "datetime": now.get("dateTime"),
+                        "timestamp": time.time(),
+                    })
+                return self._format_clock(now, query)
+            if self.wal:
+                self.wal.write({
+                    "event": "web_search_error",
+                    "backend": "time_api",
+                    "error": f"clock API ('{tz}') unavailable; falling through to search",
+                    "query": query,
+                    "timestamp": time.time(),
+                })
         n = max(1, ws.max_results)
         results: list = []
         blocked = False
@@ -1121,6 +1175,78 @@ class Pipeline:
                 lines.append(f"   {r['snippet']}")
             lines.append("")
         return "\n".join(lines).strip()
+
+    @staticmethod
+    def _time_intent_pair() -> Tuple[str, str]:
+        """(the IANA timezone endpoint, ipapi timezone endpoint) for the clock.
+        """
+        return (
+            "https://timeapi.io/api/Time/current/zone",
+            "https://ipapi.co/json/",
+        )
+
+    async def _resolve_timezone(self) -> str:
+        """Return an IANA timezone: a config override, or from the server's IP.
+        """
+        override = (self.config.web_search.time_timezone or "").strip()
+        if override:
+            return override
+        try:
+            url = self._time_intent_pair()[1]
+            async with httpx.AsyncClient(timeout=8) as client:
+                r = await client.get(
+                    url, headers={"User-Agent": "cued-recall/1.0"})
+                r.raise_for_status()
+                return r.json().get("timezone") or "UTC"
+        except Exception:
+            return "UTC"
+
+    async def _fetch_clock(self, tz: str) -> Optional[dict]:
+        """Fetch the authoritative current date/time from the keyless clock API.
+        """
+        try:
+            url, _ = self._time_intent_pair()
+            async with httpx.AsyncClient(timeout=12) as client:
+                r = await client.get(
+                    url,
+                    params={"timeZone": tz},
+                    headers={"User-Agent": "cued-recall/1.0"},
+                )
+                r.raise_for_status()
+                data = r.json()
+            if not data.get("year"):
+                return None
+            return data
+        except Exception:
+            return None
+
+    @staticmethod
+    def _format_clock(now: dict, query: str) -> str:
+        months = ["January", "February", "March", "April", "May", "June",
+                  "July", "August", "September", "October", "November",
+                  "December"]
+        try:
+            month = months[int(now.get("month", 1)) - 1]
+        except (ValueError, IndexError, TypeError):
+            month = ""
+        day = now.get("day")
+        year = now.get("year")
+        dow = now.get("dayOfWeek") or ""
+        today = f"Today is {dow}, {month} {day}, {year}." if month and dow else ""
+        return (
+            f"Authoritative current date/time read from the live clock API "
+            f"(timeapi.io), NOT a cached search snippet."
+            + (f"\n{today}" if today else "")
+            + f"\n- date: {year}-{int(now.get('month', 0)):02d}-"
+              f"{int(day or 0):02d}  (day of week: {dow})"
+            + f"\n- time: {now.get('time', '')} {now.get('timeZone', '')}"
+            + f"\n- exact: {now.get('dateTime', '')}"
+            + f"\nUse {year}-{int(now.get('month', 0)):02d}-"
+              f"{int(day or 0):02d} as the date/today. Ignore any older date "
+              "from memory, system hints, or other snippets: this is the "
+              "authoritative current date/time for the request "
+              f"'{query}'."
+        )
 
     @staticmethod
     def _strip_html(s: str) -> str:
