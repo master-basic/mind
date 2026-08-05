@@ -470,6 +470,22 @@ class VectorIndex:
             """, (limit,)).fetchall()
         return [r[0] for r in rows]
 
+    def count_blocks_without_vectors(self) -> int:
+        """How many recallable-by-status blocks have no embedding.
+
+        The counting half of blocks_without_vectors, for the health signal in
+        /admin/stats -- a store with tens of thousands of blocks should not have
+        to materialise every id just to answer "is anything invisible?".
+        """
+        with self._lock:
+            row = self._conn.execute("""
+                SELECT COUNT(*) FROM blocks b
+                WHERE b.status IN ('shelved', 'truncated')
+                  AND NOT EXISTS (SELECT 1 FROM block_vec v
+                                  WHERE v.block_id = b.block_id)
+            """).fetchone()
+        return row[0] if row else 0
+
     def decay_candidates(self, purge_age_s: float,
                          limit: int = 1000) -> List[str]:
         """Blocks arithmetic alone can condemn -- no model call involved.

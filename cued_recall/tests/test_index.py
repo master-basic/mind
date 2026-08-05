@@ -116,6 +116,23 @@ class TestVectors:
         # make the health signal cry wolf on every live conversation.
         add(index, "hot", [0, 0, 0, 0], status="hot", with_vector=False)
         assert index.blocks_without_vectors() == []
+        assert index.count_blocks_without_vectors() == 0
+
+    def test_count_agrees_with_the_listing(self, index):
+        # /admin/stats counts, the backfill lists. They must not drift.
+        add(index, "ok", [1, 0, 0, 0])
+        for i in range(3):
+            add(index, f"lost{i}", [0, 0, 0, 0], with_vector=False)
+        assert index.count_blocks_without_vectors() == 3
+        assert len(index.blocks_without_vectors()) == 3
+
+    def test_dropping_a_vector_makes_a_block_count_as_missing(self, index):
+        # Truncation rewrites text without re-embedding, and purge drops the
+        # vector deliberately -- the count has to notice either way.
+        add(index, "b", [1, 0, 0, 0])
+        assert index.count_blocks_without_vectors() == 0
+        index.delete_vector("b")
+        assert index.count_blocks_without_vectors() == 1
 
 
 class TestMeta:

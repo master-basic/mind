@@ -482,6 +482,12 @@ async function loadStats() {
     const cards = [
       { label: 'Msgpack Files', value: data.msgpack_files },
       { label: 'WAL Events', value: data.wal_events },
+      // Blocks that kept their text but lost their embedding. They report a
+      // healthy status everywhere else on this page while being unrecallable,
+      // so this card is the only place the condition is visible. Red whenever
+      // it is not zero -- backfill_missing_vectors.py is the repair.
+      { label: 'Missing Vectors', value: data.blocks_missing_vectors,
+        warn: data.vector_backfill_needed },
     ];
 
     for (const [key, val] of Object.entries(data.blocks_by_status_type || {})) {
@@ -489,7 +495,8 @@ async function loadStats() {
     }
 
     for (const c of cards) {
-      grid.innerHTML += `<div class="stat-card"><div class="value">${c.value}</div><div class="label">${c.label}</div></div>`;
+      const style = c.warn ? ' style="color:#f85149"' : '';
+      grid.innerHTML += `<div class="stat-card"><div class="value"${style}>${c.value}</div><div class="label">${c.label}</div></div>`;
     }
   } catch (e) {
     document.getElementById('stats-grid').innerHTML = `<div class="stat-card" style="color:#f85149">Error: ${e.message}</div>`;

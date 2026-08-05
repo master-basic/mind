@@ -248,10 +248,18 @@ def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_ru
         block_counts = index.stats()
         block_files = len(list(store.blocks_dir.glob("*.msgpack")))
         wal_events = len(wal.read_all())
+        # A block whose embed failed at creation keeps its text, reports status
+        # 'shelved', and appears here as a healthy block -- while being
+        # unrecallable forever. Nothing in the running system used to say so:
+        # 729 of 1,812 blocks in one real store were in that state, 57 of them
+        # holding content, and it took a hand-run backfill script to find out.
+        missing_vectors = index.count_blocks_without_vectors()
         return {
             "blocks_by_status_type": block_counts,
             "msgpack_files": block_files,
             "wal_events": wal_events,
+            "blocks_missing_vectors": missing_vectors,
+            "vector_backfill_needed": missing_vectors > 0,
         }
 
     async def _reasoning_rates() -> dict:

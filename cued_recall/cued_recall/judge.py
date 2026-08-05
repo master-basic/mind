@@ -194,6 +194,20 @@ class Judge:
         counts["elapsed_s"] = round(time.time() - started, 1)
         counts["decay_purged"] = decayed
         counts["processed"] = decayed + counts["visited"]
+
+        # Once per pass, not per block: blocks that lost their embedding are
+        # invisible to recall but indistinguishable from healthy ones by status,
+        # so without a periodic count the condition never surfaces on its own.
+        # The pass is the natural place -- it already walks the store on a timer
+        # and nothing else does.
+        missing = await asyncio.to_thread(self.index.count_blocks_without_vectors)
+        counts["blocks_missing_vectors"] = missing
+        if missing:
+            self.wal.write({
+                "event": "vectors_missing",
+                "blocks": missing,
+                "timestamp": time.time(),
+            })
         return counts
 
     async def _decay_sweep(self) -> int:
