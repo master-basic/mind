@@ -63,7 +63,7 @@ one defect nobody had ranked turned out to be the largest.
 | 1.3 asymmetric trap rows in the corpus | **not done** | below |
 | 2.1 score, rank, then fill | **done** | §10 |
 | 2.2 token-count honesty | **done** | §10 |
-| 3.1 prototype/abstraction pass | **done, shipped off** | §12 |
+| 3.1 prototype/abstraction pass | **done, on by default** | §12, §18 |
 | 3.2 graded utility decay | **done** | §11 |
 | 3.3 persist the acceptance signal | **done** | §11 |
 | 4.1 scope correction by block type | **done** | §4 |
@@ -83,7 +83,7 @@ one defect nobody had ranked turned out to be the largest.
 
 | | Finding | State |
 |---|---|---|
-| F1 | no prototype layer | **done** — merge pass, off by default (§12) |
+| F1 | no prototype layer | **done** — merge pass, on by default (§12, §18) |
 | F2 | symmetric retrieval / composite embedding | **measured, refuted**; the real defect was the judge's note (§8, §9) |
 | F3 | one flat level of representation | **done** — by deepseek, 2026-08-05 (§16) |
 | F4 | correction is all-or-nothing | **done** — by deepseek, 2026-08-05 (§17) |
@@ -116,7 +116,7 @@ All shipped with the measured value as the default. Documented in
 | `judge.utility_recall_weight` | `30.0` | days of idleness one recall earns |
 | `judge.utility_uncontested_weight` | `60.0` | extra days for an uncontested recall |
 | `judge.utility_floor` | `0.0` | utility at or below which a block purges |
-| `judge.merge_enabled` | `false` | the abstraction pass (§12) |
+| `judge.merge_enabled` | `true` | the abstraction pass; on by default since the §18 measurement (§12, §18) |
 | `judge.merge_cluster_sim` | `0.90` | similarity at which two blocks are the same ground |
 | `judge.merge_min_cluster` | `3` | how many near-duplicates before generalising |
 | `judge.merge_min_age_s` | `604800` | how settled a cluster must be |
@@ -654,6 +654,50 @@ injection and judge-note redaction — the F4 acceptance: a multi-claim block
 recalls with the bad claim gone and the others intact). `pytest` green at
 294.
 
+### 18 — The merge decision (Phase 3.1 / F1, measured live)
+
+Phase 3.1 closed on 2026-08-05: the merge pass is now **on by default**.
+This is the measurement that decided it, run with `evaluate/eval_merge.py`
+against a *copy* of the snapshot store (the live store is user data and is
+never the subject of an experiment), with the real judge and embed servers.
+
+Three seeded families, each three near-duplicate blocks aged past the
+7-day gate:
+
+- **nginx_timeout — merged, and correct.** Three notes ("worker timeout is
+  60 s, raised from 30, in /etc/nginx.conf" in three wordings) became one
+  18-token block: "Raising worker timeout from 30 to 60 seconds in
+  /etc/nginx.conf." Both specifics survive, 88 → 18 tokens, and a
+  related-but-new probe — "why is my nginx timing out so fast?" — recalls
+  the merged block. That is the plan's acceptance line, passed end to end
+  through the real pipeline.
+- **dns_latency — refused, and correctly.** This is the §12 family, the one
+  merge ever measured before, which conflated 840ms with the TTL and lost
+  840. The model's draft this time — "DNS cache TTL set to 300 in
+  /etc/resolv.conf: first lookup latency dropped from 840ms to 60ms" — kept
+  the numbers but dropped the dotted identifier `dns.cache_ttl`.
+  `_lost_specifics` caught it, the `merge_rejected` event recorded it, and
+  all three originals stayed shelved. The verifier made a real catch on a
+  third run, not a rehearsed one.
+- **python_version — no cluster at 0.90.** Three notes about pinning 3.12
+  over 3.13 did not reach `merge_cluster_sim`. The gate is doing what it is
+  for: only near-identical ground gets generalised, paraphrases stay put.
+
+The snapshot itself (396 blocks, all younger than the age gate) produced
+zero clusters — so flipping the default changes nothing for a young store,
+and the flag still switches the pass off entirely.
+
+Judgement: enabling merging is now safe. The refusals cost nothing (the
+originals are untouched) and the one thing that must never happen — a bad
+generalisation retiring its evidence behind it — has now been refused in
+two independent real runs, on two different failure shapes. If the guard
+were instead too strict, the pass would be a no-op; the nginx family shows
+it can accept when the model keeps its word.
+
+Config: `judge.merge_enabled` defaults `true` (was `false`). `pytest` green
+at 295. `evaluate/eval_merge.py` is the repeatable measurement — run it
+against a fresh snapshot before trusting a new store with the pass.
+
 ---
 
 ## Not done
@@ -663,9 +707,8 @@ them.
 
 ### Code
 
-| Plan item | Size | Why not yet |
-|---|---|---|
-| **3.1** decide whether to enable merging | judgement | Built and off. Snapshot, set `merge_enabled: true`, run a pass, read the `blocks_merged` and `merge_rejected` events. The one merge measured was factually wrong and correctly refused — a sample of one. |
+All plan code items are done. The remaining "code" decisions are the config
+judgements recorded in §18 (merge default) and the evals/docs below.
 
 ### Evals and docs (the plan's cross-cutting section)
 
@@ -707,10 +750,11 @@ Recorded here because both documents are committed and now partly wrong:
   so the merged block and all its members would compete for the same budget —
   the opposite of the intent. They are retired to `purged` instead, which is
   the codebase's existing reversible "out of recall, still on disk" state.
-- `semantic-mind.md` F1 assumes the abstraction is worth having once built. The
-  one merge measured against the real judge was factually wrong. The pass ships
-  off, with a verifier that catches dropped specifics; whether a 1.5B model can
-  generalise safely at all is still open.
+- `semantic-mind.md` F1 assumed the abstraction was worth having once built.
+  The pass shipped off with a verifier that catches dropped specifics; §18
+  records the measurement that settled the open question — a 1.5B judge can
+  generalise safely when it is made to keep every specific, and refuses when
+  it cannot.
 
 ## Reproducing
 

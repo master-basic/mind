@@ -6,6 +6,7 @@ generalisation that was never true and then retires the evidence behind it.
 """
 
 import math
+from pathlib import Path
 
 import pytest
 
@@ -168,7 +169,17 @@ class TestClustering:
         assert len(retired) == len({e["block_id"] for e in retired})
 
     @pytest.mark.asyncio
-    async def test_disabled_by_default(self, judge):
+    async def test_enabled_by_default_since_the_2026_08_05_measurement(self):
+        # The flag shipped off until a real pass was measured
+        # (evaluate/eval_merge.py): a good merge that kept every specific and
+        # fired recall, and a refusal of the draft that dropped one. On now.
+        from cued_recall.config import Config
+        cfg = Config((Path(__file__).resolve().parent.parent)
+                     / "config.example.yaml")
+        assert cfg.judge.merge_enabled is True
+
+    @pytest.mark.asyncio
+    async def test_the_off_switch_still_stops_merges(self, judge):
         judge.config.judge.merge_enabled = False
         cluster_of(judge, 3)
         stub_merge(judge)

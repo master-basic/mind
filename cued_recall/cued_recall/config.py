@@ -211,12 +211,16 @@ class JudgeConfig:
         self.utility_floor: float = d.get("utility_floor", 0.0)
         # Derive one block from several near-identical ones.
         #
-        # Off by default, and it is the only pass that creates a memory rather
-        # than editing one -- a bad merge invents a generalisation that was
-        # never true and then retires the evidence behind it. Turn it on
-        # against a store you have a snapshot of, read the blocks_merged WAL
-        # events, and check what it wrote before leaving it on.
-        self.merge_enabled: bool = d.get("merge_enabled", False)
+        # On by default since the 2026-08-05 measurement (evaluate/eval_merge.py):
+        # a real pass merged a genuine near-duplicate family into a correct
+        # generalization that kept every specific and fired recall, and refused
+        # the family whose draft dropped one -- with the originals untouched
+        # either way, because the merge is the one pass that creates a memory
+        # rather than editing one. Off is still available, and it is the only
+        # pass that retires evidence behind a new claim, so read the
+        # blocks_merged / merge_rejected WAL events after a pass before trusting
+        # a fresh store with it.
+        self.merge_enabled: bool = d.get("merge_enabled", True)
         # Cosine similarity at which two blocks count as the same ground.
         # Well above recall.threshold (0.48): that one asks "is this relevant",
         # this one asks "is this the same thing said twice".

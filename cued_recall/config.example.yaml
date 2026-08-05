@@ -223,14 +223,15 @@ judge:
   # one, so a question asked three times leaves three near-identical blocks,
   # each spending judge budget and prompt tokens to say the same thing.
   #
-  # OFF by default, and the only pass that creates a memory rather than editing
-  # one: a bad merge invents a generalisation that was never true and then
-  # retires the evidence behind it. Turn it on against a store you have a
-  # snapshot of, read the blocks_merged events in the WAL, and check what it
-  # wrote before leaving it on. The originals are retired reversibly -- status
-  # flipped and vector dropped, file always kept even when purge_deletes_file
-  # is on, restorable via /admin/blocks/restore.
-  merge_enabled: false
+  # ON by default since the 2026-08-05 measurement (evaluate/eval_merge.py): a
+  # real pass merged a genuine near-duplicate family into a correct
+  # generalisation that kept every specific and fired recall, and refused the
+  # family whose draft dropped one -- originals untouched either way. The only
+  # pass that creates a memory rather than editing one, so read the
+  # blocks_merged / merge_rejected WAL events after a pass. The originals are
+  # retired reversibly -- status flipped and vector dropped, file always kept
+  # even when purge_deletes_file is on, restorable via /admin/blocks/restore.
+  merge_enabled: true
   # Similarity at which two blocks count as the same ground. Well above
   # recall.threshold: that asks "is this relevant", this asks "is this the same
   # thing said twice".
