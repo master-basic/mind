@@ -174,16 +174,20 @@ def truncate_tokens_shipped(text, n):
     return truncate(text, n)
 
 
-def seed_note_texts(seeds, key_source, blocks_path):
+def seed_note_texts(seeds, key_source, blocks_path, judge_note="text"):
     """What the judge is shown for each seed.
 
-    Always the block's own text, whatever is indexed. _filter_by_relevance
-    passes block.text and never the embed key, so tying the note to
-    --key-source would score the judge on a prompt the pipeline never builds --
-    and the judge's verdict is the only thing standing between the trap family
-    and the answer.
+    Independent of what is indexed. _filter_by_relevance passes block.text and
+    never the embed key, so tying the note to --key-source would score the
+    judge on a prompt the pipeline never builds -- and the judge's verdict is
+    the only thing standing between the trap family and the answer.
+
+    judge_note="question" shows the question the block was written to answer
+    instead of the block's words. See eval_judge_notes.py: on this corpus that
+    is the difference between refusing 0 of 6 traps and refusing 6 of 6, at no
+    cost to legitimate recall.
     """
-    if key_source == "prompt":
+    if judge_note == "question" or key_source == "prompt":
         return [s["prompt"] for s in seeds]
     by_id = _load_blocks(blocks_path, seeds)
     _, truncate_tokens = load_shipped_utils()
@@ -331,6 +335,11 @@ def main():
                     help="generated seed answers/traces, for --key-source")
     ap.add_argument("--json", dest="json_out",
                     help="write the full sweep here, for before/after diffs")
+    ap.add_argument("--judge-note", default="text",
+                    choices=("text", "question"),
+                    help="what the judge is shown as the note: the block's own "
+                         "words (production today) or the question it was "
+                         "written to answer")
     args = ap.parse_args()
 
     rows = [json.loads(l) for l in open(args.corpus, encoding="utf-8")
@@ -393,7 +402,8 @@ def main():
     judged = None
     if args.judge:
         t0 = time.perf_counter()
-        notes = seed_note_texts(seeds, args.key_source, args.blocks)
+        notes = seed_note_texts(seeds, args.key_source, args.blocks,
+                                judge_note=args.judge_note)
         keep = judge_pairs(probes, seeds, sims, args.k, args.judge_endpoint,
                            notes=notes)
         elapsed = time.perf_counter() - t0
@@ -485,6 +495,7 @@ def main():
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "corpus": args.corpus,
             "key_source": args.key_source,
+            "judge_note": args.judge_note,
             "k": args.k,
             "seeds": len(seeds),
             "probes": len(probes),

@@ -27,6 +27,30 @@ class RecallConfig:
         self.judge_enabled: bool = d.get("judge_enabled", True)
         # Per candidate. Short, because they run while the user waits.
         self.judge_timeout_s: float = d.get("judge_timeout_s", 5.0)
+        # What the judge reads as the archived note.
+        #
+        #   "question" -- the user message the block was written to answer
+        #   "text"     -- the block's own words (what shipped until 2026-08-05)
+        #
+        # Measured on the evaluate/ corpus against the real store
+        # representation, at threshold 0.48 with the judge on: false-fire
+        # 0.64 with "text", 0.09 with "question", and all 18 legitimate recalls
+        # (exact, paraphrase, crosslingual) survive both. The 0.00 false-fire
+        # recorded in benchmark.md was an artefact of a harness that showed the
+        # judge a seed prompt rather than a block; shown a real block the judge
+        # keeps 5 of 6 traps, which is the anchoring failure in
+        # grading_traps.md.
+        #
+        # The risk this trades for, and it is not measured by the corpus: a
+        # block whose originating question differed but whose content happens
+        # to answer the new one is now refused. If recall starts missing things
+        # it used to find, this is the first knob to try.
+        self.judge_note: str = d.get("judge_note", "question")
+        if self.judge_note not in ("question", "text"):
+            raise ValueError(
+                f"recall.judge_note must be 'question' or 'text', "
+                f"got {self.judge_note!r}"
+            )
 
 
 class JudgeConfig:

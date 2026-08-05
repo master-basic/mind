@@ -1,0 +1,65 @@
+{
+  "comparison": "note_sources",
+  "per_relation": {
+    "exact": {
+      "reasoning": 6,
+      "answer": 6,
+      "prompt": 6,
+      "gist": 6,
+      "both": 6
+    },
+    "paraphrase": {
+      "reasoning": 6,
+      "answer": 6,
+      "prompt": 6,
+      "gist": 5,
+      "both": 6
+    },
+    "crosslingual": {
+      "reasoning": 6,
+      "answer": 6,
+      "prompt": 6,
+      "gist": 6,
+      "both": 6
+    },
+    "trap": {
+      "reasoning": 5,
+      "answer": 6,
+      "prompt": 0,
+      "gist": 0,
+      "both": 5
+    }
+  },
+  "summary": {
+    "reasoning": {
+      "recall_kept": 18,
+      "recall_total": 18,
+      "trap_leaked": 5,
+      "trap_total": 6
+    },
+    "answer": {
+      "recall_kept": 18,
+      "recall_total": 18,
+      "trap_leaked": 6,
+      "trap_total": 6
+    },
+    "prompt": {
+      "recall_kept": 18,
+      "recall_total": 18,
+      "trap_leaked": 0,
+      "trap_total": 6
+    },
+    "gist": {
+      "recall_kept": 17,
+      "recall_total": 18,
+      "trap_leaked": 0,
+      "trap_total": 6
+    },
+    "both": {
+      "recall_kept": 18,
+      "recall_total": 18,
+      "trap_leaked": 5,
+      "trap_total": 6
+    }
+  }
+}

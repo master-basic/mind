@@ -338,6 +338,11 @@ def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_ru
                 # privacy rule as `text` -- shipping it unconditionally would
                 # hand over exactly what withholding `text` is protecting.
                 "embed_text": block.embed_text if text is not None else None,
+                # The originating question is already carried by stimulus_text
+                # above, which export ships unconditionally, so this adds no
+                # disclosure -- and without it an imported block falls back to
+                # judging on its own words.
+                "question_text": block.question_text,
             })
         return {
             "taxonomy_version": TAXONOMY_VERSION,
@@ -374,6 +379,7 @@ def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_ru
                 # to the text itself so the content channel is populated rather
                 # than silently empty on every imported block.
                 embed_text=(item.get("embed_text") or text or "")[:8000],
+                question_text=(item.get("question_text") or "")[:8000],
                 # Verification is not portable: someone else's "accepted" is
                 # not evidence for this instance. It has to be earned again
                 # through this instance's own conversations.

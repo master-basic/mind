@@ -56,6 +56,7 @@ from .utils import (
     count_tokens,
     embed_source_text,
     estimate_tokens,
+    judge_note_text,
     matches_correction,
     relevance_prompt,
     split_paragraph_boundary,
@@ -644,7 +645,10 @@ class Pipeline:
                                      "content": RELEVANCE_SYSTEM},
                                     {"role": "user",
                                      "content": relevance_prompt(
-                                         question, block.text)},
+                                         question,
+                                         judge_note_text(
+                                             block,
+                                             self.config.recall.judge_note))},
                                 ],
                                 "temperature": 0,
                                 "max_tokens": 4,
@@ -1908,6 +1912,12 @@ class Pipeline:
         limit = self.config.embed_token_limit
         for block in all_blocks:
             block.embed_text = truncate_tokens(block.text, limit)
+            # The question this block was written to answer. Kept on every
+            # block type, not just reasoning: for a result or reading block
+            # stimulus_text is a copy of the block's own words, so there would
+            # otherwise be nowhere the question survives. This is what the
+            # relevance judge reads -- see judge_note_text.
+            block.question_text = truncate_tokens(user_message, 512)
 
         for block in all_blocks:
             await asyncio.to_thread(self.store.put, block)

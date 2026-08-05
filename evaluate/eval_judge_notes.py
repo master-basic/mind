@@ -89,9 +89,19 @@ VARIANTS = {
     "same-step": prompt_same_step,
 }
 
-# Which note text stands in for the block. "prompt" is what the original
-# harness used and is kept only to show the size of the gap.
-NOTE_SOURCES = ("prompt", "answer", "reasoning")
+# Which note text stands in for the block.
+#
+#   reasoning  what _filter_by_relevance passes today: block.text
+#   answer     block.text for a result block
+#   prompt     the question the block was written to answer. Already stored --
+#              build_stimulus puts it first in stimulus_text -- so using it
+#              costs nothing. This is also what the original harness used, by
+#              accident, and it is the only note that refuses the trap family.
+#   gist       the tagger's 40-char label, written on every block and read by
+#              nothing (the F11 complaint)
+#   both       the question and the content together, so the judge can make the
+#              same-task check without losing the ability to match on content
+NOTE_SOURCES = ("reasoning", "answer", "prompt", "gist", "both")
 
 
 def ask(endpoint, system, text, timeout=60):
@@ -108,6 +118,54 @@ def ask(endpoint, system, text, timeout=60):
     return not reply.startswith("no")          # True = keep, as the pipeline
 
 
+def score_note_sources(args, seeds, probes, note_for, relations):
+    """The shipped prompt against every candidate note, on the same pairs.
+
+    This is the comparison that matters: the wording is not the variable that
+    moves the trap family, the note is.
+    """
+    print(f"prompt: shipped   pairs: same-family only   "
+          f"judge: {args.judge_endpoint}\n")
+    width = 12
+    print(f"{'relation':<14}{'n':>3}  " +
+          "".join(s.rjust(width) for s in NOTE_SOURCES))
+    print("-" * (19 + width * len(NOTE_SOURCES)))
+
+    kept = defaultdict(dict)
+    for rel in relations:
+        sel = [p for p in probes if p["relation"] == rel]
+        line = f"{rel:<14}{len(sel):>3}  "
+        for src in NOTE_SOURCES:
+            n = sum(ask(args.judge_endpoint, RELEVANCE_SYSTEM,
+                        relevance_prompt(p["prompt"], note_for(p["family"], src)))
+                    for p in sel)
+            kept[rel][src] = n
+            line += f"{n}/{len(sel)}".rjust(width)
+        print(line)
+
+    print("\nkept = the judge let the block through.")
+    print("  exact/paraphrase/crosslingual: kept is correct")
+    print("  trap: kept is the anchoring failure in grading_traps.md\n")
+    summary = {}
+    for src in NOTE_SOURCES:
+        good = sum(kept[r][src] for r in relations[:3])
+        leaked = kept["trap"][src]
+        summary[src] = {"recall_kept": good, "recall_total": 18,
+                        "trap_leaked": leaked, "trap_total": 6}
+        flag = "  <-- production today" if src == "reasoning" else ""
+        print(f"  {src:<12} recall {good}/18   trap leaked {leaked}/6{flag}")
+
+    print("\nn=6 per relation. A note source that wins here has been shown not")
+    print("to lose recall on this corpus, not to generalise.")
+    if args.json_out:
+        with open(args.json_out, "w", encoding="utf-8") as f:
+            json.dump({"comparison": "note_sources",
+                       "per_relation": {r: kept[r] for r in relations},
+                       "summary": summary}, f, indent=2)
+        print(f"\nwrote {args.json_out}")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--corpus", default="corpus.jsonl")
@@ -115,6 +173,9 @@ def main():
     ap.add_argument("--judge-endpoint", default="http://127.0.0.1:8081")
     ap.add_argument("--variants", action="store_true",
                     help="also score the candidate rewordings")
+    ap.add_argument("--all-notes", action="store_true",
+                    help="score the shipped prompt against every note source, "
+                         "which is the comparison that isolates the defect")
     ap.add_argument("--note-source", default="reasoning",
                     choices=NOTE_SOURCES,
                     help="what stands in for the block's text")
@@ -132,10 +193,21 @@ def main():
             r = json.loads(line)
             gen[r["family"]] = r
 
-    def note_for(family):
-        if args.note_source == "prompt":
+    def note_for(family, source=None):
+        source = source or args.note_source
+        g = gen[family]
+        if source == "prompt":
             return seeds[family]["prompt"]
-        return gen[family].get(args.note_source) or gen[family]["answer"]
+        if source == "gist":
+            return g.get("gist") or ""
+        if source == "both":
+            # The shape the pipeline can build for free: a reasoning block
+            # already carries its originating question in stimulus_text and its
+            # own words in text.
+            return (f"This note was written while answering:\n"
+                    f"{seeds[family]['prompt']}\n\n"
+                    f"The note says:\n{g.get('reasoning') or g['answer']}")
+        return g.get(source) or g["answer"]
 
     # Only same-family pairs. The question is not "can the judge tell two
     # unrelated things apart" -- cosine already does that -- but "when the
@@ -144,6 +216,9 @@ def main():
     variants = VARIANTS if args.variants else {"shipped": relevance_prompt}
     # Recall relations first, then the one that must be refused.
     RELATIONS = ("exact", "paraphrase", "crosslingual", "trap")
+
+    if args.all_notes:
+        return score_note_sources(args, seeds, probes, note_for, RELATIONS)
 
     print(f"note source: {args.note_source}   "
           f"pairs: same-family only   judge: {args.judge_endpoint}\n")

@@ -83,6 +83,21 @@ recall:
   # Costs one short call per candidate, in parallel, on the request path.
   judge_enabled: true
   judge_timeout_s: 5.0
+  # What the judge reads as the archived note: the question the block was
+  # written to answer ("question"), or the block's own words ("text", which is
+  # what shipped until 2026-08-05).
+  #
+  # Measured against the real store representation at threshold 0.48 with the
+  # judge on: false-fire 0.64 with "text", 0.09 with "question", and all 18
+  # legitimate recalls survive either way. The 0.00 false-fire in benchmark.md
+  # came from a harness that showed the judge a seed prompt rather than a
+  # block; shown a real block it keeps 5 of 6 traps, which is the anchoring
+  # failure grading_traps.md recorded.
+  #
+  # The untested trade: a block whose originating question differed but whose
+  # content happens to answer the new one is now refused. If recall starts
+  # missing things it used to find, set this to "text" first.
+  judge_note: question
 judge:
   # New material since the last pass before another one is worth running.
   interval_tokens: 20000

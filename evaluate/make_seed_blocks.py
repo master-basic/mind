@@ -26,6 +26,7 @@ versions, so it is committed rather than regenerated per run.
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -64,6 +65,46 @@ def chat(base, prompt, model, timeout=900):
     return think, answer, dt
 
 
+def tag(judge_endpoint, stimulus, text, timeout=300):
+    """Gist and tags through the shipped Tagger, not a copy of its prompt."""
+    import sys as _sys
+    here = os.path.dirname(os.path.abspath(__file__))
+    _sys.path.insert(0, os.path.join(os.path.dirname(here), "cued_recall"))
+    from cued_recall.models import Block
+    from cued_recall.taxonomy import (TAXONOMY_GROUPS, validate_gist,
+                                      validate_tags)
+    from cued_recall.tagger import Tagger
+
+    block = Block(stimulus_text=stimulus, text=text)
+    vocab = "\n".join(f"- {g}: {', '.join(t)}"
+                      for g, t in TAXONOMY_GROUPS.items())
+    prompt = (
+        "Summarize this archived block for a human skimming an admin "
+        "dashboard. Respond with exactly one JSON object: "
+        '{"gist": "<40 characters or fewer, plain description of what '
+        'this block is about>", "tags": [<0 to 3 tags, chosen ONLY from '
+        "the fixed list below, nothing else>]}\n\n"
+        f"Tag list (grouped, pick tag names only):\n{vocab}\n\n"
+        f"Context (what was asked):\n{block.stimulus_text[:1500]}\n\n"
+        f"Content:\n{block.text[:2000]}"
+    )
+    payload = {"messages": [{"role": "user", "content": prompt}],
+               "temperature": 0.1, "max_tokens": 150}
+    req = urllib.request.Request(
+        judge_endpoint.rstrip("/") + "/v1/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read())
+        content = data["choices"][0]["message"]["content"] or ""
+    except Exception as e:
+        print(f"    [tag] failed: {type(e).__name__}: {e}")
+        return "", []
+    gist, tags = Tagger._parse(content)
+    return validate_gist(gist, 40), validate_tags(tags, 3)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--corpus", default="corpus.jsonl")
@@ -72,9 +113,27 @@ def main():
                     help="the reasoning server, NOT the middleware -- these "
                          "turns must not be recalled into or stored")
     ap.add_argument("--model", default="reasoning")
+    ap.add_argument("--judge-endpoint", default="http://127.0.0.1:8081",
+                    help="the small model, for the gist")
     ap.add_argument("--show", action="store_true",
                     help="print an existing seed_blocks.jsonl and exit")
+    ap.add_argument("--gists-only", action="store_true",
+                    help="keep the generated traces, refresh only gist/tags "
+                         "(the traces cost minutes; the gists cost seconds)")
     args = ap.parse_args()
+
+    if args.gists_only:
+        rows = [json.loads(l) for l in open(args.out, encoding="utf-8")
+                if l.strip()]
+        for r in rows:
+            r["gist"], r["tags"] = tag(args.judge_endpoint, r["prompt"],
+                                       r["reasoning"])
+            print(f"  {r['id']:<14} gist={r['gist']!r} tags={r['tags']}")
+        with open(args.out, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        print(f"\nupdated {args.out} ({len(rows)} seeds)")
+        return 0
 
     if args.show:
         for line in open(args.out, encoding="utf-8"):
@@ -104,15 +163,22 @@ def main():
             # zero vector scores 0 against everything -- a result that looks
             # like a finding.
             sys.exit(f"[ERROR] {s['id']} produced neither answer nor trace")
+        # The gist too, through the shipped tagger prompt: it is written on
+        # every real block and is one of the candidate notes for the relevance
+        # judge, so a seed that stands in for a block needs one.
+        gist, tags = tag(args.judge_endpoint, s["prompt"], think)
         out.append({
             "id": s["id"],
             "family": s["family"],
             "prompt": s["prompt"],
             "reasoning": think,
             "answer": answer,
+            "gist": gist,
+            "tags": tags,
         })
         print(f"  {s['id']:<14} {dt:>6.1f}s  "
-              f"think={len(think):>6}  answer={len(answer):>6}")
+              f"think={len(think):>6}  answer={len(answer):>6}  "
+              f"gist={gist!r}")
 
     with open(args.out, "w", encoding="utf-8") as f:
         for r in out:

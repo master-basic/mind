@@ -224,6 +224,50 @@ exceptions, and on a 1.5B model reading 8,000 characters they are what gets lost
 Legitimate recall is untouched in every variant. This is specifically and only a
 failure to say no.
 
+### Changing what the judge is shown does fix it
+
+The note that refuses the whole trap family is one the pipeline already has.
+Every note source, shipped prompt, same pairs (`--all-notes`):
+
+| note | chars (ocr1) | legitimate recall | traps leaked |
+|---|---|---|---|
+| the answer | 8,463 | 18/18 | **6/6** |
+| the think trace (production today) | 10,627 | 18/18 | **5/6** |
+| the question **and** the content | ~10,800 | 18/18 | **5/6** |
+| the tagger's 40-char gist | 40 | 17/18 | **0/6** |
+| **the question the block answered** | 208 | **18/18** | **0/6** |
+
+`both` is the informative row: adding the question to the content changes
+nothing, so the content dominates and the question has to *replace* it. And the
+gist scoring 0/6 is the first evidence that the taxonomy carries real signal
+rather than being the decoration F11 calls it.
+
+End to end on the real representation (`--key-source composite`, threshold
+0.48, judge on):
+
+| | judge note = text | judge note = question |
+|---|---|---|
+| recall | 0.96 | 0.75 |
+| **false-fire** | **0.64** | **0.09** |
+| exact / paraphrase / crosslingual | 6/6 · 6/6 · 6/6 | 6/6 · 6/6 · 6/6 |
+| trap fired | 5/6 | **0/6** |
+| distractor fired | 5/6 | 1/6 |
+| control fired | 2/5 | 0/5 |
+
+Every legitimate recall survives; the entire recall drop is the trap family,
+which the corpus labels `should_recall: true` and which `grading_traps.md`
+showed anchoring a real answer on the wrong stack.
+
+Shipped as `recall.judge_note`, defaulting to `question`. It applies
+retroactively with no backfill: a reasoning block's `stimulus_text` already
+begins with the question, so `judge_note_text` parses it back out, and anything
+that cannot be resolved to a question falls back to the block's text.
+
+**The untested trade:** a block whose originating question differed but whose
+content happens to answer the new one is now refused. No relation family in
+this corpus covers that miss class. `recall.judge_note: text` restores the old
+behaviour.
+
 ### Rewording the prompt did not fix it
 
 Two candidate rewordings, scored on the same pairs (`--variants`):
@@ -254,7 +298,8 @@ decision is reversible with a re-embed if a larger corpus says otherwise.
 
 The defect that is real, and larger than the analysis estimated, is the judge's
 inability to refuse related-but-wrong material when it reads an actual block.
-That is roadmap item 4, not item 1, and it is not a prompt-wording problem.
+That is roadmap item 4, not item 1, and it is not a prompt-wording problem --
+it is a question of what the judge is handed, and it is fixed above.
 
 Reproducing:
 

@@ -168,6 +168,42 @@ def embed_source_text(block, source: str = "composite") -> str:
     return stimulus or content or (getattr(block, "text", "") or "")
 
 
+def judge_note_text(block, note_source: str = "text") -> str:
+    """What the relevance judge should be shown for a block.
+
+    "text" is what the pipeline has always passed. "question" shows the user
+    message the block was written to answer instead.
+
+    The difference is the whole false-fire figure. Measured on the evaluate/
+    corpus with a real block as the note, the judge keeps 5 of 6 trap
+    candidates -- material about a different phase of the same work, the
+    failure grading_traps.md caught anchoring a real answer on the wrong stack.
+    Shown the question that produced the block, it keeps 0 of 6. Legitimate
+    recall is 18/18 either way, so this only affects the judge's ability to say
+    no. Showing it both together scores exactly like showing the text alone:
+    the content dominates, so the question has to replace it, not accompany it.
+
+    Falls back through stimulus_text: for a reasoning block that is
+    build_stimulus output, whose first section is the question, so a store
+    written before question_text existed still gets the benefit without a
+    backfill. Anything that cannot be resolved to a question returns the
+    block's text, which is the old behaviour.
+    """
+    if note_source != "question":
+        return getattr(block, "text", "") or ""
+    question = (getattr(block, "question_text", "") or "").strip()
+    if question:
+        return question
+    stimulus = (getattr(block, "stimulus_text", "") or "")
+    head = stimulus.split("\n---\n", 1)[0].strip()
+    # A result or reading block's stimulus is a copy of its own text, not a
+    # question, and splitting it yields the whole thing back. Only trust the
+    # split when it actually split something off.
+    if head and head != stimulus.strip():
+        return head
+    return getattr(block, "text", "") or ""
+
+
 def build_stimulus(user_message: str, result_text: str,
                    reading_excerpt: str = "") -> str:
     parts = [truncate_tokens(user_message, 512)]

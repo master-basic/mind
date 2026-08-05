@@ -61,6 +61,16 @@ class Block:
     # the two feeds the index is config.embed_source; both are always stored,
     # so switching is a re-embed and not a re-ingest.
     embed_text: str = ""
+    # The user's message that this block was written in answer to. Stored on
+    # its own because it is what the relevance judge should read: shown a
+    # block's own words, the judge keeps 5 of 6 trap candidates, and shown the
+    # question the block was answering it keeps 0 of 6 -- with every legitimate
+    # recall surviving either way. See evaluate/eval_judge_notes.py.
+    #
+    # For reasoning blocks this is also recoverable from stimulus_text, whose
+    # first section is the question, which is what makes the change work on a
+    # store written before this field existed.
+    question_text: str = ""
     verification: Verification = Verification.unknown
     # User-set: exempt from decay and from consolidation, at any age. Retrieval
     # is the only evidence this system gathers on its own that a memory matters,
