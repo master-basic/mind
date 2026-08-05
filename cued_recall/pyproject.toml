@@ -30,3 +30,6 @@ testpaths = ["tests"]
 # table, the index -- so they run in under a second with no servers up. If a
 # test here needs a model endpoint, it belongs in evaluate/ instead.
 addopts = "-q"
+# Explicit: async tests carry @pytest.mark.asyncio. Auto mode would collect
+# any coroutine it found, including ones meant to be awaited by a fixture.
+asyncio_mode = "strict"

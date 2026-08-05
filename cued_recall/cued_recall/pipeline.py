@@ -2041,8 +2041,26 @@ class Pipeline:
                 fallback = block.text
         return fallback
 
+    # What a correction is evidence against. The user is objecting to an
+    # answer, so the answer and the thinking behind it are implicated -- but
+    # a `reading` block is source material they pasted or the system fetched,
+    # and it was not wrong merely because the model misused it. Marking it
+    # corrected dropped it from recall and started its purge clock, which
+    # deleted the user's own document as punishment for the model's mistake.
+    CORRECTABLE_TYPES = (BlockType.reasoning.value, BlockType.result.value)
+
     async def _mark_corrected(self, block_ids: List[str], source: str):
         for bid in block_ids:
+            meta = await asyncio.to_thread(self.index.get_meta, bid)
+            if meta and meta.get("type") not in self.CORRECTABLE_TYPES:
+                self.wal.write({
+                    "event": "correction_skipped_source_block",
+                    "block_id": bid,
+                    "block_type": meta.get("type"),
+                    "source": source,
+                    "timestamp": time.time(),
+                })
+                continue
             # The source is recorded because it decides how much weight the
             # verdict carries: a pattern match can get a block deleted
             # outright, a model guess cannot. See Judge._should_purge.
