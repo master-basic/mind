@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import html as html_lib
 import ipaddress
 import json
@@ -12,6 +13,16 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 import numpy as np
+
+# ddgs (Dux Distributed Global Search) is a keyless metasearch fallback for
+# web_search. Optional: if it is not installed (or its native dep won't build
+# on this Python), _DDGS_AVAILABLE is False and the backend is simply skipped.
+try:
+    from ddgs import DDGS as _DDGS
+    _DDGS_AVAILABLE = True
+except Exception:
+    _DDGS = None
+    _DDGS_AVAILABLE = False
 
 
 def url_block_reason(url: str) -> Optional[str]:
@@ -1026,25 +1037,29 @@ class Pipeline:
             return bool(ws.searxng_url)
         if name in ("brave", "serper"):
             return bool(ws.key_for(name))
-        return name == "duckduckgo"  # needs no credentials
+        if name == "ddgs":
+            return _DDGS_AVAILABLE
+        # bing / mojeek / duckduckgo are keyless scrapes, always available.
+        return name in ("bing", "mojeek", "duckduckgo")
 
     def _search_chain(self) -> List[str]:
         """Backends to try in order: the configured one, then any others.
 
-        DuckDuckGo is throttled unpredictably, so a configured paid backend
-        should be able to cover for it and vice versa rather than letting one
-        bad response become "no results".
+        Keyless scrapes (bing, mojeek, duckduckgo) come before any configured
+        paid backend: they cost nothing and cover each other when one is
+        throttled, so a single bad response cannot become "no results". The
+        configured paid backend is still first when explicitly chosen.
         """
         ws = self.config.web_search
         chain = []
-        chosen = (ws.backend or "duckduckgo").lower()
+        chosen = (ws.backend or "bing").lower()
         if self._backend_usable(chosen):
             chain.append(chosen)
         if ws.fallback:
-            for name in ("brave", "serper", "searxng", "duckduckgo"):
+            for name in ("bing", "mojeek", "duckduckgo", "ddgs", "brave", "serper", "searxng"):
                 if name not in chain and self._backend_usable(name):
                     chain.append(name)
-        return chain or ["duckduckgo"]
+        return chain or ["bing"]
 
     async def _run_backend(self, name: str, query: str, n: int) -> Tuple[list, bool]:
         """Returns (results, blocked)."""
@@ -1054,6 +1069,12 @@ class Pipeline:
             return await self._search_brave(query, n), False
         if name == "serper":
             return await self._search_serper(query, n), False
+        if name == "bing":
+            return await self._search_bing_checked(query, n)
+        if name == "mojeek":
+            return await self._search_mojeek_checked(query, n)
+        if name == "ddgs":
+            return await self._search_ddgs_checked(query, n)
         return await self._search_duckduckgo_checked(query, n)
 
     async def _web_search(self, query: str) -> str:
@@ -1086,9 +1107,9 @@ class Pipeline:
                 "failed or was refused, so no query can succeed right now. Do "
                 "NOT retry this tool or rephrase the query -- the result will "
                 "be identical. Either answer from your own knowledge and say "
-                "the information may be out of date, or ask the user to "
-                "configure a working search backend (brave, serper, or "
-                "searxng) under web_search in config.yaml."
+                "the information may be out of date, or try again later when "
+                "the engines (keyless Bing, Mojeek, and DuckDuckGo are enabled "
+                "by default) stop rejecting requests."
             )
         if not results:
             return f"No search results for: {query}"
@@ -1187,6 +1208,183 @@ class Pipeline:
                 "snippet": self._strip_html(snippets[i]) if i < len(snippets) else "",
             })
         return results
+
+    async def _search_bing_checked(self, query: str, n: int) -> Tuple[list, bool]:
+        """Search Bing, reporting whether the engine blocked us.
+
+        Bing answers scraped requests with a CAPTCHA/anti-bot shell (HTTP 200
+        but none of the result markup) rather than a hard error, so treat that
+        as "blocked" so the chain falls through to Mojeek instead of telling
+        the model nothing matched.
+        """
+        try:
+            html, status = await self._fetch_bing_html(query, n)
+        except Exception:
+            return [], True
+        results = self._parse_bing_html(html, n)
+        if results:
+            return results, False
+        blocked = status != 200 or 'class="b_algo"' not in html
+        return [], blocked
+
+    async def _fetch_bing_html(self, query: str, n: int) -> Tuple[str, int]:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        # www.bing.com aggressively challenges headless clients; the www4 edge
+        # serves the same index without that gate (per the current 2026 DOM).
+        async with httpx.AsyncClient(follow_redirects=True, timeout=20) as client:
+            resp = await client.get(
+                "https://www4.bing.com/search",
+                params={"q": query, "count": n, "setlang": "en"},
+                headers=headers,
+            )
+            resp.encoding = "utf-8"
+            return resp.text, resp.status_code
+
+    @staticmethod
+    def _bing_unwrap(href: str) -> str:
+        # Bing wraps result URLs as //www.bing.com/ck/a?a=...&u=a1<base64url>.
+        # Decode the base64 payload to get the real URL instead of filling the
+        # index with bing.com/ck/a redirect junk.
+        try:
+            m = re.search(r"[?&]u=a1([A-Za-z0-9_-]+)", href)
+            if m:
+                padded = m.group(1) + "=" * (-len(m.group(1)) % 4)
+                return base64.urlsafe_b64decode(padded).decode("utf-8", "replace")
+        except Exception:
+            pass
+        return href
+
+    def _parse_bing_html(self, html: str, n: int) -> list:
+        # Regex-free structural parse that survives Bing's interpolated markup:
+        # walk li.b_algo blocks, take the first <a> in the title h2, and any
+        # caption/description text for the snippet.
+        results = []
+        for block in re.findall(r'<li class="b_algo"[^>]*>(.*?)</li>', html, re.DOTALL):
+            m = re.search(r'<h2[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.DOTALL)
+            if not m:
+                continue
+            href, title = m.group(1), self._strip_html(m.group(2))
+            snippet = ""
+            cap = re.search(
+                r'<div[^>]*class="b_caption"[^>]*>(.*?)</div>'
+                r'|<p[^>]*>(.*?)</p>|class="b_lineclamp[^"]*"[^>]*>(.*?)(?=</span>|</div>|</li>)',
+                block, re.DOTALL)
+            if cap:
+                snippet = self._strip_html(
+                    cap.group(1) or cap.group(2) or cap.group(3) or "")
+            if title:
+                results.append({
+                    "title": title,
+                    "url": self._bing_unwrap(href),
+                    "snippet": snippet,
+                })
+            if len(results) >= n:
+                break
+        return results
+
+    async def _search_mojeek_checked(self, query: str, n: int) -> Tuple[list, bool]:
+        """Search Mojeek, reporting blocked like the other checked backends.
+
+        Mojeek is deliberately scraper-friendly (no User-Agent gating, no JS),
+        so a break here is rare; the checked wrapper keeps the fallback chain
+        uniform and cheap when its HTML shape does change.
+        """
+        try:
+            html, status = await self._fetch_mojeek_html(query, n)
+        except Exception:
+            return [], True
+        results = self._parse_mojeek_html(html, n)
+        if results:
+            return results, False
+        blocked = status != 200 or "results-standard" not in html
+        return [], blocked
+
+    async def _fetch_mojeek_html(self, query: str, n: int) -> Tuple[str, int]:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0 Safari/537.36"
+            ),
+        }
+        async with httpx.AsyncClient(follow_redirects=True, timeout=20) as client:
+            resp = await client.get(
+                "https://www.mojeek.com/search",
+                params={"q": query, "n": max(10, n)},
+                headers=headers,
+            )
+            resp.encoding = "utf-8"
+            return resp.text, resp.status_code
+
+    def _parse_mojeek_html(self, html: str, n: int) -> list:
+        # Result items are <li> that hold an <a class="title">; each <li> also
+        # carries a nested <ul class="url"> for the display URL, so the list
+        # container regex is unreliable. Scan raw <li>...</li> blocks instead:
+        # result items never nest another <li>, and a plain <a class="title">
+        # is distinctive enough to keep header/footer lists out.
+        results = []
+        for li in re.findall(r'<li[^>]*>(.*?)</li>', html, re.DOTALL):
+            am = re.search(
+                r'<a[^>]*class="title"[^>]*href="([^"]+)"[^>]*>(.*?)</a>'
+                r'|<a[^>]*href="([^"]+)"[^>]*class="title"[^>]*>(.*?)</a>',
+                li, re.DOTALL)
+            if not am:
+                continue
+            href = am.group(1) or am.group(3)
+            title = self._strip_html(am.group(2) or am.group(4))
+            snippet = ""
+            pm = re.search(r'<p[^>]*class="s"[^>]*>(.*?)</p>', li, re.DOTALL)
+            if pm:
+                snippet = self._strip_html(pm.group(1))
+            if title:
+                results.append({
+                    "title": title,
+                    "url": href,
+                    "snippet": snippet,
+                })
+            if len(results) >= n:
+                break
+        return results
+
+    async def _search_ddgs_checked(self, query: str, n: int) -> Tuple[list, bool]:
+        """Keyless metasearch via the optional ddgs library.
+
+        ddgs aggregates Bing/Mojeek/DuckDuckGo/more with its own anti-bot
+        handling, so it is the last-resort keyless engine when every scrape
+        is gated. It is synchronous, so it must run in a worker thread to
+        avoid stalling the async event loop. Absent (not installed), the
+        backend reports itself unusable via _backend_usable and never gets
+        called here.
+        """
+        if not _DDGS_AVAILABLE:
+            return [], False
+        try:
+            raw = await asyncio.to_thread(
+                _DDGS().text, query, backend="auto", max_results=max(1, n))
+        except Exception:
+            # Rate-limited or refused -- blocked, so the chain keeps going.
+            return [], True
+        results = []
+        for r in raw or []:
+            href = (r.get("href") or "").strip()
+            if not href:
+                continue
+            results.append({
+                "title": (r.get("title") or "").strip(),
+                "url": href,
+                "snippet": (r.get("body") or "").strip(),
+            })
+            if len(results) >= n:
+                break
+        # Genuinely no matches is "not blocked", so the chain can stop here.
+        return results, False
 
     async def _search_searxng(self, query: str, n: int) -> list:
         base = self.config.web_search.searxng_url.rstrip("/")

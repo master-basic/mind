@@ -271,8 +271,9 @@ class TaggerConfig:
 class WebSearchConfig:
     def __init__(self, d: dict):
         self.enabled: bool = d.get("enabled", True)
-        # backend: "duckduckgo" (no key), "searxng", "brave", "serper"
-        self.backend: str = d.get("backend", "duckduckgo")
+        # backend: "bing" (default, keyless), "mojeek", "duckduckgo" (both
+        # keyless too), or the keyed "brave" / "serper" / "searxng".
+        self.backend: str = d.get("backend", "bing")
         self.searxng_url: str = d.get("searxng_url", "")
         # Legacy single key: applied to whichever backend is selected.
         self.api_key: str = d.get("api_key", "")

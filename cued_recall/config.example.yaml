@@ -288,9 +288,11 @@ verifier:
   spans: false
 web_search:
   enabled: true
-  # duckduckgo needs no key but is rate-limited unpredictably. Set a
-  # brave_api_key below and switch backend to "brave" for reliable search.
-  backend: duckduckgo
+  # Keyless by default: bing (primary), with mojeek, duckduckgo and (if the
+  # optional `ddgs` library is installed) a metasearch fallback as always-
+  # available backups. Set a brave_api_key below and switch backend to
+  # "brave" if you want a keyed provider ahead of the free scrapes.
+  backend: bing
   # Get a key at https://brave.com/search/api/ (free tier available).
   brave_api_key: ''
   serper_api_key: ''
