@@ -59,6 +59,7 @@ from .utils import (
     estimate_tokens,
     judge_note_text,
     matches_correction,
+    redact_span,
     relevance_prompt,
     split_paragraph_boundary,
     truncate_tokens,
@@ -629,16 +630,26 @@ class Pipeline:
         # against a low admitted count means recall.budget_tokens is starving
         # the injection rather than the index failing to find anything.
         skipped_corrected = skipped_missing = skipped_oversized = 0
+        span_corrected = 0
+        # Span-level corrections (Phase 4.2 / F4): a corrected block that
+        # carries a span enters the pool with the span redacted instead of
+        # being suppressed whole -- 90% of a block that is right keeps being
+        # usable. Gated on verifier.spans, the flag that produced the span in
+        # the first place, so the old exclude-whole-block behaviour is the
+        # default exactly as it was.
+        spans_on = self.config.verifier.spans
         candidates = []
         for block_id, sim in results:
             meta = await asyncio.to_thread(self.index.get_meta, block_id)
-            if meta and meta.get("verification") == "corrected":
-                skipped_corrected += 1
-                continue
             block = await asyncio.to_thread(self.store.get, block_id)
             if block is None:
                 skipped_missing += 1
                 continue
+            if meta and meta.get("verification") == "corrected":
+                if not (spans_on and block.correction_span):
+                    skipped_corrected += 1
+                    continue
+                span_corrected += 1
             candidates.append((block, sim))
 
         # Relevance first, budget second. The budget used to be filled in
@@ -694,6 +705,7 @@ class Pipeline:
             "skipped_missing": skipped_missing,
             "skipped_oversized": skipped_oversized,
             "tokens_used": total_tokens,
+            "span_corrected": span_corrected,
             # "vector" normally; "keywords" when the embed server was down and
             # recall degraded to the gist/tag channel, or when only the second
             # source found anything; "vector+keywords" when both channels
@@ -754,6 +766,23 @@ class Pipeline:
             return note
         return note.rstrip() + "\n" + "\n".join(extras)
 
+    def _judge_note_for(self, block: Block, keyword: bool) -> str:
+        """The note the relevance judge sees for one candidate.
+
+        The measured base is judge_note_text (judge_note "question" beats
+        "text" 6/6 vs 1/6 traps on the eval corpus). Keyword-channel
+        candidates (Phase 5.1) get their gist/tags appended -- those are the
+        evidence the channel matched on. A span-corrected block (Phase 4.2)
+        gets the offending claim redacted: the judge must judge what is left
+        of the block, not the claim the user already refuted.
+        """
+        note = judge_note_text(block, self.config.recall.judge_note)
+        if keyword:
+            note = self._taxonomy_note(block, note)
+        if block.correction_span:
+            note = redact_span(note, block.correction_span)
+        return note
+
     async def _score_by_relevance(
         self, question: str, blocks: List[Tuple[Block, float]],
         keyword_ids: Optional[set] = None,
@@ -798,10 +827,10 @@ class Pipeline:
                     async with httpx.AsyncClient(
                         timeout=self.config.recall.judge_timeout_s
                     ) as client:
-                        note = judge_note_text(
-                            block, self.config.recall.judge_note)
-                        if keyword_ids and block.block_id in keyword_ids:
-                            note = self._taxonomy_note(block, note)
+                        note = self._judge_note_for(
+                            block,
+                            bool(keyword_ids) and block.block_id in keyword_ids,
+                        )
                         payload = {
                             "messages": [
                                 {"role": "system",
@@ -902,7 +931,13 @@ class Pipeline:
             parts.append(
                 f"[recall {block.block_id[:8]}, similarity {sim:.2f}, {date_str}]"
             )
-            parts.append(block.text)
+            # A span-corrected block is recalled with the refuted claim
+            # removed, not re-served to the model as if nothing happened
+            # (Phase 4.2 / F4).
+            if block.correction_span:
+                parts.append(redact_span(block.text, block.correction_span))
+            else:
+                parts.append(block.text)
             parts.append("")
         return "\n".join(parts)
 
@@ -2324,11 +2359,14 @@ class Pipeline:
         if not previous_answer:
             return
 
-        verdict = await self.verifier.is_correction(previous_answer, user_message)
+        verdict = await self.verifier.check_correction(
+            previous_answer, user_message)
         # None means the model failed or hedged. That is not "no" -- leave the
         # blocks alone rather than recording a judgement nobody made.
-        if verdict is True:
-            await self._mark_corrected(block_ids, "model")
+        if verdict and verdict[0]:
+            # The span rides along only when the prompt asked for one
+            # (verifier.spans); otherwise it is always empty.
+            await self._mark_corrected(block_ids, "model", verdict[1])
 
     async def _previous_answer_text(self, block_ids: List[str]) -> str:
         """The answer the user is responding to, for the correction classifier.
@@ -2356,7 +2394,8 @@ class Pipeline:
     # deleted the user's own document as punishment for the model's mistake.
     CORRECTABLE_TYPES = (BlockType.reasoning.value, BlockType.result.value)
 
-    async def _mark_corrected(self, block_ids: List[str], source: str):
+    async def _mark_corrected(self, block_ids: List[str], source: str,
+                              span: str = ""):
         for bid in block_ids:
             meta = await asyncio.to_thread(self.index.get_meta, bid)
             if meta and meta.get("type") not in self.CORRECTABLE_TYPES:
@@ -2377,12 +2416,18 @@ class Pipeline:
             block = await asyncio.to_thread(self.store.get, bid)
             if block:
                 block.verification = Verification.corrected
+                # Only ever set, never cleared: a later span-less re-mark
+                # (e.g. a pattern match on a later turn) must not launder a
+                # recorded claim back into recall.
+                if span:
+                    block.correction_span = span
                 await asyncio.to_thread(self.store.put, block)
             self.wal.write({
                 "event": "verification_set",
                 "block_id": bid,
                 "verification": "corrected",
                 "source": source,
+                "span": span,
                 "timestamp": time.time(),
             })
 

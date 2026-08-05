@@ -67,7 +67,7 @@ one defect nobody had ranked turned out to be the largest.
 | 3.2 graded utility decay | **done** | §11 |
 | 3.3 persist the acceptance signal | **done** | §11 |
 | 4.1 scope correction by block type | **done** | §4 |
-| 4.2 span-level corrections | **not done** | below |
+| 4.2 span-level corrections | **done** — by deepseek, 2026-08-05 | §17 |
 | 5.1 tag/gist as a retrieval channel | **done** — by deepseek, 2026-08-05 | §16 |
 | 5.2 similarity floor + embed-failure fallback | **done** — by deepseek, 2026-08-05 | §14 |
 | 6.1 re-embed when text changes | **done** | §6 |
@@ -86,7 +86,7 @@ one defect nobody had ranked turned out to be the largest.
 | F1 | no prototype layer | **done** — merge pass, off by default (§12) |
 | F2 | symmetric retrieval / composite embedding | **measured, refuted**; the real defect was the judge's note (§8, §9) |
 | F3 | one flat level of representation | **done** — by deepseek, 2026-08-05 (§16) |
-| F4 | correction is all-or-nothing | **half** — turn scope fixed (§4); span-level open (4.2) |
+| F4 | correction is all-or-nothing | **done** — by deepseek, 2026-08-05 (§17) |
 | F5 | decay is arithmetic, not utility | **done** (§11) |
 | F6 | budget filled by geometry before the judge | **done** (§10) |
 | F7 | index/vector drift and silent vector loss | **done**, and the cause was not what F7 said (§2, §6, §7) |
@@ -121,6 +121,7 @@ All shipped with the measured value as the default. Documented in
 | `judge.merge_min_cluster` | `3` | how many near-duplicates before generalising |
 | `judge.merge_min_age_s` | `604800` | how settled a cluster must be |
 | `judge.merge_max_per_pass` | `5` | merges per pass |
+| `verifier.spans` | `false` | span-level corrections: the verifier quotes the offending part and recall redacts it instead of suppressing the block; off — the yes/no prompt is the measured one (§17, by deepseek) |
 | `recall.pin_priority` | `true` | whether a pin breaks ties in the ranked recall fill (§13, by deepseek) |
 | `recall.floor` | `0.0` | cosine floor below which the judge is skipped; **off** — the plan's 0.30 cannot fire below the 0.48 threshold and no safe value is measured yet (§14, by deepseek) |
 | `recall.tag_channel` | `true` | the gist/tag keyword channel; used as the embed-failure fallback (§14, by deepseek) |
@@ -610,6 +611,49 @@ default off). The `_score_by_relevance` signature gained `keyword_ids`, which
 is why the fakes in `test_recall_fallback.py` and `test_recall_ranking.py`
 now accept it. `pytest` green at 270.
 
+### 17 — Span-level corrections (Phase 4.2 / F4, by deepseek)
+
+Continued on 2026-08-05 by deepseek; recorded here for later audit.
+
+A correction used to suppress the whole block from recall: the previous turn
+was marked corrected, and 90% of a block that was right became unusable with
+the 10% that was wrong. `verifier.spans: true` makes the correction granular:
+
+- **Verifier.** `check_correction` replaces `is_correction` (kept as a
+  wrapper): on a yes, the prompt asks for the exact phrase from the answer
+  that the user reports wrong (`yes "the file is at /etc/foo.conf"`), parsed
+  by `_parse_span`. The span-mode prompt is a new `with_span` branch of
+  `_prompt`; the default leaves the prompt byte-identical to the one
+  `eval_correction.py` measured. `max_tokens` grows from 4 to 96 in span mode.
+- **Store.** `Block.correction_span` (new field, msgpack-round-trips like the
+  rest). `_mark_corrected` takes a span, writes it to the block file and
+  carries it on the `verification_set` WAL event. The span is only ever set,
+  never cleared: a later span-less re-mark (a pattern match on a later turn)
+  cannot launder a recorded claim back into recall.
+- **Recall.** With `verifier.spans` on, a corrected block that carries a span
+  enters the judge pool instead of being excluded — the old exclude-whole-
+  block behaviour is the default exactly as it was, so the flag flips the
+  whole feature. The judge's note (`_judge_note_for`) and the recall
+  injection both run the block through `redact_span`: exact match, then
+  case-insensitive; a paraphrase the model produced gets a
+  `[reported wrong: <span>]` flag line rather than being quietly re-served.
+  `recall_budget` events gain `span_corrected`. In question-note mode the
+  span is never in the question, so the block shows up flagged — the judge
+  still knows part of it is refuted.
+
+Shipped off, same reason as the floor and the second source: the yes/no
+classifier is the version eval_correction.py measured, and the span quote is
+new model output that needs the plan's multi-claim correction rows before it
+is trusted. `is_correction`/`_parse` remain for any caller that never asked
+for a span.
+
+Twenty-four tests in `test_span_corrections.py` (redaction exact/case-
+insensitive/paraphrase, span parsing incl. "no span when the prompt did not
+ask", prompt byte-compat, mark-and-store, never-clear, admission on/off,
+injection and judge-note redaction — the F4 acceptance: a multi-claim block
+recalls with the bad claim gone and the others intact). `pytest` green at
+294.
+
 ---
 
 ## Not done
@@ -621,7 +665,6 @@ them.
 
 | Plan item | Size | Why not yet |
 |---|---|---|
-| **4.2** span-level corrections (F4) | large | Needs new output from `verifier.py` — a span, not a yes/no — so it is a model-output change, not a plumbing one. |
 | **3.1** decide whether to enable merging | judgement | Built and off. Snapshot, set `merge_enabled: true`, run a pass, read the `blocks_merged` and `merge_rejected` events. The one merge measured was factually wrong and correctly refused — a sample of one. |
 
 ### Evals and docs (the plan's cross-cutting section)

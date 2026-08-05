@@ -277,6 +277,14 @@ verifier:
   enabled: true
   endpoint: ""
   max_chars: 1200
+  # Span-level corrections (Phase 4.2). On, a "yes" also quotes the offending
+  # part of the answer, and recall admits the corrected block with that span
+  # redacted ("[a part of this block was reported wrong and removed]") instead
+  # of suppressing the whole block -- the other claims in it stay usable.
+  # Off by default: the yes/no prompt is the version eval_correction.py
+  # measured, and the span quote needs its own eval rows first (the plan's
+  # multi-claim correction rows under Evals and docs).
+  spans: false
 web_search:
   enabled: true
   # duckduckgo needs no key but is rate-limited unpredictably. Set a

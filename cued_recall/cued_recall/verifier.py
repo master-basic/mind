@@ -1,5 +1,5 @@
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 import httpx
 
@@ -17,6 +17,12 @@ class CorrectionVerifier:
     forgetting was dead. A 1.5B model cannot do the judge's old three-way
     decision, but it can answer one yes/no question.
 
+    With `verifier.spans` on (Phase 4.2 / F4), a yes also carries a quote of
+    the offending part of the answer, so a correction can remove one claim
+    from a block instead of suppressing the whole block -- "weight the stable
+    aspects" in the chapter's sense. Default off keeps the measured yes/no
+    prompt exactly as eval_correction.py scores it.
+
     Never called on the request path. The classifier costs a CPU-bound
     round trip, and verification is applied to the PREVIOUS turn's blocks
     anyway, so nothing needs it before the reply goes out.
@@ -24,6 +30,7 @@ class CorrectionVerifier:
 
     TIMEOUT_S = 120
     MAX_TOKENS = 4
+    SPAN_MAX_TOKENS = 96
     SYSTEM_PROMPT = ("You classify one message. You reply with exactly one "
                      "word: yes or no.")
 
@@ -41,6 +48,19 @@ class CorrectionVerifier:
         None is not False. An unreachable or confused model must not be
         recorded as "the user was happy with it".
         """
+        result = await self.check_correction(previous_answer, user_message)
+        return result[0] if result else None
+
+    async def check_correction(
+        self, previous_answer: str, user_message: str
+    ) -> Optional[Tuple[bool, str]]:
+        """(is_correction, span), or None when the model gave no usable answer.
+
+        The span is the verifier's quote of the offending part of the answer;
+        empty when the verdict is no, or when `verifier.spans` is off and the
+        prompt never asked for one. None is not False -- an unreachable or
+        confused model must not be recorded as "the user was happy with it".
+        """
         if not self.config.verifier.enabled:
             return None
         if not (user_message or "").strip():
@@ -52,7 +72,8 @@ class CorrectionVerifier:
         # trimmed as hard as the answer it responds to.
         message = (user_message or "")[:2000]
 
-        prompt = self._prompt(answer, message)
+        with_span = self.config.verifier.spans
+        prompt = self._prompt(answer, message, with_span=with_span)
 
         try:
             async with SLOTS:
@@ -66,7 +87,8 @@ class CorrectionVerifier:
                                 {"role": "user", "content": prompt},
                             ],
                             "temperature": 0,
-                            "max_tokens": self.MAX_TOKENS,
+                            "max_tokens": (self.SPAN_MAX_TOKENS if with_span
+                                           else self.MAX_TOKENS),
                         },
                     )
                     resp.raise_for_status()
@@ -89,10 +111,10 @@ class CorrectionVerifier:
             })
             return None
 
-        return self._parse(content)
+        return self._parse_span(content, with_span)
 
     @staticmethod
-    def _prompt(answer: str, message: str) -> str:
+    def _prompt(answer: str, message: str, with_span: bool = False) -> str:
         """The few-shot classification prompt.
 
         A method rather than an inline string so evaluate/eval_correction.py
@@ -102,7 +124,17 @@ class CorrectionVerifier:
         follow-ups like "can you also show how to change the port?", which is
         the expensive direction. The examples pin down the distinction it kept
         missing: a bad outcome versus a request for more.
+
+        `with_span` adds the span instruction (Phase 4.2); the default leaves
+        the prompt byte-identical to the version eval_correction.py measured.
         """
+        span_line = ""
+        if with_span:
+            span_line = (
+                "When you say yes, also copy the exact phrase from the answer "
+                "that the user reports is wrong, in quotes on the same line, "
+                "like: yes \"the file is at /etc/foo.conf\".\n"
+            )
         return (
             "Decide whether the user is reporting that the assistant's answer "
             "was wrong or did not work.\n\n"
@@ -111,6 +143,7 @@ class CorrectionVerifier:
             "or doubt that the answer is right.\n"
             "Say no when the user asks for more, asks a new or related "
             "question, or is satisfied.\n\n"
+            + span_line +
             "Examples:\n\n"
             'Answer: "Run `apt install foo`."\n'
             'Message: "that gave me: package not found"\n'
@@ -142,15 +175,25 @@ class CorrectionVerifier:
 
     @staticmethod
     def _parse(content: str) -> Optional[bool]:
-        text = (content or "").strip().lower()
+        """The old yes/no-only parse, kept for callers without a span mode."""
+        parsed = CorrectionVerifier._parse_span(content, False)
+        return parsed[0] if parsed else None
+
+    @staticmethod
+    def _parse_span(content: str, with_span: bool) -> Optional[Tuple[bool, str]]:
+        text = (content or "").strip()
         if not text:
             return None
         # Match on the first word only. "no, the user is asking a follow-up"
         # starts with the answer; scanning the whole string for "yes" would
         # find it in an explanation that concluded the opposite.
-        first = text.split()[0].strip('."\',:*')
+        first = text.split()[0].strip('."\',:*').lower()
         if first.startswith("yes"):
-            return True
+            span = ""
+            if with_span and len(text) > len(first):
+                span = text.split(None, 1)[1].strip()
+                span = span.lstrip(":-").strip().strip('"\'`[]')
+            return True, span
         if first.startswith("no"):
-            return False
+            return False, ""
         return None

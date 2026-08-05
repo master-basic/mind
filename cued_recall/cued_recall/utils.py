@@ -255,3 +255,29 @@ def matches_correction(text: str, patterns: List[str]) -> bool:
             if pat.lower() in text.lower():
                 return True
     return False
+
+
+# What a span-corrected block's redacted claim is replaced with (Phase 4.2).
+# The marker must not read like new information: the judge and the reasoning
+# model see that something was removed, not what it said.
+CORRECTION_MARKER = "[a part of this block was reported wrong and removed]"
+
+
+def redact_span(text: str, span: str) -> str:
+    """Remove a corrected span from text for recall (Phase 4.2 / F4).
+
+    The span is the verifier's own quote of the offending part of the answer.
+    Tries an exact match first, then a case-insensitive one (the model's quote
+    can differ in case). If neither hits -- the model paraphrased -- the text
+    comes back with a marker line naming the span instead, so the block is
+    flagged for the judge rather than quietly re-serving the claim.
+    """
+    span = (span or "").strip()
+    if not span or not text:
+        return text
+    if span in text:
+        return text.replace(span, CORRECTION_MARKER, 1)
+    idx = text.lower().find(span.lower())
+    if idx >= 0:
+        return text[:idx] + CORRECTION_MARKER + text[idx + len(span):]
+    return f"[reported wrong: {span}]\n{text}"

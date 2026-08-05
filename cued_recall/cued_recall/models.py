@@ -72,6 +72,12 @@ class Block:
     # store written before this field existed.
     question_text: str = ""
     verification: Verification = Verification.unknown
+    # The part of this block the user reported wrong, in the verifier's own
+    # quote of it (Phase 4.2 / F4). Empty on every block not corrected with a
+    # span. When present, recall admits the block with the span redacted
+    # instead of suppressing the whole block -- 90% of a block that is right
+    # keeps being usable.
+    correction_span: str = ""
     # User-set: exempt from decay and from consolidation, at any age. Retrieval
     # is the only evidence this system gathers on its own that a memory matters,
     # which leaves no way to say "keep this" about one that has not been needed

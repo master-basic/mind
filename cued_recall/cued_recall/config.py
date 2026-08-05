@@ -245,6 +245,13 @@ class VerifierConfig:
         self.endpoint: str = d.get("endpoint", "")
         # How much of the previous answer to show the classifier.
         self.max_chars: int = d.get("max_chars", 1200)
+        # Span-level corrections (Phase 4.2 / F4). On, a "yes" verdict also
+        # quotes the offending part of the answer, and recall admits the
+        # corrected block with that span redacted instead of suppressing the
+        # whole block -- 90% of a block that is right keeps being usable.
+        # Off by default: the yes/no prompt is the version eval_correction.py
+        # measured, and the span quote needs its own eval before it is trusted.
+        self.spans: bool = d.get("spans", False)
 
 
 class TaggerConfig:
