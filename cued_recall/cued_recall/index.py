@@ -77,6 +77,15 @@ class VectorIndex:
             m = re.search(r"float\[(\d+)\]", row[0])
             if m and int(m.group(1)) != self.dim:
                 c.execute("DROP TABLE block_vec")
+        # "which blocks belong to conversation X, turn Y?" is asked up to four
+        # times per user turn (shelve_previous_turn, detect_and_apply_correction,
+        # verify_correction_with_model, apply_accepted_verification). Without
+        # this it is a full table scan each time, and the answer is a handful of
+        # rows out of thousands.
+        c.execute("""
+            CREATE INDEX IF NOT EXISTS idx_blocks_conversation_turn
+            ON blocks (conversation_id, turn_index)
+        """)
         c.execute(f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS block_vec USING vec0(
                 block_id TEXT PRIMARY KEY,
@@ -468,6 +477,22 @@ class VectorIndex:
                 ORDER BY b.created_at ASC
                 LIMIT ?
             """, (limit,)).fetchall()
+        return [r[0] for r in rows]
+
+    def block_ids_for_turn(self, conversation_id: str,
+                           turn_index: int) -> List[str]:
+        """Every block written by one turn of one conversation.
+
+        Served by idx_blocks_conversation_turn. This used to be list_meta(
+        limit=10000) followed by a Python filter -- an O(store) read, several
+        times per user turn, for an answer that is a handful of rows.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT block_id FROM blocks "
+                "WHERE conversation_id=? AND turn_index=?",
+                (conversation_id, turn_index),
+            ).fetchall()
         return [r[0] for r in rows]
 
     def count_blocks_without_vectors(self) -> int:

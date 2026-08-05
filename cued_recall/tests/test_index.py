@@ -182,6 +182,35 @@ class TestMeta:
         index.set_pinned("pin", True)
         assert index.decay_candidates(purge_age_s=1) == ["old"]
 
+    def test_block_ids_for_turn_selects_exactly_one_turn(self, index):
+        add(index, "a", [1, 0, 0, 0], conversation_id="c1", turn_index=0)
+        add(index, "b", [0, 1, 0, 0], conversation_id="c1", turn_index=0)
+        add(index, "c", [0, 0, 1, 0], conversation_id="c1", turn_index=1)
+        add(index, "d", [0, 0, 0, 1], conversation_id="c2", turn_index=0)
+        assert sorted(index.block_ids_for_turn("c1", 0)) == ["a", "b"]
+        assert index.block_ids_for_turn("c1", 1) == ["c"]
+        assert index.block_ids_for_turn("c9", 0) == []
+
+    def test_block_ids_for_turn_uses_the_index(self, index):
+        # The point of the change: a covering index rather than a scan. Called
+        # up to four times per user turn, so a scan here is a scan per turn.
+        add(index, "a", [1, 0, 0, 0])
+        plan = index._conn.execute(
+            "EXPLAIN QUERY PLAN SELECT block_id FROM blocks "
+            "WHERE conversation_id=? AND turn_index=?", ("c1", 0)
+        ).fetchall()
+        detail = " ".join(str(r[-1]) for r in plan)
+        assert "idx_blocks_conversation_turn" in detail
+        assert "SCAN" not in detail
+
+    def test_block_ids_for_turn_is_not_capped(self, index):
+        # The old implementation read list_meta(limit=10000) and filtered in
+        # Python, so past 10,000 blocks it started returning wrong answers
+        # rather than slow ones.
+        for i in range(50):
+            add(index, f"b{i}", [1, 0, 0, 0], turn_index=0)
+        assert len(index.block_ids_for_turn("c1", 0)) == 50
+
     def test_blocks_due_for_judging_puts_never_judged_first(self, index):
         add(index, "judged", [1, 0, 0, 0], created_at=0.0)
         add(index, "fresh", [0, 1, 0, 0], created_at=0.0)

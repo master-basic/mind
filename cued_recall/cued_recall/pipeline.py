@@ -2104,13 +2104,15 @@ class Pipeline:
                 })
 
     def _find_turn_blocks(self, conversation_id: str, turn_index: int) -> List[str]:
-        all_meta = self.index.list_meta(limit=10000)[0]
-        return [
-            m["block_id"]
-            for m in all_meta
-            if m["conversation_id"] == conversation_id
-            and m["turn_index"] == turn_index
-        ]
+        """Which blocks a given turn wrote.
+
+        One indexed query. This was list_meta(limit=10000) plus a Python
+        filter, called up to four times per user turn -- so a store of a few
+        thousand blocks meant tens of thousands of rows built into dicts and
+        thrown away, per turn, to find three of them. It also silently answered
+        wrong above 10,000 blocks, since the limit truncated the scan.
+        """
+        return self.index.block_ids_for_turn(conversation_id, turn_index)
 
     async def _shelve_block_id(self, block_id: str):
         await asyncio.to_thread(self.index.update_status, block_id, "shelved")

@@ -106,9 +106,7 @@ def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_ru
         # The budget travels on each event rather than being read from config
         # here: the router has no config handle, and a historical turn should
         # show the budget that was actually in force when it ran.
-        events = [e for e in wal.read_all()
-                  if e.get("event") == "recall_budget"]
-        return {"turns": list(reversed(events[-limit:]))}
+        return {"turns": wal.tail_events(limit, event="recall_budget")}
 
     @router.get("/tags")
     async def list_tags():
@@ -125,7 +123,10 @@ def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_ru
         if block is None:
             raise HTTPException(status_code=404, detail="block not found")
         meta = index.get_meta(block_id)
-        history = [e for e in wal.read_all() if e.get("block_id") == block_id]
+        # Bounded and newest-first. A block's whole history is a handful of
+        # events, and reading the entire log to find them got slower every day
+        # the server stayed up.
+        history = wal.tail_events(200, block_id=block_id)
         return {"block": block.to_msgpack(), "meta": meta, "wal_events": history}
 
     @router.post("/blocks/{block_id}/verify")
@@ -247,7 +248,7 @@ def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_ru
     async def stats():
         block_counts = index.stats()
         block_files = len(list(store.blocks_dir.glob("*.msgpack")))
-        wal_events = len(wal.read_all())
+        wal_events = wal.count()
         # A block whose embed failed at creation keeps its text, reports status
         # 'shelved', and appears here as a healthy block -- while being
         # unrecallable forever. Nothing in the running system used to say so:
