@@ -43,8 +43,10 @@ one defect nobody had ranked turned out to be the largest.
 | 8 | `82c4ef7` Measure the two embed_source settings, and find the judge does not hold | Phase 0.3 | F2 refuted |
 | 9 | `6ecd9c3` Show the judge the question, not the answer | Phase 4 (roadmap item 4) | the real defect |
 | 10 | `79b7526` Spend the recall budget on relevance, not on nearness | Phase 2.1, 2.2 | F6 |
+| 11 | `5116538` Give decay a gradient, and stop losing the evidence it runs on | Phase 3.2, 3.3 | F5, F13 |
+| 12 | `372b965` Derive one block from several, and refuse the merge when it garbles them | Phase 3.1 | F1 |
 
-182 unit tests, no servers needed, under six seconds.
+232 unit tests, no servers needed, under ten seconds.
 
 ### 1 — Test seam (Phase 0.1)
 
@@ -297,6 +299,81 @@ count), and `token_sink` fed `judge.interval_tokens` a word count — ~30% low o
 prose and worse on code, so the judge was waiting for materially more material
 than the number claimed.
 
+### 11 — Decay gets a gradient, and keeps its evidence (Phase 3.2, 3.3)
+
+Done in that order because a decay rule needs a signal that survives a restart
+before it is worth scoring against.
+
+**3.3.** A block recalled into a turn and then not objected to is the only
+positive evidence this system gathers on its own — and it lived in a dict on
+`Pipeline`, capped at 500 entries and dropped on every restart, while the decay
+rules consuming it kept running. It moves into the index as a `turn_recalls`
+table plus an `uncontested_recalls` counter. Taking a turn's record *consumes*
+it, so a retried turn cannot count the same evidence twice; a block already
+marked corrected earns nothing, since it was recalled into the very turn that
+contradicted it; and the counter keeps climbing after `verification` saturates
+at "accepted", because a state cannot express "used weekly" and a counter can.
+
+**3.2.** `recall_count > 0` made one recall, ever, a permanent exemption from
+age-based purging: the system could say "used" and "never used" and nothing
+between, so a block recalled once eighteen months ago outranked one recalled
+every week, and the store could only grow. Utility is now recalls and
+uncontested recalls converted into days of life earned, spent against time
+since the block was last *useful* rather than since it was written — otherwise
+a block that keeps being recalled still ages out on a fixed schedule, which is
+the same bug in a different costume. The age gate still comes first, and a pin
+still exempts outright.
+
+`report_decay.py` runs the real rule against the real store and prints what a
+pass would purge and why, writing nothing. On the live 396-block store the old
+and new rules currently agree exactly — 37 blocks, all corrected — so the
+change is a no-op there today. Worth being able to check before a pass rather
+than after.
+
+Three tests in `test_judge_decay.py` asserted the old immortality rule. They
+documented behaviour rather than endorsing it, and were rewritten rather than
+deleted.
+
+### 12 — The abstraction pass, and what it got wrong (Phase 3.1)
+
+The missing half of the whole analysis: the store records every episode and
+never reduces many into one. The pass clusters blocks above
+`merge_cluster_sim`, asks for one note that holds across them, stores it with a
+`parents` link, and retires the originals reversibly — status flipped, vector
+dropped, **file always kept even when `purge_deletes_file` is on**. Decay is
+"this stopped being worth keeping"; a merge is "this is better said elsewhere";
+they must not share a delete.
+
+**Off by default, and the first real run showed why.** Three genuine
+near-duplicates about DNS latency merged to:
+
+> "setting `dns.cache_ttl=300` … reduces the cache TTL **from 30 seconds to
+> 60ms**"
+
+The originals said the TTL *was* 30s and that first-lookup *latency* fell from
+840ms to 60ms. Two quantities conflated and 840 lost — a generalisation that
+was never true, about to have its evidence retired behind it.
+
+So "keep every specific" is now **checked rather than requested**.
+`_lost_specifics` pools numbers, paths and dotted identifiers across the
+members and refuses any merge that drops one. Re-run, the same cluster is
+rejected for `dropped specifics` and all three originals stay shelved. It
+cannot catch the conflation — only the dropped number — but a merge that loses
+a number is not one to trust with the rest.
+
+Three bugs the tests caught, all the same shape: `index.query` filters on
+status alone, so every rule that stopped a block being a *seed* had to be
+applied again to cluster *members*. Without it a pinned, corrected or
+still-warm block could be pulled in and retired behind a merge it was never
+eligible for — a pin especially, for which being merged is the one thing it
+must prevent. Two more in my own first cut: the size guard compared against the
+largest single member (rejecting every real merge — it must be the members'
+*combined* size), and a refused cluster was re-reached from each of its members
+for another generation each.
+
+Verified live: a good merge takes 88 tokens to 40 in 1.9 s; the bad one is
+refused.
+
 ---
 
 ## Not done
@@ -305,7 +382,7 @@ Blocked on nothing — these are simply next.
 
 | Plan item | Why not yet |
 |---|---|
-| **Phase 3** — prototype merging, graded decay, persistent acceptance (F1, F5, F13) | The speculative phase, and the one the standing decision-gate note argues against starting before continuity is shown to justify its cost. 3.2 (graded decay) and 3.3 (persist the acceptance signal) are cheap and independent of the LLM-merging part; 3.1 is not. |
+| **Phase 3.1 — deciding whether to turn merging on** | Built and defaulted off. Before enabling it on a real store: snapshot, set `merge_enabled: true`, run a pass, and read the `blocks_merged` and `merge_rejected` WAL events. The one merge measured so far was factually wrong and correctly refused; that is a sample of one. |
 | **Phase 4.2** — span-level corrections (F4) | Needs new output from `verifier.py` (a span, not a yes/no). Phase 4.1 landed. |
 | **Phase 5** — tag/gist retrieval channel, similarity floor (F3, F10, F11) | Worth revisiting: §9 measured the gist at 17/18 recall and 0/6 trap leakage, which is the first evidence that the taxonomy carries real signal rather than being decoration. The similarity floor (5.2) is independent and cheap. |
 | **Phase 7.1** — block persistence off the response path (F8) | Straight durability fix, needs no eval. |
@@ -333,6 +410,15 @@ Recorded here because both documents are committed and now partly wrong:
   candidate pool and then requires TTFT within +100 ms, which on a single-slot
   CPU judge at ~55 ms a call cannot both hold. Implemented as a reorder of the
   existing pool, with widening as a documented knob.
+- `update_plan.md` Phase 3.1 says to mark merged originals `truncated`. That
+  status is still recallable (`index.query` accepts `shelved` and `truncated`),
+  so the merged block and all its members would compete for the same budget —
+  the opposite of the intent. They are retired to `purged` instead, which is
+  the codebase's existing reversible "out of recall, still on disk" state.
+- `semantic-mind.md` F1 assumes the abstraction is worth having once built. The
+  one merge measured against the real judge was factually wrong. The pass ships
+  off, with a verifier that catches dropped specifics; whether a 1.5B model can
+  generalise safely at all is still open.
 
 ## Reproducing
 
