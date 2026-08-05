@@ -100,6 +100,60 @@ class TestRenderLocal:
         assert tz_label
 
 
+class TestClockHost:
+    def test_accepts_time_akamai_variants(self):
+        for u in ["https://time.akamai.com", "https://time.akamai.com/?iso",
+                  "https://time.akamai.com/?iso&ms", "http://time.akamai.com"]:
+            assert Pipeline._is_clock_host(u), u
+
+    def test_other_hosts_are_not_clock(self):
+        assert not Pipeline._is_clock_host("https://www.accuweather.com")
+        assert not Pipeline._is_clock_host("https://example.com")
+        assert not Pipeline._is_clock_host("")
+        assert not Pipeline._is_clock_host("not a url")
+
+
+class TestWebFetchClockIntercept:
+    @pytest.mark.asyncio
+    async def test_time_akamai_fetch_returns_authoritative_answer(self, pipeline):
+        # Whatever the model fetches, this host must return the formatted clock
+        # answer -- not the raw ISO that triggers a whole verification wall.
+        p = Pipeline.__new__(Pipeline)
+        p.config = pipeline.config
+        p.wal = None
+        p._is_clock_host = staticmethod(Pipeline._is_clock_host)
+        fetched = []
+        async def stub_fetch(url):
+            fetched.append(url)
+            return "FETCHED " + url
+        async def stub_clock(q):
+            return "CLOCK ANSWER " + q
+        p._fetch_url = stub_fetch
+        p._clock_answer = stub_clock
+        results = await p._handle_tool_calls(
+            [], [{"id": "tc1", "function": {"name": "web_fetch",
+                                            "arguments": '{"url": "https://time.akamai.com"}'}}])
+        assert results[0]["content"] == "CLOCK ANSWER current date and time"
+        assert fetched == []  # _fetch_url was never touched
+
+    @pytest.mark.asyncio
+    async def test_non_clock_fetch_still_uses_fetch_url(self, pipeline):
+        p = Pipeline.__new__(Pipeline)
+        p.config = pipeline.config
+        p.wal = None
+        p._is_clock_host = staticmethod(Pipeline._is_clock_host)
+        fetched = []
+        async def stub_fetch(url):
+            fetched.append(url)
+            return "FETCHED " + url
+        p._fetch_url = stub_fetch
+        results = await p._handle_tool_calls(
+            [], [{"id": "tc1", "function": {"name": "web_fetch",
+                                            "arguments": '{"url": "https://example.com/x"}'}}])
+        assert "FETCHED https://example.com/x" in results[0]["content"]
+        assert fetched == ["https://example.com/x"]
+
+
 class TestTimeIntentConfig:
     def test_web_search_config_exposes_the_switch(self, config):
         ws = config.web_search

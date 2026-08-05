@@ -1119,25 +1119,14 @@ class Pipeline:
         # Date/time intent: answer against the live clock API, never a scraped
         # snippet, which search engines serve from stale caches.
         if ws.time_intent and _time_intent(query):
-            tz = await self._resolve_timezone()
-            now = await self._fetch_clock(tz)
-            if now is not None:
-                local_dt, tz_label, source = now
-                if self.wal:
-                    self.wal.write({
-                        "event": "web_search_time",
-                        "query": query,
-                        "timezone": tz_label,
-                        "datetime": local_dt.isoformat(),
-                        "source": source,
-                        "timestamp": time.time(),
-                    })
-                return self._format_clock(local_dt, tz_label, source, query)
+            answer = await self._clock_answer(query)
+            if answer is not None:
+                return answer
             if self.wal:
                 self.wal.write({
                     "event": "web_search_error",
                     "backend": "time_api",
-                    "error": f"clock API unavailable ('{tz}'); falling through to search",
+                    "error": "clock API unavailable; falling through to search",
                     "query": query,
                     "timestamp": time.time(),
                 })
@@ -1275,6 +1264,40 @@ class Pipeline:
             f"from memory, system hints, or other snippets: this is the "
             f"authoritative current date/time for the request '{query}'."
         )
+
+    @staticmethod
+    def _is_clock_host(url: str) -> bool:
+        """True when the model asked to fetch time.akamai.com directly. The user
+        explicitly directs clock calls there, so these must yield the clean
+        authoritative answer instead of a raw ISO string the model then has to
+        convert -- which is what made it launch a whole verification wall.
+        """
+        try:
+            host = (urlparse(url).netloc or "").lower()
+        except Exception:
+            return False
+        return host in ("time.akamai.com", "www.time.akamai.com", "time.akama.com")
+
+    async def _clock_answer(self, query: str) -> Optional[str]:
+        """Return the formatted authoritative date/time for a clock request,
+        or None if no clock source responded. Shared by the web_search
+        date/time path and web_fetch of time.akamai.com.
+        """
+        tz = await self._resolve_timezone()
+        now = await self._fetch_clock(tz)
+        if now is None:
+            return None
+        local_dt, tz_label, source = now
+        if self.wal:
+            self.wal.write({
+                "event": "web_search_time",
+                "query": query,
+                "timezone": tz_label,
+                "datetime": local_dt.isoformat(),
+                "source": source,
+                "timestamp": time.time(),
+            })
+        return self._format_clock(local_dt, tz_label, source, query)
 
     @staticmethod
     def _strip_html(s: str) -> str:
@@ -1636,7 +1659,14 @@ class Pipeline:
             try:
                 if name == "web_fetch":
                     url = args.get("url", "")
-                    content = "No URL provided" if not url else (await self._fetch_url(url))[:8000]
+                    if not url:
+                        content = "No URL provided"
+                    elif self._is_clock_host(url):
+                        ans = await self._clock_answer("current date and time")
+                        content = ans if ans is not None else (
+                            await self._fetch_url(url))[:8000]
+                    else:
+                        content = (await self._fetch_url(url))[:8000]
                 elif name == "web_search":
                     query = args.get("query", "")
                     content = "No query provided" if not query else await self._web_search(query)
