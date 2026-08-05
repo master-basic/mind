@@ -1,6 +1,6 @@
 import shutil
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 import yaml
 
 
@@ -456,6 +456,26 @@ class Config:
         # runs. The margin is nearly free -- 450 ms against a prefill measured
         # in tens of seconds.
         self.exact_count_threshold: float = raw.get("exact_count_threshold", 0.6)
+        # Cap on tokens emitted per tool round. Reasoning models emit long
+        # think traces before any visible answer; without a hard cap a stuck
+        # model can stream megabytes of reasoning, never return a finish_reason
+        # or a tool call, and leave the client to time out and show an empty
+        # turn. Set to null to disable the cap (unbounded upstream behaviour).
+        self.max_completion_tokens: Optional[int] = raw.get(
+            "max_completion_tokens", 8192
+        )
+        # Tool-call rounds allowed per turn. When a model keeps requesting
+        # tools past this budget (repeated web_search), the pipeline forces one
+        # final plain-text round so the turn ends with an answer, not an empty
+        # stream. Raised blindly it multiplies inference cost and context per
+        # turn without fixing that, hence the forced-answer instead of 20.
+        self.max_tool_rounds: int = raw.get("max_tool_rounds", 5)
+        # When a forced answer round runs (see pipeline._stream_and_blockify),
+        # disable the model's think phase so it writes a reply immediately
+        # instead of spending the whole output budget on reasoning and being
+        # cut off empty. Uses llama.cpp's chat_template_kwargs.enable_thinking.
+        # Set false for a server/model whose template does not support it.
+        self.forced_answer_no_think: bool = raw.get("forced_answer_no_think", True)
         self.web_search = WebSearchConfig(raw.get("web_search", {}))
 
     def get_server(self, name: str) -> ServerConfig:

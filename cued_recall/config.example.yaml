@@ -61,6 +61,18 @@ chars_per_token: 3.2
 # Held back from the context window for the reply. Must cover a reasoning
 # model's think trace, which is generated before any visible output.
 context_reserve_tokens: 4096
+# Cap on tokens emitted per tool round. A stuck reasoning model otherwise
+# streams megabytes of think trace with no finish_reason or tool call, and the
+# client times out into an empty turn. null disables the cap.
+max_completion_tokens: 8192
+# Tool-call rounds per turn. When a model keeps requesting tools past this,
+# the pipeline forces one final plain-text round so the turn cannot end empty.
+max_tool_rounds: 5
+# Forced answer rounds run with the think phase disabled (llama.cpp
+# chat_template_kwargs.enable_thinking) so the model writes a reply
+# immediately instead of re-spending the budget on reasoning. Set false if
+# the server/model template does not support chat_template_kwargs.
+forced_answer_no_think: true
 # Above this fraction of the budget, stop estimating and have the server
 # tokenize the prompt exactly (one ~450 ms call, only near the limit).
 exact_count_threshold: 0.6

@@ -1645,9 +1645,26 @@ class Pipeline:
         r"<parameter=([\w\-]+)>(.*?)</parameter>", re.DOTALL,
     )
 
+    @staticmethod
+    def _detect_repetition(text: str, min_len: int = 200, min_count: int = 3) -> bool:
+        """True if a fixed-width block of text is repeated several times.
+
+        A reasoning model that gets stuck loops the same paragraph verbatim,
+        so a near-identical trace repeats the same blocks over and over. Used
+        on the non-streaming reply to force a no-think answer round instead of
+        letting a stuck trace be the final turn.
+        """
+        if not text or len(text) < min_len * min_count:
+            return False
+        step = max(1, min_len // 2)
+        for start in range(0, len(text) - min_len, step):
+            if text.count(text[start:start + min_len]) >= min_count:
+                return True
+        return False
+
     @classmethod
     def _parse_fallback_tool_calls(cls, text: str) -> List[dict]:
-        """Parse a Hermes-style textual tool call some fine-tunes fall back to
+        """Parse a Hermes-style tool call some fine-tunes fall back to
         instead of emitting a properly structured tool_calls delta -- notably
         abliterated/uncensored merges, whose alignment-removal training often
         degrades structured-output adherence as a side effect. Recognizing
@@ -1797,7 +1814,7 @@ class Pipeline:
         reasoning_content_parts: List[str] = []
         t0 = time.time()
         token_count = 0
-        MAX_TOOL_ROUNDS = 5
+        max_rounds = self.config.max_tool_rounds
 
         # Strict OpenAI-compatible clients (the AI SDK used by opencode, etc.)
         # expect every chunk to carry the full envelope -- id/object/created/
@@ -1845,11 +1862,24 @@ class Pipeline:
         # (the old code did a single non-streaming follow-up and stopped).
         messages = list(augmented_messages)
         async with httpx.AsyncClient() as client:
-            for _round in range(MAX_TOOL_ROUNDS):
+            _round = 0
+            forced_answer = False
+            while True:
+                # A model that kept requesting tools past the budget gets one
+                # forced plain-text pass; a ceiling afterwards guarantees the
+                # turn always ends rather than looping on tool requests.
+                if _round > max_rounds:
+                    break
                 tool_calls_by_index = {}
                 round_content = ""
                 tool_fallback_filter = self.ToolCallFallbackFilter()
                 reasoning_fallback_filter = self.ToolCallFallbackFilter()
+                # Repetition guard state: a stuck reasoning model repeats the
+                # same paragraph verbatim. Signatures of the reasoning tail
+                # catch that, so the round can stop and force a real answer.
+                repetition_detected = False
+                rc_accum = ""
+                sig_seen = {}
                 try:
                     fitted = await self._fit_messages(messages, body)
                 except RuntimeError as e:
@@ -1884,6 +1914,25 @@ class Pipeline:
                     # Hard rule: force web_search on the first round only.
                     if force_search and _round == 0:
                         payload["tool_choice"] = self._force_search_choice()
+                    # Forced answer round: forbid tools so the model must write
+                    # a plain-text reply instead of requesting web tools again.
+                    if forced_answer:
+                        payload["tool_choice"] = "none"
+                        # A reasoning model would otherwise spend its whole
+                        # output budget thinking and be cut off empty. Disable
+                        # the think phase so it answers immediately.
+                        if self.config.forced_answer_no_think:
+                            payload["chat_template_kwargs"] = {
+                                "enable_thinking": False}
+                    # Bound each round's output: a runaway reasoning trace
+                    # otherwise streams forever with no finish_reason or tool
+                    # call, and the client times out into an empty turn.
+                    # Respect a smaller cap the client already sent.
+                    cap = self.config.max_completion_tokens
+                    if cap is not None:
+                        have = payload.get("max_tokens")
+                        if have is None or have > cap:
+                            payload["max_tokens"] = cap
                     try:
                         r = await client.send(
                             client.build_request(
@@ -2012,6 +2061,19 @@ class Pipeline:
                             if rc_out:
                                 reasoning_content_parts.append(rc_out)
                                 yield sse({"reasoning_content": rc_out})
+                            # Repetition guard. Accumulate the reasoning tail
+                            # and count fixed-width signatures; once an
+                            # identical block shows up several times the model
+                            # is looping, so stop this round and force an
+                            # immediate answer instead of streaming forever.
+                            rc_accum += rc
+                            if len(rc_accum) >= 256:
+                                sig = rc_accum[-220:]
+                                sig_seen[sig] = sig_seen.get(sig, 0) + 1
+                                if sig_seen[sig] >= 4:
+                                    repetition_detected = True
+                                    break
+                                rc_accum = rc_accum[-220:]
                         delta = delta_obj.get("content", "")
                         if not delta:
                             continue
@@ -2047,6 +2109,23 @@ class Pipeline:
                 finally:
                     await resp.aclose()
 
+                # A round that was cut off by max_tokens with no answer, or
+                # that started repeating itself verbatim, was a stuck think
+                # trace. Give the model one last chance to answer without
+                # tools (with the think phase disabled).
+                if (not forced_answer and (repetition_detected or (
+                        not tool_calls_by_index and not round_content
+                        and upstream_finish == "length"))):
+                    forced_answer = True
+                    messages = messages + [{
+                        "role": "user",
+                        "content": ("Your thinking was cut off or started "
+                                    "repeating. Stop thinking and write your "
+                                    "final answer now, concisely, without "
+                                    "calling any tools."),
+                    }]
+                    continue
+
                 # No tools requested -> this was the final answer.
                 if not tool_calls_by_index:
                     break
@@ -2058,7 +2137,7 @@ class Pipeline:
                 # the client executes them and sends the results back as a
                 # new request. Running them through _handle_tool_calls here
                 # would answer every one with "Unknown tool", which the model
-                # then retries -- burning MAX_TOOL_ROUNDS inference passes and
+                # then retries -- burning max_tool_rounds inference passes and
                 # leaving the client believing no tool was ever called.
                 foreign = [c for c in calls if c["name"] not in self.OWN_TOOLS]
                 if foreign:
@@ -2093,6 +2172,20 @@ class Pipeline:
                     ],
                 }
                 messages = messages + [assistant_msg] + tool_results
+
+                # Budget exhausted but the model still wants tools. Instead of
+                # ending the turn with an empty answer, force one plain-text
+                # pass using what has already been gathered.
+                _round += 1
+                if _round >= max_rounds and not forced_answer:
+                    forced_answer = True
+                    messages = messages + [{
+                        "role": "user",
+                        "content": ("You have used all your tool calls. Answer "
+                                    "the user's question now from the tool "
+                                    "results already returned, without calling "
+                                    "tools again."),
+                    }]
 
         splitter.flush()
 
@@ -2185,11 +2278,18 @@ class Pipeline:
         turn_index: int,
         force_search: bool = False,
     ) -> dict:
-        # Tool-call loop: keep calling the LLM until no more tool_calls (max 5 rounds)
+        # Tool-call loop: keep calling the LLM until no more tool_calls. A
+        # per-round token cap stops a runaway reasoning trace, and a forced
+        # plain-text round when the budget is exhausted means the turn ends
+        # with an answer, never an empty result.
         messages = list(augmented_messages)
-        for _round in range(5):
-            t0 = time.time()
-            async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient() as client:
+            _round = 0
+            forced_answer = False
+            while True:
+                if _round > self.config.max_tool_rounds:
+                    break
+                t0 = time.time()
                 fitted = await self._fit_messages(messages, body)
                 # Same overflow recovery as the streaming path: retry once
                 # against the token count the server itself reported before
@@ -2199,6 +2299,20 @@ class Pipeline:
                     # Hard rule: force web_search on the first round only.
                     if force_search and _round == 0:
                         payload["tool_choice"] = self._force_search_choice()
+                    # Forced answer round: forbid tools so the model must write
+                    # a plain-text reply instead of requesting web tools again.
+                    if forced_answer:
+                        payload["tool_choice"] = "none"
+                        # Same think-phase disable as the streaming path.
+                        if self.config.forced_answer_no_think:
+                            payload["chat_template_kwargs"] = {
+                                "enable_thinking": False}
+                    # Same per-round output cap as the streaming path.
+                    cap = self.config.max_completion_tokens
+                    if cap is not None:
+                        have = payload.get("max_tokens")
+                        if have is None or have > cap:
+                            payload["max_tokens"] = cap
                     try:
                         resp = await client.post(
                             f"{self.config.reasoning_endpoint}/v1/chat/completions",
@@ -2244,38 +2358,78 @@ class Pipeline:
                     break
                 resp.raise_for_status()
                 result = resp.json()
-            elapsed = time.time() - t0
+                elapsed = time.time() - t0
 
-            self._report_usage(result.get("usage") or {})
+                self._report_usage(result.get("usage") or {})
 
-            usage = result.get("usage") or {}
-            completion_tokens = usage.get("completion_tokens")
-            if completion_tokens is None:
-                content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-                completion_tokens = len(content.split())
-            if self.tps_sink:
-                self.tps_sink(completion_tokens, elapsed)
+                usage = result.get("usage") or {}
+                completion_tokens = usage.get("completion_tokens")
+                if completion_tokens is None:
+                    content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    completion_tokens = len(content.split())
+                if self.tps_sink:
+                    self.tps_sink(completion_tokens, elapsed)
 
-            message = result.get("choices", [{}])[0].get("message", {})
-            tool_calls = message.get("tool_calls")
+                message = result.get("choices", [{}])[0].get("message", {})
+                tool_calls = message.get("tool_calls")
 
-            if not tool_calls:
-                break
+                # A non-streaming reply whose reasoning trace loops verbatim
+                # is a stuck model. Force a no-think answer round.
+                if (not tool_calls
+                        and self._detect_repetition(
+                            message.get("reasoning_content") or "")
+                        and not forced_answer):
+                    forced_answer = True
+                    messages.append({
+                        "role": "user",
+                        "content": ("Your thinking was repeating itself. Stop "
+                                    "thinking and write your final answer now, "
+                                    "concisely, without calling tools."),
+                    })
+                    continue
 
-            # Tools we don't implement belong to the client -- hand the whole
-            # response back untouched so it can run them, instead of replying
-            # "Unknown tool" to itself for MAX rounds. See the streaming path.
-            if any(tc.get("function", {}).get("name") not in self.OWN_TOOLS
-                   for tc in tool_calls):
-                return result
+                # A capped run with no tool call and no answer was a pure
+                # reasoning trace cut off by max_tokens. Give the model one
+                # last chance to answer without tools.
+                if (not tool_calls and not (message.get("content") or "")
+                        and (message.get("finish_reason") or "") == "length"
+                        and not forced_answer):
+                    forced_answer = True
+                    messages.append({
+                        "role": "user",
+                        "content": ("Your reasoning was cut off before you "
+                                    "answered. Write your final answer now, "
+                                    "concisely, without calling any tools."),
+                    })
+                    continue
 
-            # Execute tool calls and append results
-            tool_results = await self._handle_tool_calls(messages, tool_calls)
-            messages.append(message)
-            messages.extend(tool_results)
-        else:
-            # If loop exhausted, take whatever the LLM gave us
-            pass
+                if not tool_calls:
+                    break
+
+                # Tools we don't implement belong to the client -- hand the whole
+                # response back untouched so it can run them, instead of replying
+                # "Unknown tool" to itself for MAX rounds. See the streaming path.
+                if any(tc.get("function", {}).get("name") not in self.OWN_TOOLS
+                       for tc in tool_calls):
+                    return result
+
+                # Execute tool calls and append results
+                tool_results = await self._handle_tool_calls(messages, tool_calls)
+                messages.append(message)
+                messages.extend(tool_results)
+
+                # Budget exhausted but the model still wants tools. Force one
+                # plain-text pass using what has already been gathered.
+                _round += 1
+                if _round >= self.config.max_tool_rounds and not forced_answer:
+                    forced_answer = True
+                    messages.append({
+                        "role": "user",
+                        "content": ("You have used all your tool calls. Answer "
+                                    "the question now from the tool results "
+                                    "already returned, without calling tools "
+                                    "again."),
+                    })
 
         response_text = message.get("content", "") or ""
         reasoning_content = message.get("reasoning_content", "") or ""
