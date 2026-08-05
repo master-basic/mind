@@ -1,0 +1,45 @@
+{
+  "note_source": "reasoning",
+  "per_relation": {
+    "exact": {
+      "shipped": 6,
+      "task-match": 1,
+      "same-step": 6
+    },
+    "paraphrase": {
+      "shipped": 6,
+      "task-match": 1,
+      "same-step": 5
+    },
+    "crosslingual": {
+      "shipped": 6,
+      "task-match": 1,
+      "same-step": 6
+    },
+    "trap": {
+      "shipped": 5,
+      "task-match": 1,
+      "same-step": 5
+    }
+  },
+  "summary": {
+    "shipped": {
+      "recall_kept": 18,
+      "recall_total": 18,
+      "trap_leaked": 5,
+      "trap_total": 6
+    },
+    "task-match": {
+      "recall_kept": 3,
+      "recall_total": 18,
+      "trap_leaked": 1,
+      "trap_total": 6
+    },
+    "same-step": {
+      "recall_kept": 17,
+      "recall_total": 18,
+      "trap_leaked": 5,
+      "trap_total": 6
+    }
+  }
+}

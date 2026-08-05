@@ -167,6 +167,111 @@ Cost: ~150 judge calls for the sweep, serial, on a CPU 1.5B. In the pipeline the
 calls for one turn run concurrently through the shared small-model semaphore,
 bounded by `recall.judge_timeout_s` (5 s), and a timeout keeps the block.
 
+## The false-fire figure above does not describe the running system
+
+Measured 2026-08-05. **The 0.00 is an artefact of the harness, not a property
+of the judge.** It should be read as an upper bound on the judge's ability, not
+as what the pipeline does.
+
+Everything above used each seed's *prompt* on both sides of the pipeline: as the
+text embedded to represent a stored block, and as the note shown to the judge.
+No block this system writes looks like that. A reasoning block's key is
+`build_stimulus(question, answer, reading)` and its text is a think trace of
+several thousand characters; a result block's key and text are the answer. So
+the sweep measured question-to-question similarity and question-to-question
+relevance, and the geometry the store actually has had never been swept at all.
+
+`make_seed_blocks.py` closes that gap: it runs each seed prompt once against the
+reasoning model with no middleware and records the think trace and the answer,
+so a seed can be represented the way the store really represents it.
+`eval_retrieval.py --key-source {prompt,composite,content}` then sweeps the two
+settings of `embed_source` on the representation each one actually produces.
+
+At the shipped operating point (threshold 0.48, k=4, judge on), with the judge
+shown `block.text` as `_filter_by_relevance` does:
+
+| | prompt (harness) | composite (shipped) | content (proposed) |
+|---|---|---|---|
+| recall | 0.75 | 0.96 | 0.96 |
+| false-fire | **0.00** | **0.64** | **0.45** |
+| trap fired | 0/6 | 5/6 | 5/6 |
+| distractor fired | 0/6 | 5/6 | 4/6 |
+| control fired | 0/5 | 2/5 | 1/5 |
+
+The production evidence agrees with the second and third columns. `grading_traps.md`
+records `ocr1-trap` injecting 2,005 tokens of the seed's client-side stack into a
+phase-2 question and the answer anchoring on it. If the judge really refused 6 of
+6 traps in production, that could not have happened.
+
+### It is not length, and it is not the embed key
+
+`eval_judge_notes.py` isolates it. Holding the pair fixed and varying only what
+the judge is shown as the note:
+
+| note shown to the judge | chars (ocr1) | legitimate recall kept | traps leaked |
+|---|---|---|---|
+| seed prompt (harness) | 208 | 18/18 | **0/6** |
+| the answer | 8,463 | 18/18 | **5/6** |
+| the think trace (production) | 10,627 | 18/18 | **5/6** |
+
+Answer and trace behave identically despite a 25% length difference, so it is not
+the size of the note. It is that a real block *contains the answer material*, and
+the shipped prompt asks whether the note "contains information that would change
+or improve the answer" — for a phase-1 note against a phase-2 question about the
+same codebase, that is honestly yes. The refusal cases are listed afterwards as
+exceptions, and on a 1.5B model reading 8,000 characters they are what gets lost.
+
+Legitimate recall is untouched in every variant. This is specifically and only a
+failure to say no.
+
+### Rewording the prompt did not fix it
+
+Two candidate rewordings, scored on the same pairs (`--variants`):
+
+| wording | legitimate recall | traps leaked |
+|---|---|---|
+| shipped | 18/18 | 5/6 |
+| task-match ("same task, or different task on the same system?") | **3/18** | 1/6 |
+| same-step (stage test first, as the question) | 17/18 | 5/6 |
+
+One collapsed recall, the other changed nothing. Tuning further against six trap
+examples would be fitting noise, so the shipped wording stands and the problem is
+recorded rather than papered over.
+
+### What this changes
+
+`semantic-mind.md` ranks "embed reasoning blocks from their own text" first, on
+the theory that the composite is what makes traps score 0.841 and that fixing the
+representation stops them scoring high in the first place. Measured, it does not.
+Trap mean top-similarity goes 0.756 → 0.698 under `content`, still far above the
+0.48 threshold, and *every* relation drops by roughly the same amount — so the
+separation between exact and trap gets slightly **worse** (0.140 → 0.109), not
+better. `content` is modestly better on false fires (0.64 → 0.45) on n=11, which
+is a real but small effect and not the mechanism the roadmap claimed.
+
+So `embed_source` stays `composite`. Both texts are stored on every block, so the
+decision is reversible with a re-embed if a larger corpus says otherwise.
+
+The defect that is real, and larger than the analysis estimated, is the judge's
+inability to refuse related-but-wrong material when it reads an actual block.
+That is roadmap item 4, not item 1, and it is not a prompt-wording problem.
+
+Reproducing:
+
+```
+python make_seed_blocks.py
+python eval_retrieval.py --key-source composite --judge --json baseline_composite.json
+python eval_retrieval.py --key-source content   --judge --json baseline_content.json
+python eval_judge_notes.py --variants
+```
+
+Two harness bugs found and fixed while doing this. The embedding cache was keyed
+on the *number* of corpus rows, so any experiment that changed the key text
+while keeping the row count silently scored the previous run's vectors — it is
+keyed on a hash of the text now. And the sweep table printed a `│`, which is
+un-encodable in the console's cp1252 and crashed the run whenever output was
+redirected to a file.
+
 ## Judge throughput
 
 The review's "a large store will never finish a pass" is answerable now that
