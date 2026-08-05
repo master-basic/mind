@@ -160,6 +160,29 @@ judge:
   # Sweep at least this often even with no new material, so decay still happens
   # during a quiet week.
   sweep_interval_s: 21600
+  # How long an unconsumed recall record is kept. Only the turn immediately
+  # after a recall reads one back, so anything older belongs to a conversation
+  # abandoned mid-turn. Swept once per judge pass.
+  recall_record_ttl_s: 604800
+  # Decay by earned utility rather than by "was it ever recalled".
+  #
+  # The rule this replaced made one recall, ever, a permanent exemption from
+  # age-based purging: the system could say "used" and "never used" and nothing
+  # in between, so a block recalled once eighteen months ago outranked one
+  # recalled weekly, and the store could only grow. Set False to restore it --
+  # this decides what gets deleted, and deletion is the one thing the index
+  # cannot undo on its own.
+  utility_decay: true
+  # Days of idleness a single recall earns. A block recalled once survives a
+  # month of being ignored, then goes.
+  utility_recall_weight: 30.0
+  # Extra days for a recall the user did not contradict. Worth more than a bare
+  # recall: being shown to the model and not objected to is better evidence
+  # than merely being shown.
+  utility_uncontested_weight: 60.0
+  # Utility at or below this purges, once past the age gate above. Zero means
+  # "has spent more idle days than it earned".
+  utility_floor: 0.0
 tagger:
   enabled: true
   endpoint: ""

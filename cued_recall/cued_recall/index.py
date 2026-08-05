@@ -77,6 +77,32 @@ class VectorIndex:
             m = re.search(r"float\[(\d+)\]", row[0])
             if m and int(m.group(1)) != self.dim:
                 c.execute("DROP TABLE block_vec")
+        # Which blocks recall served into which turn. This lived in a plain
+        # dict on Pipeline, capped at 500 entries and lost on every restart --
+        # so the one positive signal the system gathers on its own (a block was
+        # put in front of the model and the user did not object) was erased by
+        # a process restart, while the decay rules that consume it kept running.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS turn_recalls (
+                conversation_id TEXT,
+                turn_index INTEGER,
+                block_id TEXT,
+                created_at REAL,
+                PRIMARY KEY (conversation_id, turn_index, block_id)
+            )
+        """)
+        # Read by (conversation_id, turn_index) on the next turn, and swept by
+        # created_at.
+        c.execute("""
+            CREATE INDEX IF NOT EXISTS idx_turn_recalls_age
+            ON turn_recalls (created_at)
+        """)
+        # How many times a block was recalled into a turn and then not
+        # contradicted. Distinct from recall_count, which counts being served
+        # and says nothing about whether it helped.
+        if "uncontested_recalls" not in existing_cols:
+            c.execute("ALTER TABLE blocks ADD COLUMN "
+                      "uncontested_recalls INTEGER DEFAULT 0")
         # "which blocks belong to conversation X, turn Y?" is asked up to four
         # times per user turn (shelve_previous_turn, detect_and_apply_correction,
         # verify_correction_with_model, apply_accepted_verification). Without
@@ -479,6 +505,72 @@ class VectorIndex:
             """, (limit,)).fetchall()
         return [r[0] for r in rows]
 
+    def record_recall(self, conversation_id: str, turn_index: int,
+                      block_ids: List[str], ts: float):
+        """Note that recall served these blocks into this turn.
+
+        Durable on purpose: the next turn reads it back to decide whether the
+        user objected, and that verdict feeds decay. Held in memory it was lost
+        on restart and silently dropped past 500 entries.
+        """
+        if not block_ids:
+            return
+        with self._lock:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO turn_recalls "
+                "(conversation_id, turn_index, block_id, created_at) "
+                "VALUES (?,?,?,?)",
+                [(conversation_id, turn_index, b, ts) for b in block_ids],
+            )
+            self._conn.commit()
+
+    def take_recalled_into_turn(self, conversation_id: str,
+                                turn_index: int) -> List[str]:
+        """The blocks recall served into one turn, consuming the record.
+
+        Consumed rather than read, so a turn's evidence is counted once however
+        many times the caller runs -- a retried or duplicated turn must not
+        inflate a block's standing.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT block_id FROM turn_recalls "
+                "WHERE conversation_id=? AND turn_index=?",
+                (conversation_id, turn_index),
+            ).fetchall()
+            if rows:
+                self._conn.execute(
+                    "DELETE FROM turn_recalls "
+                    "WHERE conversation_id=? AND turn_index=?",
+                    (conversation_id, turn_index),
+                )
+                self._conn.commit()
+        return [r[0] for r in rows]
+
+    def prune_turn_recalls(self, older_than_s: float) -> int:
+        """Drop recall records nobody will ever read back.
+
+        Only the immediately following turn consumes one, so anything older
+        than a generous window is a conversation that was abandoned mid-turn.
+        Without this the table grows for the life of the store.
+        """
+        cutoff = time.time() - older_than_s
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM turn_recalls WHERE created_at < ?", (cutoff,)
+            )
+            self._conn.commit()
+            return cur.rowcount or 0
+
+    def increment_uncontested(self, block_id: str):
+        with self._lock:
+            self._conn.execute(
+                "UPDATE blocks SET uncontested_recalls="
+                "COALESCE(uncontested_recalls, 0) + 1 WHERE block_id=?",
+                (block_id,),
+            )
+            self._conn.commit()
+
     def block_ids_for_turn(self, conversation_id: str,
                            turn_index: int) -> List[str]:
         """Every block written by one turn of one conversation.
@@ -523,6 +615,11 @@ class VectorIndex:
 
         Returns a superset -- the caller re-checks each one against the real
         rule, so this query and that rule cannot drift apart.
+
+        No longer filtered on `recall_count = 0`. Under utility decay a block
+        that was recalled can still go stale, so pre-filtering them out here
+        would have made the new rule unreachable for exactly the blocks it
+        exists to judge.
         """
         cutoff = time.time() - purge_age_s
         with self._lock:
@@ -530,8 +627,7 @@ class VectorIndex:
                 SELECT block_id FROM blocks
                 WHERE status IN ('shelved', 'truncated')
                   AND COALESCE(pinned, 0) = 0
-                  AND (verification = 'corrected'
-                       OR (COALESCE(recall_count, 0) = 0 AND created_at < ?))
+                  AND (verification = 'corrected' OR created_at < ?)
                 ORDER BY created_at ASC
                 LIMIT ?
             """, (cutoff, limit)).fetchall()

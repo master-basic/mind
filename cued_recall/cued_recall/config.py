@@ -135,6 +135,35 @@ class JudgeConfig:
         # Run a pass this often even when no new material has arrived, so
         # decay still happens during a quiet week.
         self.sweep_interval_s: int = d.get("sweep_interval_s", 21600)
+        # How long an unconsumed turn_recalls row is kept. Only the turn
+        # immediately after a recall reads one back, so anything older belongs
+        # to a conversation that was abandoned mid-turn. Generous, because the
+        # rows are tiny and the cost of dropping one early is a block that
+        # never gets credit for having been useful.
+        self.recall_record_ttl_s: int = d.get("recall_record_ttl_s", 604800)
+        # Decay by earned utility rather than by "was it ever recalled".
+        #
+        # The old rule made one recall, ever, a permanent exemption from
+        # age-based purging -- the system could say "used" and "never used" and
+        # nothing in between, so a block recalled once eighteen months ago
+        # outranked one recalled weekly and the store could only grow. Set
+        # False to restore that rule; it stays switchable because this decides
+        # what gets deleted, and deletion is the one thing the index cannot
+        # undo on its own.
+        self.utility_decay: bool = d.get("utility_decay", True)
+        # Days of life a single recall earns. 30 means a block recalled once
+        # survives a month of being ignored, then goes -- against the old rule,
+        # where it survived forever.
+        self.utility_recall_weight: float = d.get("utility_recall_weight", 30.0)
+        # Extra days for a recall the user did not contradict. Worth more than
+        # a bare recall: being shown to the model and not objected to is better
+        # evidence than merely being shown. See Pipeline.apply_accepted_verification.
+        self.utility_uncontested_weight: float = d.get(
+            "utility_uncontested_weight", 60.0
+        )
+        # Utility at or below this purges (once past the age gate). Zero means
+        # "has spent more idle days than it earned".
+        self.utility_floor: float = d.get("utility_floor", 0.0)
 
 
 class VerifierConfig:

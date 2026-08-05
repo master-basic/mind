@@ -200,6 +200,14 @@ class Judge:
         counts["decay_purged"] = decayed
         counts["processed"] = decayed + counts["visited"]
 
+        # Recall records whose turn never arrived: a conversation abandoned
+        # mid-turn leaves one behind, and nothing else would ever remove it.
+        pruned = await asyncio.to_thread(
+            self.index.prune_turn_recalls, self.config.judge.recall_record_ttl_s
+        )
+        if pruned:
+            counts["recall_records_pruned"] = pruned
+
         # Once per pass, not per block: blocks that lost their embedding are
         # invisible to recall but indistinguishable from healthy ones by status,
         # so without a periodic count the condition never surfaces on its own.
@@ -232,12 +240,15 @@ class Judge:
             meta = await asyncio.to_thread(self.index.get_meta, bid)
             verification = meta.get("verification", "unknown") if meta else "unknown"
             recall_count = meta.get("recall_count", 0) if meta else 0
+            uncontested = (meta or {}).get("uncontested_recalls") or 0
+            last_recalled = (meta or {}).get("last_recalled") or 0.0
             source = meta.get("verification_source", "") if meta else ""
             pinned = bool((meta or {}).get("pinned") or block.pinned)
             age = time.time() - block.created_at
             if not self._should_purge(verification, recall_count, age,
                                       worthless=False, source=source,
-                                      pinned=pinned):
+                                      pinned=pinned, uncontested=uncontested,
+                                      last_recalled=last_recalled):
                 continue
             await self._purge_block(block)
             removed += 1
@@ -246,7 +257,12 @@ class Judge:
                 "block_id": bid,
                 "action": "purge",
                 "reason": ("corrected" if verification == "corrected"
-                           else "never_recalled"),
+                           else "never_recalled" if recall_count == 0
+                           else "utility_exhausted"),
+                "recall_count": recall_count,
+                "uncontested_recalls": uncontested,
+                "utility": round(self._utility(recall_count, uncontested, age,
+                                               last_recalled), 2),
                 # Which verdict earned it, so a purge can be traced back to a
                 # regex, a classifier, or a button.
                 "verification_source": source,
@@ -338,9 +354,40 @@ class Judge:
         return "truncate", {"was": was, "got": got, "model_call": True,
                             "truncate_count": block.truncate_count}
 
+    def _utility(self, recall_count: int, uncontested: int, age: float,
+                 last_recalled: float = 0.0) -> float:
+        """How much a block has earned its place, as a number rather than a flag.
+
+        The old rule was `recall_count > 0` and nothing else: one recall, ever,
+        made a block permanently exempt from age-based purging. So the system
+        could express "used" and "never used" and nothing in between -- a block
+        recalled once eighteen months ago outranked one recalled every week,
+        because both were simply "used".
+
+        Three terms, all in the same currency of days-of-life earned:
+
+        - each recall is worth recall_weight days,
+        - each *uncontested* recall is worth uncontested_weight more, because
+          being shown to the model and not contradicted is better evidence than
+          merely being shown,
+        - and it decays with the time since the block was last useful, not
+          since it was created -- otherwise a block that keeps being recalled
+          still ages out on a fixed schedule.
+        """
+        cfg = self.config.judge
+        earned = (recall_count * cfg.utility_recall_weight
+                  + uncontested * cfg.utility_uncontested_weight)
+        # Idle time, not age: a block recalled last week is not stale merely
+        # because it was written a year ago. Falls back to age for a block that
+        # was never recalled, where the two are the same thing.
+        idle = age if not last_recalled else max(0.0, time.time() - last_recalled)
+        return earned - (idle / 86400.0)
+
     def _should_purge(self, verification: str, recall_count: int,
                       age: float, worthless: bool,
-                      source: str = "", pinned: bool = False) -> bool:
+                      source: str = "", pinned: bool = False,
+                      uncontested: int = 0,
+                      last_recalled: float = 0.0) -> bool:
         """Decay, as plain arithmetic.
 
         A corrected answer is actively harmful if it is recalled again, so it
@@ -363,10 +410,17 @@ class Judge:
         |           | known miss reads "now do the same for the firewall" as   |
         |           | a complaint.                                             |
 
-        Everything else has to have been never once recalled -- retrieval is
-        the only evidence this system gathers on its own that a memory is
-        load-bearing, which is exactly why a pin exists for the memories it
-        cannot gather it about.
+        Everything else is decided by utility rather than by a flag. Retrieval
+        is still the only evidence this system gathers on its own that a memory
+        is load-bearing, but "was it ever retrieved" is too blunt a reading of
+        it: a block recalled once, long ago, was permanently exempt from
+        purging, so the store could only ever grow. _utility turns recalls into
+        days of life earned and spends them against idle time, so a memory that
+        keeps being used keeps being kept and one that stopped being used
+        eventually goes.
+
+        A pin still exempts a block outright -- that is the mechanism for the
+        memories retrieval cannot gather evidence about.
         """
         cfg = self.config.judge
         if pinned:
@@ -377,11 +431,18 @@ class Judge:
             if source == "pattern":
                 return recall_count == 0 and age > cfg.corrected_grace_s
             # source == "model", or unrecorded: no special power, fall through.
-        if recall_count > 0:
+        floor = cfg.worthless_age_s if worthless else cfg.purge_age_s
+        if age <= floor:
+            # Never purge a young block however unused: the age gate is what
+            # keeps a quiet week from emptying the store.
             return False
-        if worthless:
-            return age > cfg.worthless_age_s
-        return age > cfg.purge_age_s
+        if not cfg.utility_decay:
+            # The pre-2026-08-05 rule, kept switchable because this changes
+            # what gets deleted and deletion is the one thing that cannot be
+            # undone from the index alone.
+            return recall_count == 0
+        return self._utility(recall_count, uncontested, age,
+                             last_recalled) <= cfg.utility_floor
 
     def _user_prompt(self, stimulus: str, text: str, abridged: bool) -> str:
         """The consolidation prompt.

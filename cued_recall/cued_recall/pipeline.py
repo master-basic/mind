@@ -147,12 +147,13 @@ class Pipeline:
         self.chat_sink = None
         self.tagger = None
         self.verifier = None
-        # Which blocks recall actually served, per (conversation_id, turn).
-        # A block that was recalled and then not objected to is the only
-        # positive verification signal this system can observe; see
-        # apply_accepted_verification. In memory only -- losing it on restart
-        # costs nothing but a few unknowns.
-        self._recalled_by_turn: dict = {}
+        # Which blocks recall served into which turn now lives in the index
+        # (turn_recalls), not here. It was a dict capped at 500 and dropped on
+        # restart, which meant the only positive verification signal this
+        # system can observe -- a block was shown to the model and the user did
+        # not object -- was erased by a restart while the decay rules that
+        # consume it kept running. See apply_accepted_verification.
+        #
         # None = not yet known. Set False the first time the judge server
         # rejects or omits logprobs, so later calls stop asking and fall back
         # to parsing yes/no. Mirrors Judge._supports_schema.
@@ -2050,17 +2051,25 @@ class Pipeline:
             [b.block_id for b, _ in recall_blocks],
         )
 
+    # How long a recall record is worth keeping. Only the immediately
+    # following turn ever consumes one, so anything past this belongs to a
+    # conversation that was abandoned mid-turn.
+    RECALL_RECORD_TTL_S = 7 * 86400
+
     def _remember_recalled(self, conversation_id: str, turn_index: int,
                            block_ids: List[str]):
+        """Record which blocks recall served into this turn.
+
+        In the index, not in memory. This was a dict capped at 500 entries and
+        dropped on restart -- so the only positive evidence the system gathers
+        on its own, that a block was put in front of the model and the user
+        carried on, was erased by a restart while the decay rules that consume
+        it kept running.
+        """
         if not block_ids:
             return
-        self._recalled_by_turn[(conversation_id, turn_index)] = block_ids
-        # Only the immediately previous turn is ever read back, so this is a
-        # short tail, not a history. Bound it so a long-running server does not
-        # accumulate one entry per turn forever.
-        if len(self._recalled_by_turn) > 500:
-            for key in list(self._recalled_by_turn)[:250]:
-                del self._recalled_by_turn[key]
+        self.index.record_recall(conversation_id, turn_index, block_ids,
+                                 time.time())
 
     async def _split_reasoning(
         self, text: str, conversation_id: str, turn_index: int, now: float
@@ -2233,17 +2242,30 @@ class Pipeline:
         real event -- it was put in front of the model, it shaped an answer,
         and the user carried on. That is the only positive signal available
         here, so it is the only one used.
+
+        Read from the index rather than from memory, so a restart between the
+        recall and the next turn no longer erases the evidence. Consuming the
+        record also makes the count idempotent: a retried turn cannot inflate
+        a block's standing.
         """
         prev_turn = turn_index - 1
         if prev_turn < 0:
             return
-        block_ids = self._recalled_by_turn.pop(
-            (conversation_id, prev_turn), []
+        block_ids = await asyncio.to_thread(
+            self.index.take_recalled_into_turn, conversation_id, prev_turn
         )
         for bid in block_ids:
             meta = await asyncio.to_thread(self.index.get_meta, bid)
             # Anything already corrected stays corrected: a later turn that
-            # happens to recall it must not launder that away.
+            # happens to recall it must not launder that away. The counter is
+            # gated on the same test, so a contradicted block gains no credit
+            # from having been recalled into the turn that contradicted it.
+            if meta and meta.get("verification") == "corrected":
+                continue
+            # Counted every time, not just on the first. Verification is a
+            # state and saturates; this is the gradient decay needs to tell
+            # "used once, long ago" from "used every week".
+            await asyncio.to_thread(self.index.increment_uncontested, bid)
             if meta and meta.get("verification") == "unknown":
                 await asyncio.to_thread(
                     self.index.update_verification, bid, "accepted",
