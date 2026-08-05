@@ -172,6 +172,63 @@ class TestRankedFill:
         assert [b.block_id for b, _ in got] == ["good"]
 
     @pytest.mark.asyncio
+    async def test_a_pin_is_admitted_before_an_equally_scored_unpinned(self, rig):
+        # F14 in one case: two blocks, equal relevance, only one fits the
+        # budget. The pin used to buy nothing -- the block that sorted first
+        # took the slot regardless. Now it is the tie-break.
+        p, set_hits, set_scores = rig
+        a = block(60, "unpinned")
+        b = block(60, "pinned")
+        b.pinned = True
+        seed(p, [a, b])
+        set_hits([("unpinned", 0.90), ("pinned", 0.80)])
+        set_scores({"unpinned": 0.90, "pinned": 0.90})
+        got = await p.recall_blocks("q")
+        assert [x.block_id for x, _ in got] == ["pinned"]
+
+    @pytest.mark.asyncio
+    async def test_relevance_still_beats_a_pin(self, rig):
+        # The pin is a tie-break, never the primary key: relevance decides
+        # what fits, so a clearly more relevant unpinned block still wins the
+        # budget over a marginal pinned one.
+        p, set_hits, set_scores = rig
+        a = block(60, "relevant")
+        b = block(60, "pin")
+        b.pinned = True
+        seed(p, [a, b])
+        set_hits([("pin", 0.99), ("relevant", 0.60)])
+        set_scores({"pin": 0.55, "relevant": 0.95})
+        got = await p.recall_blocks("q")
+        assert [x.block_id for x, _ in got] == ["relevant"]
+
+    @pytest.mark.asyncio
+    async def test_pin_priority_off_restores_the_old_order(self, rig):
+        p, set_hits, set_scores = rig
+        p.config.recall.pin_priority = False
+        a = block(60, "unpinned")
+        b = block(60, "pinned")
+        b.pinned = True
+        seed(p, [a, b])
+        set_hits([("unpinned", 0.90), ("pinned", 0.80)])
+        set_scores({"unpinned": 0.90, "pinned": 0.90})
+        got = await p.recall_blocks("q")
+        assert [x.block_id for x, _ in got] == ["unpinned"]
+
+    @pytest.mark.asyncio
+    async def test_a_pin_breaks_ties_without_the_judge(self, rig):
+        # The no-judge path ranks by similarity; the pin still breaks an
+        # equal-similarity tie in the fill order.
+        p, set_hits, set_scores = rig
+        p.config.recall.judge_enabled = False
+        a = block(60, "unpinned")
+        b = block(60, "pinned")
+        b.pinned = True
+        seed(p, [a, b])
+        set_hits([("unpinned", 0.90), ("pinned", 0.90)])
+        got = await p.recall_blocks("q")
+        assert [x.block_id for x, _ in got] == ["pinned"]
+
+    @pytest.mark.asyncio
     async def test_without_the_judge_similarity_order_is_kept(self, rig):
         p, set_hits, set_scores = rig
         p.config.recall.judge_enabled = False

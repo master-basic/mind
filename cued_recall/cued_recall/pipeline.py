@@ -547,8 +547,15 @@ class Pipeline:
         # Only embed a bounded slice for the recall query: a pasted file can be
         # far larger than the embed model's context.
         query_text = truncate_tokens(user_message, 512)
-        # Recall is best-effort: if the embed server errors (e.g. input still too
-        # large), skip recall for this turn rather than 500 the whole chat.
+        cfg = self.config.recall
+        source = "vector"
+        # Recall is best-effort: if the embed server errors (e.g. input still
+        # too large, or the server down), skip recall for this turn rather
+        # than 500 the whole chat. With the keyword channel on, an embed
+        # outage degrades to keyword overlap instead of silently recalling
+        # nothing -- the whole store vanishing for the turn is the failure
+        # mode this exists to prevent, and the relevance judge (a different
+        # server) still arbitrates what the keyword query surfaces.
         try:
             embed_vec = await asyncio.to_thread(self.embed.embed, query_text)
         except Exception as e:
@@ -557,14 +564,38 @@ class Pipeline:
                 "error": str(e),
                 "timestamp": time.time(),
             })
-            return []
-        cfg = self.config.recall
-        results = await asyncio.to_thread(
-            self.index.query,
-            embed_vec,
-            cfg.k * cfg.candidate_multiplier,
-            cfg.threshold,
-        )
+            if not cfg.tag_channel:
+                return []
+            source = "keywords"
+            try:
+                results = await asyncio.to_thread(
+                    self.index.keyword_query,
+                    query_text,
+                    cfg.k * cfg.candidate_multiplier,
+                )
+            except Exception:
+                return []
+        else:
+            results = await asyncio.to_thread(
+                self.index.query,
+                embed_vec,
+                cfg.k * cfg.candidate_multiplier,
+                cfg.threshold,
+            )
+            # Below the cosine floor the best candidate is not worth a judge
+            # call: it would take 1.5-2.2 s of CPU calls to conclude "nothing
+            # here" (measured, evaluate/throughput.md). The floor trades that
+            # tax for whatever recall lived below it, which is why it defaults
+            # off -- config.example.yaml explains what a safe value would need.
+            if (cfg.judge_enabled and results
+                    and results[0][1] < cfg.floor):
+                self.wal.write({
+                    "event": "recall_floor",
+                    "best_similarity": round(results[0][1], 4),
+                    "floor": cfg.floor,
+                    "timestamp": time.time(),
+                })
+                results = []
         # Why a candidate did not make it into the prompt was invisible: the
         # turn log recorded only how many blocks were admitted. Counted here so
         # the admin panel can show budget pressure -- a high skipped_oversized
@@ -595,13 +626,20 @@ class Pipeline:
             scored = await self._score_by_relevance(query_text, candidates)
             kept = [t for t in scored if t[2] >= cfg.judge_score_floor]
             rejected_by_judge = len(scored) - len(kept)
-            # Stable within equal scores, so a tie falls back to the cosine
-            # order the index returned rather than to dict iteration luck.
-            kept.sort(key=lambda t: t[2], reverse=True)
         else:
             # No judge: similarity is the only ranking available, and results
             # already arrive in that order.
             kept = [(b, sim, sim) for b, sim in candidates]
+        # Rank for the budget fill. A pin is a user's explicit "keep this",
+        # and it used to buy nothing at retrieval: an equally-scored unpinned
+        # block that sorted first could take the last slot. The pin is the
+        # tie-break -- relevance still decides what fits, a pin only decides
+        # between equals. Stable, so a non-pin tie falls back to the cosine
+        # order the index returned rather than to dict iteration luck.
+        if cfg.pin_priority:
+            kept.sort(key=lambda t: (t[2], int(t[0].pinned)), reverse=True)
+        elif cfg.judge_enabled:
+            kept.sort(key=lambda t: t[2], reverse=True)
 
         blocks = []
         total_tokens = 0
@@ -628,6 +666,9 @@ class Pipeline:
             "skipped_missing": skipped_missing,
             "skipped_oversized": skipped_oversized,
             "tokens_used": total_tokens,
+            # "vector" normally; "keywords" when the embed server was down and
+            # recall degraded to the gist/tag channel.
+            "source": source,
             # The best relevance score this turn saw. A run of low ones with
             # blocks still admitted is the signal that judge_score_floor is
             # too generous for this store.
@@ -1740,6 +1781,26 @@ class Pipeline:
 
         splitter.flush()
 
+        full_reasoning = (
+            "".join(reasoning_content_parts) + "".join(splitter.reasoning_parts)
+        )
+        full_result = "".join(splitter.result_parts)
+
+        # Durability before the completion signal (F8). The block writes are
+        # fast and local, so they run before the finish_reason/[DONE] chunks: a
+        # client that stops reading at the completion signal is guaranteed the
+        # turn is in the store. Only the embedding -- a network call that can
+        # take seconds -- is deferred to a background task; a dropped embed
+        # shows up under blocks_missing_vectors and is repairable via backfill
+        # rather than becoming silent memory loss.
+        embeddable = await self._create_blocks(
+            full_reasoning, full_result, user_message, reading_content,
+            recall_blocks, conversation_id, turn_index, response_text,
+            defer_embeds=True,
+        )
+        if embeddable:
+            asyncio.create_task(self._embed_blocks(embeddable))
+
         # Terminating chunk: an empty delta carrying finish_reason. Strict
         # OpenAI-compatible clients use this -- not [DONE] -- to finalize the
         # assembled message; without it the stream ends with no completion
@@ -1767,16 +1828,6 @@ class Pipeline:
         elapsed = time.time() - t0
         if self.tps_sink:
             self.tps_sink(token_count, elapsed)
-
-        full_reasoning = (
-            "".join(reasoning_content_parts) + "".join(splitter.reasoning_parts)
-        )
-        full_result = "".join(splitter.result_parts)
-
-        await self._create_blocks(
-            full_reasoning, full_result, user_message, reading_content,
-            recall_blocks, conversation_id, turn_index, response_text,
-        )
 
         if self.token_sink:
             # The estimator, not a word count. This feeds judge.interval_tokens
@@ -1968,7 +2019,17 @@ class Pipeline:
         conversation_id: str,
         turn_index: int,
         response_text: str,
-    ):
+        defer_embeds: bool = False,
+    ) -> Optional[List[Block]]:
+        """Persist the turn's blocks; optionally defer embedding (F8).
+
+        The fast, local part -- split, store.put, index metadata -- always runs
+        here, so the caller can place it before the client-visible completion
+        chunks and close the window in which a disconnect after [DONE] lost
+        the turn's memory. With `defer_embeds=True` the embedding network call
+        is skipped and the embeddable blocks are returned for the caller to
+        hand to a background task.
+        """
         now = time.time()
 
         reasoning_blocks = []
@@ -2034,6 +2095,9 @@ class Pipeline:
                 block.recall_count, block.last_recalled,
             )
 
+        if defer_embeds:
+            return [b for b in all_blocks if self._embed_source_text(b)]
+
         embed_tasks = []
         for block in all_blocks:
             if self._embed_source_text(block):
@@ -2050,6 +2114,18 @@ class Pipeline:
             conversation_id, turn_index,
             [b.block_id for b, _ in recall_blocks],
         )
+
+    async def _embed_blocks(self, blocks: List[Block]):
+        """Best-effort embedding for blocks persisted before [DONE] (F8).
+
+        Runs as a background task, so a disconnect after [DONE] neither cancels
+        nor delays it. A failed embed is recorded (embed_store_error) and the
+        block surfaces under blocks_missing_vectors, repairable via backfill,
+        rather than being lost silently.
+        """
+        if not blocks:
+            return
+        await asyncio.gather(*(self._embed_and_store(b) for b in blocks))
 
     # How long a recall record is worth keeping. Only the immediately
     # following turn ever consumes one, so anything past this belongs to a

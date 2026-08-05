@@ -119,6 +119,37 @@ def relevance_prompt(question: str, note: str) -> str:
     )
 
 
+STOPWORDS = frozenset(
+    "a an and are as at be but by for from has have how i if in into is it its "
+    "me my not of on or our so than that the their them then there these they "
+    "this to was we what when where which who will with you your would should "
+    "could can do does did just very really about".split()
+)
+
+
+def distinctive_terms(text: str, max_terms: int = 8) -> List[str]:
+    """Distinctive words to search the keyword channel with.
+
+    The non-vector fallback (and, later, the tag second source) matches a
+    query's words against each block's gist and tags. Function words and
+    fragments match every block, so they are dropped; the longest remaining
+    words are kept because they carry the most information per match. Terms
+    are restricted to word characters, which also keeps them safe as SQL
+    LIKE patterns (no '%' or '_').
+    """
+    words = re.findall(r"[^\W_]+", text.lower())
+    seen = set()
+    terms = []
+    for w in words:
+        if len(w) < 4 or w in STOPWORDS:
+            continue
+        if w not in seen:
+            seen.add(w)
+            terms.append(w)
+    terms.sort(key=lambda w: (-len(w), w))
+    return terms[:max_terms]
+
+
 def split_paragraph_boundary(text: str, max_tokens: int) -> Tuple[str, str]:
     paragraphs = re.split(r"(\n\s*\n)", text)
     parts = []

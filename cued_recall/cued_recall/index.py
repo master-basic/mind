@@ -252,6 +252,49 @@ class VectorIndex:
                 break
         return results
 
+    def keyword_query(self, query_text: str, k: int,
+                      status_filter: Tuple[str, ...] = ("shelved", "truncated")
+                      ) -> List[Tuple[str, float]]:
+        """The non-vector retrieval channel, used when the embed server is down.
+
+        Matches the query's distinctive words against each block's gist and
+        tags -- both already columns in the index, so no block file has to be
+        opened, which is what would make a per-turn fallback O(store). Scored
+        by the fraction of query terms the block matches: crude, but a better
+        fill order than admission luck, and the relevance judge (a different
+        server) arbitrates these candidates exactly as it does vector ones.
+
+        A query with no distinctive terms matches nothing. This deliberately
+        returns an empty list rather than everything, because matching on
+        "the" is worse than matching on nothing.
+        """
+        from .utils import distinctive_terms
+        terms = distinctive_terms(query_text)
+        if not terms:
+            return []
+        clauses = " OR ".join(["(gist LIKE ? OR tags LIKE ?)"] * len(terms))
+        params = []
+        for t in terms:
+            params += [f"%{t}%", f"%{t}%"]
+        status_ph = ",".join("?" * len(status_filter))
+        # k*20 is a generous superset for the Python scoring pass; this runs
+        # only while the embed path is down, so a LIKE scan is the honest cost.
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT block_id, gist, tags FROM blocks "
+                f"WHERE status IN ({status_ph}) AND ({clauses}) "
+                f"ORDER BY created_at DESC LIMIT ?",
+                [*status_filter, *params, k * 20],
+            ).fetchall()
+        scored = []
+        for block_id, gist, tags in rows:
+            hay = f"{gist or ''} {tags or ''}".lower()
+            hits = sum(1 for t in terms if t in hay)
+            if hits:
+                scored.append((block_id, hits / len(terms)))
+        scored.sort(key=lambda p: p[1], reverse=True)
+        return scored[:k]
+
     def get_meta(self, block_id: str) -> Optional[dict]:
         with self._lock:
             row = self._conn.execute(

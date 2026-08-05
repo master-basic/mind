@@ -69,12 +69,12 @@ one defect nobody had ranked turned out to be the largest.
 | 4.1 scope correction by block type | **done** | §4 |
 | 4.2 span-level corrections | **not done** | below |
 | 5.1 tag/gist as a retrieval channel | **not done** | below |
-| 5.2 similarity floor + embed-failure fallback | **not done** | below |
+| 5.2 similarity floor + embed-failure fallback | **done** — by deepseek, 2026-08-05 | §14 |
 | 6.1 re-embed when text changes | **done** | §6 |
 | 6.2 consistent "user's question" | **done** | §5 |
-| 7.1 blocks off the response path | **not done** | below |
+| 7.1 blocks off the response path | **done** — by deepseek, 2026-08-05 | §15 |
 | 7.2 kill the O(n) scans | **done** | §3 |
-| 7.3 pin priority in the budget | **not done** | below |
+| 7.3 pin priority in the budget | **done** — by deepseek, 2026-08-05 | §13 |
 | *cross-cutting* config surface | **partly** — keys for shipped phases only | below |
 | *cross-cutting* eval corpus rows | **not done** | below |
 | *cross-cutting* README / ARCHITECTURE / CHANGELOG | **not done** | below |
@@ -90,13 +90,13 @@ one defect nobody had ranked turned out to be the largest.
 | F5 | decay is arithmetic, not utility | **done** (§11) |
 | F6 | budget filled by geometry before the judge | **done** (§10) |
 | F7 | index/vector drift and silent vector loss | **done**, and the cause was not what F7 said (§2, §6, §7) |
-| F8 | blocks created after `[DONE]` | **open** — Phase 7.1 |
+| F8 | blocks created after `[DONE]` | **done** — by deepseek, 2026-08-05 (§15) |
 | F9 | inconsistent "last user message" | **done** (§5) |
-| F10 | single embedding space, no fallback | **open** — Phase 5.2 |
+| F10 | single embedding space, no fallback | **done** — by deepseek, 2026-08-05 (§14) |
 | F11 | tags/gist written but never used | **open** — Phase 5.1, and §9 found the gist carries real signal |
 | F12 | per-turn O(n) scans | **done** (§3) |
 | F13 | acceptance signal is in-memory | **done** (§11) |
-| F14 | pins do not help retrieval | **open** — Phase 7.3 |
+| F14 | pins do not help retrieval | **done** — by deepseek, 2026-08-05 (§13) |
 
 ### Config keys added
 
@@ -121,10 +121,12 @@ All shipped with the measured value as the default. Documented in
 | `judge.merge_min_cluster` | `3` | how many near-duplicates before generalising |
 | `judge.merge_min_age_s` | `604800` | how settled a cluster must be |
 | `judge.merge_max_per_pass` | `5` | merges per pass |
+| `recall.pin_priority` | `true` | whether a pin breaks ties in the ranked recall fill (§13, by deepseek) |
+| `recall.floor` | `0.0` | cosine floor below which the judge is skipped; **off** — the plan's 0.30 cannot fire below the 0.48 threshold and no safe value is measured yet (§14, by deepseek) |
+| `recall.tag_channel` | `true` | the gist/tag keyword channel; used as the embed-failure fallback (§14, by deepseek) |
 
-The plan also names `recall.floor`, `recall.tag_channel` and
-`recall.pin_priority`. Those belong to Phases 5 and 7.3 and do not exist yet —
-adding a key for an unimplemented behaviour would be worse than not having it.
+The plan also names `recall.floor` and `recall.tag_channel`; those now exist —
+see §14 for why `floor` shipped disabled.
 
 ### 1 — Test seam (Phase 0.1)
 
@@ -452,6 +454,120 @@ for another generation each.
 Verified live: a good merge takes 88 tokens to 40 in 1.9 s; the bad one is
 refused.
 
+### 13 — Pin priority in the budget (Phase 7.3, by deepseek)
+
+Continued on 2026-08-05 by deepseek; recorded here for later audit.
+
+F14 in one line: a pin was exempt from decay but bought nothing at retrieval.
+The budget was spent down the ranked list in `recall_blocks`, so an
+equally-scored unpinned block that sorted first could take the last slot and a
+pinned block behind it was skipped as oversized.
+
+The fix makes the pin the **tie-break** in the ranked fill, not the primary
+key: `kept.sort(key=lambda t: (score, int(block.pinned)), reverse=True)` (and
+`(similarity, pinned)` on the no-judge path). Relevance still decides what
+fits — a 0.95 unpinned block still beats a 0.55 pinned one — a pin only
+decides between equals. That was a deliberate reading of the acceptance
+criterion ("a pinned block is admitted before equally-scored unpinned ones")
+and keeps Phase 2's measured relevance-first property intact; the alternative
+("all pinned first") would displace a genuinely relevant block on an
+irrelevant pin.
+
+`recall.pin_priority`, default `true`, restores the old order exactly when
+off. Documented in `config.example.yaml`.
+
+Four tests in `test_recall_ranking.py`: a pin is admitted before an
+equally-scored unpinned under budget pressure; relevance still beats a pin;
+`pin_priority: false` restores the old cosine order; and a pin breaks ties on
+the no-judge path too. `pytest` green at 236.
+
+### 14 — The floor, and the keyword channel (Phase 5.2, by deepseek)
+
+Continued on 2026-08-05 by deepseek; recorded here for later audit.
+
+**The floor is a measurement hostage, so it shipped off.** The plan proposes
+`recall.floor: 0.30`. That number cannot fire: it sits below the shipped
+retrieval threshold (0.48), and `index.query` already refuses everything below
+the threshold, so no candidate ever has a best similarity under 0.30 — the
+judge-skip is unreachable. Same self-contradiction as Phase 2.1's `k*4`.
+
+Worse, the measured corpus has no safe value *anywhere*. `baseline_composite`
+per-relation mean top-sim: control (off-topic, should not recall) **0.4996**,
+crosslingual (the weakest legitimate family) **0.6408**, distractor 0.6409,
+trap 0.7559. A floor high enough to remove the off-topic tax (which live
+traffic measured at 0.49–0.57, throughput.md) lands right against crosslingual
+— with n=6 and only means published, I will not pick the number that can
+silently amputate a legitimate family. `recall.floor` therefore defaults to
+**0.0 (off)**: the mechanism ships (best cosine below floor → no judge call, a
+`recall_floor` WAL event, nothing recalled), tests exercise it at 0.60, and
+0.60 is documented in `config.example.yaml` as the candidate to confirm on the
+widened corpus before enabling.
+
+**The embed-failure fallback ships on.** When the embed server errors,
+`recall_blocks` used to return `[]` — the whole store silently vanishing for
+the turn. Now `index.keyword_query` (new) matches the query's distinctive words
+against each block's gist and tags — both already columns in the index, so no
+block file is opened and a per-turn fallback stays off the O(store) path. The
+keyword candidates flow through the exact same judge / ranked-budget path as
+vector candidates, so a CPU 1.5B relevance model still arbitrates what an
+embed outage surfaces. `utils.distinctive_terms` drops function words and
+fragments (a stopword query matches nothing, deliberately), keeps the longest
+words first, and is bounded to characters safe for SQL LIKE. `recall.tag_channel`
+(default `true`) gates it; `recall_budget` events now carry `source:
+"vector"|"keywords"` so an outage recall is visible in the admin panel rather
+than indistinguishable from a normal empty one.
+
+Phase 5.1 reuses `keyword_query` and `tag_channel` as the second candidate
+source in the normal path — the fallback was the excuse to build the channel,
+not its purpose.
+
+Seventeen tests in `test_recall_fallback.py` (terms, keyword query scoring and
+status filtering, floor short-circuit incl. the "at the floor judge still runs"
+boundary and the default-off guarantee, fallback on/off, corrected-block
+filtering on the fallback path). `pytest` green at 253.
+
+### 15 — Blocks off the response path (Phase 7.1 / F8, by deepseek)
+
+Continued on 2026-08-05 by deepseek; recorded here for later audit.
+
+`_create_blocks` ran after `[DONE]` was yielded, so a client disconnecting on
+receiving `[DONE]` cancelled the generator and the turn was never memorized —
+the very latest episode silently dropped. The fix splits `_create_blocks`
+into a durable part and a deferred part:
+
+- `_create_blocks(..., defer_embeds=True)` writes the blocks + index metadata
+  (the fast, local part) and returns the embeddable blocks. In the streaming
+  path this now runs *before* the finish_reason / `[DONE]` chunks, so a client
+  that stops reading at the completion signal is guaranteed the turn is in the
+  store.
+- The embedding — a network call that can take seconds — is handed to
+  `asyncio.create_task(self._embed_blocks(...))`, scheduled *before* `[DONE]`
+  so it survives the generator being closed on disconnect. A dropped embed is
+  recorded (`embed_store_error`) and surfaces under `blocks_missing_vectors`,
+  repairable via the backfill path, rather than becoming silent memory loss —
+  exactly the F8 acceptance wording.
+- The non-streaming path is untouched: `_create_blocks` is already awaited
+  before the response returns, so it keeps the default inline embed.
+
+No config flag: this changes *when* the same writes happen, not what is
+stored, and there is no old behaviour a user would want to keep (reverting to
+it means the memory-loss bug). The only observable difference is a few ms of
+local sqlite writes added before the completion chunks.
+
+The post-`[DONE]` tail (`tps_sink`, `token_sink`, `chat_sink`,
+`turn_completed`) stays where it was: those are not memory writes, and a
+disconnect dropping them is acceptable.
+
+Four tests in `test_blocks_before_done.py`: the acceptance test drives the
+real streaming generator through `process_turn` with a canned upstream
+(httpx patched), reads up to `[DONE]`, calls `agen.aclose()` the way Starlette
+does on disconnect, and asserts the blocks are in the store, the post-`[DONE]`
+tail really was skipped (no `turn_completed`), and the deferred embed failed
+loudly against the `embed=None` fixture. Plus `defer_embeds=True` persists
+without touching the embedder, `_embed_blocks` runs the deferred embeds with
+the same fail-recorded contract as inline, and the default still embeds
+inline. `pytest` green at 257.
+
 ---
 
 ## Not done
@@ -463,10 +579,7 @@ them.
 
 | Plan item | Size | Why not yet |
 |---|---|---|
-| **7.3** pin priority in the budget (F14) | small | Unblocked: Phase 2's ranked fill is the hook it needed, so a pin raises a block's effective score at fill time. Cheapest remaining item. |
-| **5.2** similarity floor + embed-failure fallback (F10) | small | Independent of 5.1. Skipping the judge below a cosine floor removes the 1.5–2.2 s off-topic tax the README already calls "Not implemented"; falling back to a keyword channel stops an embed outage meaning zero recall. |
-| **7.1** blocks off the response path (F8) | medium | Straight durability fix, needs no eval. `_create_blocks` runs after `[DONE]`, so a client disconnecting there loses the turn's memory entirely. |
-| **5.1** tag/gist as a retrieval channel (F3, F11) | medium | Newly interesting: §9 measured the gist at 17/18 recall and **0/6** trap leakage, the first evidence the taxonomy carries real signal rather than being decoration. |
+| **5.1** tag/gist as a retrieval channel (F3, F11) | medium | Newly interesting: §9 measured the gist at 17/18 recall and **0/6** trap leakage, the first evidence the taxonomy carries real signal rather than being decoration. §14's `keyword_query` is the channel; 5.1 wires it into the normal path as a second candidate source. |
 | **4.2** span-level corrections (F4) | large | Needs new output from `verifier.py` — a span, not a yes/no — so it is a model-output change, not a plumbing one. |
 | **3.1** decide whether to enable merging | judgement | Built and off. Snapshot, set `merge_enabled: true`, run a pass, read the `blocks_merged` and `merge_rejected` events. The one merge measured was factually wrong and correctly refused — a sample of one. |
 

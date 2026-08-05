@@ -68,6 +68,40 @@ class RecallConfig:
                 f"recall.judge_note must be 'question' or 'text', "
                 f"got {self.judge_note!r}"
             )
+        # A pin is a user's explicit "keep this", but it bought nothing at
+        # recall: the budget was spent down the relevance ranking, so an
+        # equally-scored unpinned block that sorted first could take the last
+        # slot. This makes the pin the tie-break in the ranked fill --
+        # relevance still decides what fits, a pin only decides between
+        # equals. Off restores the old order exactly.
+        self.pin_priority: bool = bool(d.get("pin_priority", True))
+        # Cosine similarity floor for the judge stage. When the best vector
+        # candidate is below this, the judge is not consulted and nothing is
+        # recalled -- an off-topic turn used to pay 1.5-2.2 s of CPU calls to
+        # conclude "nothing here" (evaluate/throughput.md).
+        #
+        # Defaults to 0.0 (off). The plan proposed 0.30, but that sits below
+        # recall.threshold (0.48), so as prescribed it could never fire; and
+        # the measured corpus has no safe value yet -- off-topic control
+        # probes top at ~0.50 while the weakest legitimate family (cross-
+        # lingual) tops at ~0.64, with trap/distractor above that, so a floor
+        # wide enough to remove the tax lands right against a real recall.
+        # 0.60 clears the measured live off-topic band (0.49-0.57) but needs
+        # the widened corpus to confirm it cannot cut one. Raise it only with
+        # a sweep.
+        self.floor: float = float(d.get("floor", 0.0))
+        if not (0.0 <= self.floor < 1.0):
+            raise ValueError(
+                f"recall.floor must be in [0, 1), got {self.floor!r}"
+            )
+        # The keyword channel: a query's distinctive words matched against a
+        # block's gist and tags (index.keyword_query), both already in the
+        # index. Used when the embed server errors, so an outage degrades
+        # recall to keyword overlap rather than silently recalling nothing;
+        # the relevance judge still arbitrates the keyword candidates. Phase
+        # 5.1 extends this channel into the normal retrieval path, which is
+        # when this knob's default matters most.
+        self.tag_channel: bool = bool(d.get("tag_channel", True))
 
 
 class JudgeConfig:
