@@ -41,9 +41,10 @@ one defect nobody had ranked turned out to be the largest.
 | 6 | `d0c90fb` Split what a block says from the question that produced it | Phase 1.1, 6.1 | F2, F7 |
 | 7 | `f33fdfb` Cap embed inputs by tokens, not by a guess | *not in plan* | new |
 | 8 | `82c4ef7` Measure the two embed_source settings, and find the judge does not hold | Phase 0.3 | F2 refuted |
-| 9 | *(pending commit)* Show the judge the question, not the answer | Phase 4 (roadmap item 4) | the real defect |
+| 9 | `6ecd9c3` Show the judge the question, not the answer | Phase 4 (roadmap item 4) | the real defect |
+| 10 | `79b7526` Spend the recall budget on relevance, not on nearness | Phase 2.1, 2.2 | F6 |
 
-149 unit tests, no servers needed, under six seconds.
+182 unit tests, no servers needed, under six seconds.
 
 ### 1 — Test seam (Phase 0.1)
 
@@ -239,6 +240,63 @@ corpus has no relation family covering that miss class. If recall starts
 missing things it used to find, `recall.judge_note: text` is the first knob to
 try.
 
+### 10 — Relevance decides the budget (Phase 2)
+
+The budget was filled in cosine order *before* the judge ran, so a candidate
+the judge was about to reject had already taken a slot and the slot was never
+refilled. The judge could remove admitted blocks but never influence which ones
+fit. Now: resolve candidates → score the whole set → rank → spend the budget
+down the ranked list.
+
+**The score is real, and free.** The judge server already computes logprobs;
+reading P(yes) over the first token costs **+2.4 ms a call** (n=24) and turns a
+verdict into an ordering. It separates with a wide empty band:
+
+| relation | min | mean | max |
+|---|---|---|---|
+| exact | 0.945 | 0.979 | 0.996 |
+| paraphrase | 0.928 | 0.978 | 0.998 |
+| crosslingual | 0.899 | 0.964 | 0.988 |
+| **trap** | **0.012** | **0.051** | **0.119** |
+
+So `judge_score_floor: 0.5` sits in empty space, and is the same decision the
+old yes/no parse made — **verified identical on all 24 corpus pairs**. A server
+that rejects or omits logprobs is detected once and falls back to the text,
+scoring 1.0/0.0, which is exactly the previous behaviour.
+
+**Where the plan contradicted itself.** Phase 2.1 asks for a `k*4` candidate
+pool; its own acceptance criterion requires TTFT within +100 ms. The judge
+server is single-slot CPU at ~55 ms a call, so `k*4` costs ~0.7 s — the two
+cannot both hold. Resolved by defaulting `candidate_multiplier` to **1**: this
+reorders the set the judge already saw rather than enlarging it, so the
+worst-case judge call count is unchanged at `k`. Widening is a knob with its
+cost documented beside it.
+
+Driven against the live stack:
+
+| turn | latency | admitted | judged | rejected | top score |
+|---|---|---|---|---|---|
+| same task | 572 ms | the block | 1 | 0 | 0.990 |
+| phase-2 trap | 590 ms | **nothing** | 2 | **2** | — |
+| off topic | 10 ms | nothing | 0 | 0 | — |
+
+The trap row is the `grading_traps.md` failure, refused outright.
+
+**Phase 2.2 — token-count honesty.** Tests pin that `count_tokens` uses the
+tokenizer when it answers and the estimator only when it does not; that a `0`
+from the tokenizer is not mistaken for a failure; and that the estimator never
+reads below a word count on prose, code, Azerbaijani or markdown. A structural
+test asserts `Block.token_count` is only ever set from `_count_tokens` — any
+other source is a units mismatch waiting to happen, and that bug has now cost
+this project twice (once as the recall budget, once as the embed cap).
+
+Two mislabelled counters fixed while there: the WAL's `reasoning_tokens` /
+`result_tokens` held whitespace word counts (nothing reads them, so renamed to
+`_words`, with a test that fails any field named `tokens` holding a word
+count), and `token_sink` fed `judge.interval_tokens` a word count — ~30% low on
+prose and worse on code, so the judge was waiting for materially more material
+than the number claimed.
+
 ---
 
 ## Not done
@@ -247,12 +305,11 @@ Blocked on nothing — these are simply next.
 
 | Plan item | Why not yet |
 |---|---|
-| **Phase 2** — judge-scored budget (F6) | Wants re-thinking after §9. Ranking by a judge score only helps if the score is trustworthy; it now is far more trustworthy than it was this morning, so this is the natural next item. |
 | **Phase 3** — prototype merging, graded decay, persistent acceptance (F1, F5, F13) | The speculative phase, and the one the standing decision-gate note argues against starting before continuity is shown to justify its cost. 3.2 (graded decay) and 3.3 (persist the acceptance signal) are cheap and independent of the LLM-merging part; 3.1 is not. |
 | **Phase 4.2** — span-level corrections (F4) | Needs new output from `verifier.py` (a span, not a yes/no). Phase 4.1 landed. |
 | **Phase 5** — tag/gist retrieval channel, similarity floor (F3, F10, F11) | Worth revisiting: §9 measured the gist at 17/18 recall and 0/6 trap leakage, which is the first evidence that the taxonomy carries real signal rather than being decoration. The similarity floor (5.2) is independent and cheap. |
 | **Phase 7.1** — block persistence off the response path (F8) | Straight durability fix, needs no eval. |
-| **Phase 7.3** — pin priority in the budget (F14) | Depends on Phase 2's ranked fill. |
+| **Phase 7.3** — pin priority in the budget (F14) | Unblocked now: Phase 2's ranked fill is the hook it needed. A pin would raise a block's effective score at fill time. |
 
 ## Corrections to the source documents
 
@@ -272,6 +329,10 @@ Recorded here because both documents are committed and now partly wrong:
   system".
 - `update_plan.md` Phase 1.2 ("Run it once as a migration. Vectors change; that
   is the point.") — not done, and should not be.
+- `update_plan.md` Phase 2.1 is internally inconsistent: it asks for a `k*4`
+  candidate pool and then requires TTFT within +100 ms, which on a single-slot
+  CPU judge at ~55 ms a call cannot both hold. Implemented as a reorder of the
+  existing pool, with widening as a documented knob.
 
 ## Reproducing
 
