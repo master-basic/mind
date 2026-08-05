@@ -1,6 +1,7 @@
 import os
 import re
 import shutil
+import struct
 import threading
 import time
 from pathlib import Path
@@ -200,6 +201,25 @@ class VectorIndex:
                 (block_id, packed),
             )
             self._conn.commit()
+
+    def get_vector(self, block_id: str) -> Optional[List[float]]:
+        """A block's stored embedding, for finding its neighbours.
+
+        Clustering needs to search *from* a block, and re-embedding its text to
+        get a vector that is already on disk would both cost a round trip and
+        risk disagreeing with the one the index actually matched on.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT embedding FROM block_vec WHERE block_id=?", (block_id,)
+            ).fetchone()
+        if row is None or not row[0]:
+            return None
+        # sqlite_vec ships serialize_float32 but no inverse, and the stored
+        # form is a packed little-endian float32 array -- the same thing
+        # struct reads.
+        blob = row[0]
+        return list(struct.unpack(f"<{len(blob) // 4}f", blob))
 
     def query(self, embedding: List[float], k: int,
               threshold: float,
@@ -631,6 +651,30 @@ class VectorIndex:
                 ORDER BY created_at ASC
                 LIMIT ?
             """, (cutoff, limit)).fetchall()
+        return [r[0] for r in rows]
+
+    def merge_candidates(self, min_age_s: float, types: Tuple[str, ...],
+                         limit: int = 500) -> List[str]:
+        """Blocks old and settled enough to be considered for generalising.
+
+        Oldest first, so a cluster forms around the most established member
+        rather than around whatever was written most recently. Pinned blocks
+        are excluded for the same reason they are excluded from decay: a pin
+        says "keep this exactly", and a merge does not keep it exactly.
+        """
+        cutoff = time.time() - min_age_s
+        placeholders = ",".join("?" * len(types))
+        with self._lock:
+            rows = self._conn.execute(f"""
+                SELECT block_id FROM blocks
+                WHERE status IN ('shelved', 'truncated')
+                  AND COALESCE(pinned, 0) = 0
+                  AND type IN ({placeholders})
+                  AND verification != 'corrected'
+                  AND created_at < ?
+                ORDER BY created_at ASC
+                LIMIT ?
+            """, (*types, cutoff, limit)).fetchall()
         return [r[0] for r in rows]
 
     def mark_judged(self, block_id: str, ts: float):

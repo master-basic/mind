@@ -183,6 +183,30 @@ judge:
   # Utility at or below this purges, once past the age gate above. Zero means
   # "has spent more idle days than it earned".
   utility_floor: 0.0
+  # Derive one block from several near-identical ones -- the abstraction the
+  # store has never done. It records every episode and never reduces many into
+  # one, so a question asked three times leaves three near-identical blocks,
+  # each spending judge budget and prompt tokens to say the same thing.
+  #
+  # OFF by default, and the only pass that creates a memory rather than editing
+  # one: a bad merge invents a generalisation that was never true and then
+  # retires the evidence behind it. Turn it on against a store you have a
+  # snapshot of, read the blocks_merged events in the WAL, and check what it
+  # wrote before leaving it on. The originals are retired reversibly -- status
+  # flipped and vector dropped, file always kept even when purge_deletes_file
+  # is on, restorable via /admin/blocks/restore.
+  merge_enabled: false
+  # Similarity at which two blocks count as the same ground. Well above
+  # recall.threshold: that asks "is this relevant", this asks "is this the same
+  # thing said twice".
+  merge_cluster_sim: 0.90
+  # How many near-identical blocks before generalising is worth a model call.
+  merge_min_cluster: 3
+  # Blocks younger than this are left alone -- a cluster that formed in the
+  # last hour is a conversation in progress, not a settled repetition.
+  merge_min_age_s: 604800
+  # Merges per pass. Low, because each one retires several blocks.
+  merge_max_per_pass: 5
 tagger:
   enabled: true
   endpoint: ""

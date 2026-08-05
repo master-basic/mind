@@ -81,6 +81,12 @@ class Block:
     last_recalled: float = 0.0
     tags: List[str] = field(default_factory=list)
     gist: str = ""
+    # For a merged block, the blocks it generalises. The system stores every
+    # episode and never derives what holds across them, which is the one thing
+    # a semantic memory is for; a merged block is that derivation, and this is
+    # the audit trail back to the exemplars it came from. Empty on every block
+    # written by a turn.
+    parents: List[str] = field(default_factory=list)
 
     def to_msgpack(self) -> dict:
         d = asdict(self)

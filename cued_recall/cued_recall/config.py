@@ -164,6 +164,26 @@ class JudgeConfig:
         # Utility at or below this purges (once past the age gate). Zero means
         # "has spent more idle days than it earned".
         self.utility_floor: float = d.get("utility_floor", 0.0)
+        # Derive one block from several near-identical ones.
+        #
+        # Off by default, and it is the only pass that creates a memory rather
+        # than editing one -- a bad merge invents a generalisation that was
+        # never true and then retires the evidence behind it. Turn it on
+        # against a store you have a snapshot of, read the blocks_merged WAL
+        # events, and check what it wrote before leaving it on.
+        self.merge_enabled: bool = d.get("merge_enabled", False)
+        # Cosine similarity at which two blocks count as the same ground.
+        # Well above recall.threshold (0.48): that one asks "is this relevant",
+        # this one asks "is this the same thing said twice".
+        self.merge_cluster_sim: float = d.get("merge_cluster_sim", 0.90)
+        # How many near-identical blocks it takes before generalising is worth
+        # a model call and the loss of the originals from recall.
+        self.merge_min_cluster: int = d.get("merge_min_cluster", 3)
+        # Blocks younger than this are left alone: a cluster that formed in the
+        # last hour is a conversation in progress, not a settled repetition.
+        self.merge_min_age_s: int = d.get("merge_min_age_s", 604800)
+        # Merges per pass. Low, because each one retires several blocks.
+        self.merge_max_per_pass: int = d.get("merge_max_per_pass", 5)
 
 
 class VerifierConfig:

@@ -2,13 +2,13 @@ import asyncio
 import json
 import re
 import time
-from typing import Optional
+from typing import List, Optional
 
 import httpx
 
 from .config import Config
 from .index import VectorIndex
-from .models import Block, BlockStatus, BlockType
+from .models import Block, BlockStatus, BlockType, Verification
 from .store import BlockStore
 from .utils import count_tokens, embed_source_text, truncate_tokens
 from .wal import WAL
@@ -151,6 +151,12 @@ class Judge:
         decayed = await self._decay_sweep()
         counts["purged"] += decayed
 
+        # After forgetting, before rewriting: a block the decay sweep just
+        # removed should not be merged into anything, and a block about to be
+        # merged should not first be spent on an individual rewrite.
+        merged = await self._merge_pass(deadline)
+        counts.update({f"merge_{k}": v for k, v in merged.items()})
+
         # Manual runs pass min_age=0 to judge all shelved blocks now; the
         # automatic (idle-triggered) pass uses the configured age gate.
         if min_age is None:
@@ -222,6 +228,347 @@ class Judge:
                 "timestamp": time.time(),
             })
         return counts
+
+    # A merge must be meaningfully smaller than the blocks it replaces,
+    # measured against their combined size. Above this ratio it has not
+    # generalised anything -- it has restated them and added one more
+    # near-duplicate to the index this pass exists to thin out.
+    MERGE_MAX_RATIO = 0.7
+
+    # Numbers, paths and dotted identifiers -- the things a merge is most
+    # likely to lose or garble, and the only part of "keep every specific"
+    # that can be checked rather than requested.
+    _SPECIFIC_PATTERNS = (
+        re.compile(r"\d+"),                       # 30, 300, 840
+        re.compile(r"/[\w./-]+"),                 # /etc/resolv-cache.conf
+        re.compile(r"\b\w+(?:\.\w+)+\b"),         # dns.cache_ttl
+    )
+
+    @classmethod
+    def _specifics(cls, text: str) -> set:
+        out = set()
+        for pattern in cls._SPECIFIC_PATTERNS:
+            for m in pattern.finditer(text or ""):
+                # Trailing sentence punctuation is not part of the specific.
+                # Without this, "/etc/resolv-cache.conf." at the end of a
+                # sentence never matches the same path written mid-sentence,
+                # and every merge is rejected for losing something it kept.
+                token = m.group(0).rstrip(".,;:!?)’'\"").lower()
+                if token:
+                    out.add(token)
+        return out
+
+    MERGE_SYSTEM = ("You combine several notes from one archive into a single "
+                    "note. You reply with one JSON object and nothing else.")
+
+    MERGE_SCHEMA = {
+        "type": "object",
+        "properties": {"summary": {"type": "string"}},
+        "required": ["summary"],
+    }
+
+    def _merge_prompt(self, notes: List[str]) -> str:
+        """Ask for what the notes have in common, not a list of them.
+
+        The instructions sit after the notes for the same reason the
+        consolidation prompt's do: on a 1.5B model an instruction several
+        thousand characters back is one it has stopped attending to.
+        """
+        body = "\n\n".join(f"Note {i + 1}:\n{n}" for i, n in enumerate(notes))
+        return (
+            f"Here are {len(notes)} notes from a memory archive that cover "
+            "nearly the same ground.\n\n"
+            f"{body}\n\n"
+            "Write ONE note that a future reader could use in place of all of "
+            "them.\n\n"
+            "State what holds across the notes, not what each one said "
+            "separately. Do not number them, do not refer to them as notes, "
+            "and do not write an introduction.\n"
+            # The failure this guards against is the whole risk of the pass: a
+            # merge that keeps only the theme is a lossy delete wearing a
+            # summary's clothes.
+            "Keep every specific that appears in any of them: names, numbers, "
+            "versions, file paths, commands, settings and outcomes. If two "
+            "notes disagree on a detail, keep both and say they differ.\n"
+            f"Do not go over {self.config.judge.summary_max_tokens} tokens.\n\n"
+            'Reply with {"summary": "<the note>"}.'
+        )
+
+    async def _merge_pass(self, deadline: float) -> dict:
+        """Derive what holds across near-identical blocks. Off by default.
+
+        The system stores every episode and never reduces many into one, which
+        is the single thing a semantic memory is for -- so a question asked
+        three times leaves three near-identical blocks, each consuming judge
+        budget and prompt tokens to say the same thing.
+
+        Deliberately conservative, because this is the one pass that creates
+        memories rather than editing them:
+
+        - only types the judge is already trusted to rewrite,
+        - only clusters of merge_min_cluster or more above merge_cluster_sim,
+        - the merged block records its parents, and the originals are retired
+          reversibly -- status flipped and vector dropped, file always kept,
+          even when purge_deletes_file is on. Merging is not forgetting.
+        """
+        cfg = self.config.judge
+        out = {"clusters": 0, "merged_blocks": 0, "retired": 0}
+        if not cfg.merge_enabled:
+            return out
+
+        candidates = await asyncio.to_thread(
+            self.index.merge_candidates, cfg.merge_min_age_s,
+            tuple(cfg.consolidate_types),
+        )
+        # Retired into a merge this pass -- never eligible again.
+        seen: set = set()
+        # Tried and refused this pass. Reaching the same cluster from another
+        # of its members yields the same verdict for another generation, so
+        # skip it until the next pass rather than forever.
+        attempted: set = set()
+        for bid in candidates:
+            if out["merged_blocks"] >= cfg.merge_max_per_pass:
+                break
+            if time.time() >= deadline:
+                break
+            if bid in seen or bid in attempted:
+                continue
+            vec = await asyncio.to_thread(self.index.get_vector, bid)
+            if vec is None:
+                continue
+            neighbours = await asyncio.to_thread(
+                self.index.query, vec, cfg.merge_min_cluster * 4,
+                cfg.merge_cluster_sim,
+            )
+            cluster = [b for b, _sim in neighbours
+                       if b not in seen and b not in attempted]
+            if len(cluster) < cfg.merge_min_cluster:
+                continue
+
+            blocks = []
+            for cid in cluster:
+                # index.query filters on status alone, so every other rule that
+                # kept a block from being a *seed* has to be applied again here
+                # -- otherwise a pinned, corrected or still-warm block gets
+                # pulled in as a cluster member and retired behind a merge it
+                # was never eligible for. A pin especially: it means "keep this
+                # exactly", and being merged is the one thing it must prevent.
+                if not await self._mergeable(cid):
+                    continue
+                b = await asyncio.to_thread(self.store.get, cid)
+                # A block whose file is gone cannot be restored later, so it
+                # must not be one of the originals a merge retires.
+                if b is not None and b.text:
+                    blocks.append(b)
+            if len(blocks) < cfg.merge_min_cluster:
+                continue
+
+            out["clusters"] += 1
+            merged_text = await self._merge_notes(blocks)
+            if not merged_text:
+                attempted.update(b.block_id for b in blocks)
+                continue
+            # Checked here rather than only where the text is generated, so the
+            # guard holds however the merged text was produced.
+            #
+            # Against the members' combined size, not the largest one: the
+            # merge replaces all of them, so three 400-character notes becoming
+            # one 500-character note is the win this pass exists for, even
+            # though 500 is larger than any single member. Comparing against
+            # the largest rejected every real merge.
+            combined = sum(len(b.text or "") for b in blocks)
+            lost = self._lost_specifics(blocks, merged_text)
+            if len(merged_text) > combined * self.MERGE_MAX_RATIO or lost:
+                self.wal.write({
+                    "event": "merge_rejected",
+                    "reason": ("dropped specifics" if lost else
+                               "not enough smaller than the blocks it replaces"),
+                    "parents": [b.block_id for b in blocks],
+                    "combined_chars": combined,
+                    "merged_chars": len(merged_text),
+                    "lost_specifics": sorted(lost)[:20],
+                    "timestamp": time.time(),
+                })
+                # Not retried within this pass: the same cluster reached from a
+                # different seed produces the same three members and the same
+                # verdict, at the cost of another generation. A later pass may
+                # try again -- the blocks are untouched.
+                attempted.update(b.block_id for b in blocks)
+                continue
+
+            merged = await self._store_merged_block(blocks, merged_text)
+            if merged is None:
+                attempted.update(b.block_id for b in blocks)
+                continue
+            out["merged_blocks"] += 1
+            for b in blocks:
+                seen.add(b.block_id)
+                await self._retire_merged(b, merged.block_id)
+                out["retired"] += 1
+            self.wal.write({
+                "event": "blocks_merged",
+                "block_id": merged.block_id,
+                "parents": [b.block_id for b in blocks],
+                "tokens_before": sum(b.token_count for b in blocks),
+                "tokens_after": merged.token_count,
+                "timestamp": time.time(),
+            })
+        return out
+
+    def _lost_specifics(self, blocks: List[Block], merged_text: str) -> set:
+        """Numbers, paths and identifiers the merge dropped.
+
+        The prompt asks the model to keep every specific. Asking is not enough.
+        Run against the real judge on three genuine near-duplicates about DNS
+        latency, the first merge produced:
+
+            "setting dns.cache_ttl=300 ... reduces the cache TTL from 30
+             seconds to 60ms"
+
+        The originals said the TTL *was* 30s and that first-lookup *latency*
+        fell from 840ms to 60ms. The model conflated two quantities and lost
+        840 entirely -- a generalisation that was never true, about to have its
+        evidence retired behind it.
+
+        This is the checkable half of that instruction. It cannot catch the
+        conflation, but it catches the dropped 840, and a merge that loses a
+        number is not one to trust with the rest.
+        """
+        merged = self._specifics(merged_text)
+        original = set()
+        for b in blocks:
+            original |= self._specifics(b.text or "")
+        return original - merged
+
+    async def _mergeable(self, block_id: str) -> bool:
+        """The same eligibility test merge_candidates applies to seeds.
+
+        Kept as one predicate because it has to hold for every block a merge
+        touches, and the vector search that finds cluster members knows only
+        about status.
+        """
+        cfg = self.config.judge
+        meta = await asyncio.to_thread(self.index.get_meta, block_id)
+        if not meta:
+            return False
+        if meta.get("pinned"):
+            return False
+        if meta.get("verification") == "corrected":
+            return False
+        if meta.get("type") not in cfg.consolidate_types:
+            return False
+        if (meta.get("created_at") or 0) > time.time() - cfg.merge_min_age_s:
+            return False
+        return True
+
+    async def _merge_notes(self, blocks: List[Block]) -> Optional[str]:
+        """One merged note, or None if the model could not produce a usable one."""
+        n_ctx = await self._judge_n_ctx()
+        avail_chars = int(max(512, n_ctx - self.MAX_TOKENS - 400) * 3.0)
+        per_note = max(200, avail_chars // max(1, len(blocks)))
+        notes = [self._head_tail(b.text or "", per_note) for b in blocks]
+
+        body = {
+            "messages": [
+                {"role": "system", "content": self.MERGE_SYSTEM},
+                {"role": "user", "content": self._merge_prompt(notes)},
+            ],
+            "temperature": 0.1,
+            "max_tokens": self.MAX_TOKENS,
+            "repeat_penalty": 1.1,
+        }
+        if self._supports_schema is not False:
+            body["response_format"] = {"type": "json_object",
+                                       "schema": self.MERGE_SCHEMA}
+        try:
+            async with httpx.AsyncClient(timeout=self.TIMEOUT_S) as client:
+                resp = await client.post(self.judge_url, json=body)
+                if resp.status_code != 200:
+                    return None
+                data = resp.json()
+        except (httpx.HTTPError, ValueError):
+            return None
+        if self.usage_sink and data.get("usage"):
+            self.usage_sink(data["usage"])
+        content = (data.get("choices", [{}])[0]
+                   .get("message", {}).get("content", "")) or ""
+        obj = self._salvage(content)
+        summary = (obj or {}).get("summary") if isinstance(obj, dict) else None
+        if not isinstance(summary, str):
+            return None
+        summary = summary.strip()
+        if not summary:
+            return None
+        # A "merge" no shorter than one member saved nothing and added a
+        # near-duplicate to the very index this pass exists to thin out.
+        longest = max(len(b.text or "") for b in blocks)
+        if len(summary) > longest:
+            return None
+        return summary
+
+    async def _store_merged_block(self, blocks: List[Block],
+                                  text: str) -> Optional[Block]:
+        merged = Block(
+            type=BlockType.result,
+            status=BlockStatus.shelved,
+            # Conversation-agnostic on purpose: the point of the block is that
+            # it holds across the conversations it came from.
+            conversation_id="",
+            turn_index=0,
+            text=text,
+            token_count=await self._count_tokens(text),
+            embed_text=truncate_tokens(text, self.config.embed_token_limit),
+            stimulus_text=truncate_tokens(text, 1024),
+            # No single originating question: judge_note_text falls back to the
+            # block's own words, which for a merged block is the short,
+            # generalised form rather than a full answer.
+            question_text="",
+            parents=[b.block_id for b in blocks],
+            verification=Verification.unknown,
+            created_at=time.time(),
+        )
+        await asyncio.to_thread(self.store.put, merged)
+        await asyncio.to_thread(
+            self.index.upsert_block_meta,
+            merged.block_id, merged.type.value, merged.status.value,
+            merged.created_at, merged.conversation_id, merged.turn_index,
+            merged.token_count, merged.verification.value, 0, 0.0,
+        )
+        await self._reembed_block(merged)
+        # A merged block nothing can retrieve is worse than no merge at all,
+        # because the originals are about to be retired behind it.
+        if self.embed is not None and await asyncio.to_thread(
+                self.index.get_vector, merged.block_id) is None:
+            await asyncio.to_thread(self.index.update_status,
+                                    merged.block_id, "purged")
+            self.wal.write({
+                "event": "merge_abandoned",
+                "block_id": merged.block_id,
+                "reason": "merged block could not be embedded",
+                "timestamp": time.time(),
+            })
+            return None
+        return merged
+
+    async def _retire_merged(self, block: Block, merged_id: str):
+        """Take an original out of recall without taking it out of existence.
+
+        The same reversible flip decay uses -- status and vector -- but never
+        the file, whatever purge_deletes_file says. Decay is a judgement that a
+        memory stopped being worth keeping; a merge is a judgement that it is
+        better said elsewhere, and those must not share a delete.
+        """
+        block.status = BlockStatus.purged
+        await asyncio.to_thread(self.store.put, block)
+        await asyncio.to_thread(self.index.delete_vector, block.block_id)
+        await asyncio.to_thread(self.index.update_status,
+                                block.block_id, "purged")
+        self.wal.write({
+            "event": "block_retired_into_merge",
+            "block_id": block.block_id,
+            "merged_into": merged_id,
+            "timestamp": time.time(),
+        })
 
     async def _decay_sweep(self) -> int:
         """Purge on age and recall count alone, before anything is sent out.
