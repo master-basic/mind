@@ -138,6 +138,72 @@ snapshot is now loud, and the swap keeps the old copy until the new one lands.
 
 ---
 
+## 29 July — 5 August — the semantic-memory work (16 behaviour-changing commits)
+
+`semantic-mind.md` and `update_plan.md` (committed 28–29 July) took the
+measurement habit further: every behaviour change ships behind a config flag
+with the old value as default, and every headline number is a measurement, not
+an assertion. What got built, in commit order:
+
+- **A pytest seam** (Phase 0.1) — the pure logic had no tests at all. 295 now.
+- **Missing-vector health signal** (Phase 0.2) — `blocks_missing_vectors` on
+  `/admin/stats`, so the backfill need is visible instead of discovered.
+- **Kill the O(n) per-turn scans** (Phase 7.2) — `_find_turn_blocks` walked
+  `list_meta(limit=10000)` up to four times a turn, and was silently *wrong*
+  above 10,000 blocks; the WAL stats scans went the same way.
+- **Correction scoped by block type** (Phase 4.1) — a wrong answer marked
+  *every* previous-turn block corrected, including the pasted source document
+  the model merely misused; the user's own material was being deleted for the
+  model's mistake.
+- **Consistent "user's question"** (Phase 6.2) — recall embedded the tool
+  payload as the query while the blocks it found were spliced in before it,
+  because the agent's turn ends with a `<tool_response>`.
+- **`embed_text` split from `stimulus_text`** (Phase 1.1, 6.1) — as a switch,
+  not a migration; truncation re-embeds now, so a rewritten block's vector
+  stops describing text it no longer holds.
+- **Embed inputs capped by tokens, not words** (not in the plan) — 1,024
+  words of code measured 2,338 tokens against a 2,048-token embedder: an HTTP
+  400, swallowed, and the block stored unrecallable forever.
+- **The `embed_source` measurement** (Phase 0.3) — and it refuted Phase 1:
+  embedding from content alone does not separate traps from legitimate
+  recalls. The plan's migration was refused; `embed_source` stays `composite`.
+- **Show the judge the question, not the answer** (roadmap item 4) — the
+  false-fire 0.00 recorded on 28 July was a harness artefact. Shown a real
+  block's text, the judge kept 5 of 6 traps; shown the originating question,
+  it refuses 6/6, false-fire 0.64 → 0.09. This was the plan's roadmap item 4
+  and the largest single defect found.
+- **Spend the budget on relevance, not nearness** (Phase 2) — candidates are
+  ranked by the judge's P(yes) (free: +2.4 ms reading logprobs) and the budget
+  spent down that order, not in cosine order.
+- **Graded utility decay** (Phase 3.2, 3.3) — "recalled once, ever" was
+  immortality; recalls now earn days of life. And the acceptance signal that
+  feeds it was an in-memory dict lost on restart; it is durable now.
+- **The merge pass** (Phase 3.1) — one block derived from ≥ 3 near-identical
+  ones, originals retired reversibly, and a verifier that refuses any merge
+  that drops a number, path or identifier — which caught the first real draft
+  conflating 840ms with the TTL. **On by default 2026-08-05** after a live
+  measurement (`evaluate/eval_merge.py`): a real family merged correctly and
+  fired recall; a draft that dropped `dns.cache_ttl` was refused.
+- **Blocks off the response path** (Phase 7.1) — blocks were created after
+  `[DONE]` was yielded, so a client disconnecting on the completion signal
+  silently dropped the turn from memory.
+- **Recall floor + embed-failure fallback** (Phase 5.2) — the floor ships off
+  (no safe value exists yet; the plan's 0.30 cannot fire below the 0.48
+  threshold), and when the embed server errors, recall now degrades to a
+  gist/tag keyword channel instead of the whole store vanishing.
+- **Tag/gist as a second candidate source** (Phase 5.1) — ships off: the
+  acceptance rows are not in the corpus yet. The channel itself is on, because
+  it is the embed-failure fallback.
+- **Span-level corrections** (Phase 4.2) — off by default: when the verifier
+  says a claim is wrong, it also quotes the offending phrase, and recall
+  redacts just that span instead of suppressing the whole block.
+- **Pin priority in the budget** (Phase 7.3) — a pin was exempt from decay
+  but bought nothing at retrieval; it is now the tie-break in the ranked fill.
+
+Progress is recorded in `update_implement.md` (§1–§18), which is also where
+the two places the plan was wrong — Phase 1's premise, and Phase 3.1's
+`truncated` retirement — are documented.
+
 ## What it does, with numbers
 
 Measured, not asserted — see [evaluate/benchmark.md](evaluate/benchmark.md):
@@ -145,7 +211,7 @@ Measured, not asserted — see [evaluate/benchmark.md](evaluate/benchmark.md):
 | | |
 |---|---|
 | Recall, embedding only @ 0.62 | 0.96 recall, **0.55 false-fire** |
-| Recall, with the relevance judge | 0.71–0.75 recall, **0.00 false-fire** at every threshold |
+| Recall, with the relevance judge, note = question | 0.75 recall, **0.09 false-fire**, traps refused 6/6 — the 0.00 originally recorded was a harness artefact that showed the judge a seed prompt, not a real block |
 | Crosslingual (Azerbaijani) recall | 3/6 → **6/6**, once the judge let the threshold drop to 0.48 |
 | Correction patterns | precision 0.87, recall 0.76, false-positive rate 0.12 (n=34) |
 | Judge pass on a 164-block store | 163 blocks visited in **7.3 s**, 1 model call |
@@ -156,10 +222,12 @@ launcher, four processes, three models, one GPU.
 
 Working end to end: an OpenAI-compatible proxy with streaming and tools; a
 built-in chat UI with history; semantic recall with a second-stage relevance
-filter; a block lifecycle with consolidation, arithmetic decay, pinning and
-restore; correction detection in English and Azerbaijani; a tabbed admin page
+filter that reads the originating question; a block lifecycle with
+consolidation, utility decay, pinning and restore; a merge pass that derives
+one block from near-identical ones; span-level corrections; correction
+detection in English and Azerbaijani; a tabbed admin page
 with GPU telemetry and memory analytics; VRAM-aware launching with MoE expert
-splitting; a wedge watchdog; snapshots; and two evaluation harnesses.
+splitting; a wedge watchdog; snapshots; and six evaluation harnesses.
 
 ## What it does not do
 

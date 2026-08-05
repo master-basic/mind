@@ -89,6 +89,85 @@ def verifier_says_yes(answer, message, endpoint, timeout=60):
     return None
 
 
+def verifier_span_says(answer, message, endpoint, timeout=60):
+    """The span-mode call: (is_correction, span), or (None, None) on failure.
+
+    Uses the shipped prompt's with_span branch (Phase 4.2), so the fixture
+    measures exactly what a block would carry in `correction_span` -- not a
+    copy of the wording.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, os.path.join(os.path.dirname(here), "cued_recall"))
+    from cued_recall.verifier import CorrectionVerifier
+
+    prompt = CorrectionVerifier._prompt(answer, message, with_span=True)
+    payload = {
+        "messages": [
+            {"role": "system", "content": CorrectionVerifier.SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0,
+        "max_tokens": CorrectionVerifier.SPAN_MAX_TOKENS,
+    }
+    req = urllib.request.Request(
+        endpoint.rstrip("/") + "/v1/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read())
+        content = (data["choices"][0]["message"]["content"] or "").strip()
+    except Exception as e:
+        print(f"  [verifier/span] failed: {type(e).__name__}: {e}")
+        return None, None
+    return CorrectionVerifier._parse_span(content, True)
+
+
+def span_score(name, rows, endpoint):
+    """The Phase 4.2 acceptance on the multi-claim fixture rows.
+
+    Each such row carries `target` -- the exact phrase from the answer that
+    the correction is about -- and `survivor` -- a phrase from another claim
+    that must survive redaction. A row passes when the verifier says yes,
+    the returned span contains the target, and redacting the span from the
+    answer leaves the survivor in place. That is the recall contract: the
+    block comes back minus the bad claim, with the rest usable.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, os.path.join(os.path.dirname(here), "cued_recall"))
+    from cued_recall.utils import redact_span
+
+    print(f"\n=== {name} ===")
+    passed = failed = undecided = 0
+    for r in rows:
+        verdict, span = verifier_span_says(r.get("answer", ""), r["message"],
+                                           endpoint)
+        if verdict is None:
+            undecided += 1
+            print(f"  {r['message'][:70]:<72} undecided")
+            continue
+        if not verdict:
+            failed += 1
+            print(f"  {r['message'][:70]:<72} verdict=no (correction missed)")
+            continue
+        target = (r.get("target") or "").lower()
+        covers = bool(span) and target in span.lower()
+        redacted = redact_span(r.get("answer", ""), span)
+        survives = (r.get("survivor") or "").lower() in redacted.lower()
+        status = "pass" if (covers and survives) else "FAIL"
+        passed += covers and survives
+        failed += not (covers and survives)
+        print(f"  {r['message'][:70]:<72} {status}"
+              f"\n      span={span!r}  target_covered={covers}  "
+              f"survivor_ok={survives}")
+        if not (covers and survives):
+            print(f"      redacted={redacted!r}")
+    print(f"  passed={passed}  failed={failed}  undecided={undecided}")
+    return {"name": name, "passed": passed, "failed": failed,
+            "undecided": undecided, "n": len(rows)}
+
+
 def score(name, rows, predict):
     """Confusion matrix and the three rates, with the counts behind them."""
     tp = fp = tn = fn = skipped = 0
@@ -209,6 +288,16 @@ def main():
                                               r["message"],
                                               args.judge_endpoint)),
         ))
+
+        # The Phase 4.2 acceptance rows: a correction that targets one claim
+        # of a multi-claim answer must produce a span that covers that claim,
+        # and redacting it must leave the other claims usable.
+        span_rows = [r for r in rows
+                     if r.get("target") and r.get("survivor")]
+        if span_rows:
+            results.append(span_score(
+                "span checks (multi-claim, 4.2)", span_rows,
+                args.judge_endpoint))
 
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)

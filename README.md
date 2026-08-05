@@ -65,15 +65,17 @@ second.
 | Reasoning/result split | Working | ` thinking` / ` response` tag parsing during streaming |
 | Semantic recall | Working, measured | Cosine retrieval plus a relevance filter. Embedding alone at 0.62 recalls 0.96 with a **false-fire rate of 0.55**; that is why it no longer runs alone. End to end it fires 6/6 on exact, paraphrase and Azerbaijani probes |
 | Vector backfill | Working | Blocks are embedded once, at creation, and a failure there was logged and never retried -- so a block written while the embedding server was busy stayed `shelved`, kept its text, and was invisible to recall forever. 57 of 1,812 blocks in one real store were in that state. `backfill_missing_vectors.py` finds and re-embeds them |
-| Semantic reranker | Working, measured, **on by default** | Second stage asks the small model whether a candidate applies. False-fire rate **0.00** at every threshold. Its only recall cost is the trap family. Disable with `recall.judge_enabled: false` — and raise `threshold` back toward 0.62 if you do |
+| Semantic reranker | Working, measured, **on by default** | Second stage asks the small model whether a candidate applies — and reads the **question that produced the block**, not the block's own words: shown the answer text the judge kept 5 of 6 traps (the false-fire **0.00** originally recorded was a harness artefact that fed it the seed prompt); shown the question it refuses all 6, with every legitimate recall surviving. See `recall.judge_note`. Disable with `recall.judge_enabled: false` — and raise `threshold` back toward 0.62 if you do |
 | Manual retention (pin) | Working | A pinned block is never purged and never rewritten, at any age |
 | Restore purged blocks | Working | Purging was always reversible on disk; `POST /admin/blocks/restore` re-embeds and brings it back |
 | KV-prefix-safe injection | Working | Recall is anchored to the newest user turn, so the cached prefix survives the turn |
 | Exact token accounting | Working | Block counts and near-limit prompt budgets use the model's `/tokenize`; conservative estimator otherwise |
 | Block lifecycle | Working | hot → shelved → truncated/purged; passes sweep forward, oldest-unjudged first |
 | Tagging system | Working | Auto-tags blocks with gist + tags at shelve time |
-| Correction detection | Working, measured | 17 anchored patterns (EN + AZ) plus a few-shot classifier. Patterns: precision 0.87, recall 0.76, **false-positive rate 0.12** on 34 hand-labelled rows |
-| Decay | Working | Purges on correction, or never-recalled past a cutoff. No model call. Reversible by default. See the retention guarantees below |
+| Correction detection | Working, measured | 17 anchored patterns (EN + AZ) plus a few-shot classifier. Patterns: precision 0.87, recall 0.76, **false-positive rate 0.12** on 34 hand-labelled rows; live verifier (5 Aug, 38 rows): precision 0.59, **FPR 0.78** — the 1.5B says "yes" even to its own few-shot negative ("can you also show the uninstall command?") |
+| Span-level corrections | Working, off by default | `verifier.spans: true` — when a correction fires, the verifier also quotes the exact phrase from the answer that is wrong, and recall redacts that span from the block instead of suppressing the whole block. Off: the yes/no classifier is the measured one. Live measurement (5 Aug, 38 rows): span-mode on the 1.5B produces bare `yes` with empty span — the span machinery never engages on live output; the 4.2 fixture measures 0/3 pass |
+| Decay | Working, measured | **Utility decay**, not immortality: recalls and uncontested recalls earn days of life, spent against time since the block was last useful; a block recalled once eighteen months ago no longer outranks one recalled weekly. Purge needs the utility floor hit *and* the age gate. No model call. Reversible by default. See the retention guarantees below |
+| Merge (abstraction pass) | Working, measured, **on by default** | Derives one gist block from ≥ 3 near-identical older blocks (cosine ≥ 0.90), links it to its `parents`, and retires the originals reversibly. A merge must keep every number, path and identifier — a draft that drops one is refused (`merge_rejected`), which has now caught real losses twice. `judge.merge_enabled: false` turns the pass off. `evaluate/eval_merge.py` is the repeatable live measurement |
 | Consolidation | Working | Judge rewrites long think traces only; guarded against copied openings and non-shrinking rewrites; capped at `max_truncate_count` rewrites per block |
 | Bounded judge pass | Working, measured | Wall-clock ceiling per pass; a pass that runs out of time resumes where it stopped. Measured: 163 blocks visited in 7.3 s, 1 model call |
 | Idle consolidation | Working | Passes run after a quiet period, not mid-conversation |
@@ -111,13 +113,14 @@ second.
 | Guarantee | |
 |---|---|
 | A pinned block | Never purged, never rewritten, at any age |
-| A block that has ever been recalled | Never purged by the age cutoff |
+| A block still earning its keep | Recalls and uncontested recalls convert into days of life; a block keeps being recalled stays. A block recalled once long ago and never again does not |
 | Any purge | Reversible — status flip plus vector drop, file kept unless `purge_deletes_file` |
 | A regex-matched correction | Stops being recalled at once; can only purge after `corrected_grace_s`, and never if the block was ever recalled |
 
 `purge_age_s` is 3 days, and read on its own that sounds alarming. It applies
-only to blocks that are unpinned, were never once retrieved, and can be
-restored afterwards.
+only to blocks that are unpinned and old enough to be past it, and that have
+spent the life their recalls earned — and every purge can be restored
+afterwards.
 
 ---
 
@@ -290,6 +293,13 @@ Settings live in `cued_recall/config.yaml` (gitignored, auto-created from `confi
 | `recall.budget_tokens` | 3000 | Max injected recall tokens |
 | `recall.judge_enabled` | true | Second-stage relevance filter on the small model |
 | `recall.judge_timeout_s` | 5.0 | Per candidate; a timeout keeps the block |
+| `recall.judge_note` | question | What the judge reads as the note: the block's originating question (measured: refuses all 6 old traps, false-fire 0.09; on the widened corpus 5 Aug: trap-asym leaks 2/6 where "about" cannot tell direction) or its own text (old behaviour, false-fire 0.64) |
+| `recall.judge_score_floor` | 0.5 | Relevance score below which a candidate is dropped |
+| `recall.candidate_multiplier` | 1 | How many candidates the judge scores, as a multiple of k |
+| `recall.floor` | 0.0 | Cosine floor below which the judge stage is skipped; **off** — confirmed on the widened corpus (5 Aug): `trap-asym` mean top-sim 0.866, crosslingual 0.841, no safe floor exists that doesn't strand legitimate recalls |
+| `recall.tag_channel` | true | gist/tag keyword channel; serves as the embed-failure fallback |
+| `recall.tag_second_source` | false | Same channel as a second candidate source on the normal path; off — acceptance rows now exist and pass (tag-same 3/3, tag-diff 0/3, 5 Aug); wiring decision pending on the next PR |
+| `recall.pin_priority` | true | Whether a pin breaks ties in the ranked recall fill |
 | `judge.interval_tokens` | 20000 | New material before a pass is worth running |
 | `judge.idle_trigger_s` | 300 | Quiet time before a consolidation pass starts |
 | `judge.sweep_interval_s` | 21600 | Sweep at least this often even with no new material, so decay still happens in a quiet week |
@@ -304,8 +314,18 @@ Settings live in `cued_recall/config.yaml` (gitignored, auto-created from `confi
 | `judge.keep_recall_count` | 3 | Recalled this often → keep verbatim, never compress |
 | `judge.rejudge_interval_s` | 604800 | Leave a block alone this long after judging it |
 | `judge.purge_deletes_file` | false | Purging is reversible unless this is set |
+| `judge.utility_decay` | true | Decay by earned utility (recalls → days of life) rather than "ever recalled" immortality |
+| `judge.utility_recall_weight` | 30.0 | Days of idleness one recall earns |
+| `judge.utility_uncontested_weight` | 60.0 | Extra days for an uncontested recall |
+| `judge.utility_floor` | 0.0 | Utility at or below which a block purges (once past the age gate) |
+| `judge.merge_enabled` | true | The abstraction pass: ≥ 3 near-identical blocks → one gist block, originals retired reversibly. On by default since the 2026-08-05 live measurement |
+| `judge.merge_cluster_sim` | 0.90 | Similarity at which two blocks count as the same ground |
+| `judge.merge_min_cluster` | 3 | How many near-duplicates before generalising is worth a model call |
+| `judge.merge_min_age_s` | 604800 | How settled a cluster must be (a week) |
+| `judge.merge_max_per_pass` | 5 | Merges per pass |
 | `tagger.enabled` | true | Auto-tag at shelve time |
 | `verifier.enabled` | true | Ask the small model about corrections the patterns miss |
+| `verifier.spans` | false | Span-level corrections: the verifier quotes the offending phrase, recall redacts it instead of suppressing the block; off — the yes/no prompt is the measured one |
 | `web_search.backend` | duckduckgo | Search backend |
 | `web_search.brave_api_key` | — | Brave Search API key |
 | `web_search.serper_api_key` | — | Serper.dev API key |
@@ -334,6 +354,8 @@ mind/
 │   ├── eval_throughput.py           # Direct vs through-the-middleware: TTFT and tok/s
 │   ├── throughput.md                # Throughput report
 │   ├── eval_e2e.py                  # A/B: direct vs through the middleware
+│   ├── eval_merge.py                # Live merge-pass measurement (Phase 3.1 decision)
+│   ├── eval_judge_notes.py          # What the judge is shown, and the false-fire cost
 │   ├── analyse.py                   # Paired analysis + bootstrap CI
 │   ├── inspect_blocks.py            # Look at what is actually stored
 │   ├── retrieval_sweep.csv          # Latest sweep output
@@ -341,6 +363,8 @@ mind/
 └── cued_recall/
     ├── config.yaml                  # Active config (gitignored)
     ├── config.example.yaml          # Template, auto-copied
+    ├── report_decay.py              # What the next judge pass would purge, and why
+    ├── backfill_missing_vectors.py  # Re-embed blocks whose vector failed at creation
     ├── backfill_token_counts.py     # Re-count stored blocks with the real tokenizer
     └── cued_recall/
         ├── main.py                  # FastAPI app, all routes
@@ -386,7 +410,10 @@ Sweeps `recall.threshold` from 0.30 to 0.94 over `corpus.jsonl` and writes
 The corpus is hand-written from real recurring work, with adversarial members in
 every family: `exact`, `paraphrase` and `crosslingual` (Azerbaijani) must recall;
 `trap` (same vocabulary, different answer) should fire but must not be reused
-blindly; `distractor` and `control` must not fire.
+blindly; `trap-asym` (same entities, direction inverted — the stork/baby class)
+likewise; `tag-same` (no shared wording, taxonomy tags overlap) must recall via
+the gist/tag channel; `distractor`, `tag-diff` (tags overlap, content differs)
+and `control` must not fire.
 
 Add `--judge` to run the second-stage relevance filter as a second arm and print
 both columns side by side. That is the number that decides whether
@@ -402,6 +429,15 @@ python evaluate/eval_correction.py --no-model
 Drop `--no-model` to score the classifier too. `--from-chats <chats.db>` mines
 real user messages for labelling, which is the only way the negative half stops
 reflecting only what someone thought to test.
+
+**Merge pass** — is the abstraction pass safe to run? Copies a snapshot store
+and runs the real `_merge_pass` against it with seeded near-duplicates, reading
+the `blocks_merged` / `merge_rejected` events and probing recall of the merged
+block. Never touches a live store:
+
+```bash
+python evaluate/eval_merge.py [--store snapshots/latest]
+```
 
 **Throughput** — what does the memory layer cost per turn? Runs the same
 prompts straight at `llama-server` and again through the middleware:

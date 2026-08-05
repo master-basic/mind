@@ -70,6 +70,15 @@ The central abstraction is a **Block** — a chunk of reasoning or result text w
            └──────│ truncated │  ← cycle continues
                   └───────────┘
 
+    merged: a NEW block, derived by the abstraction pass from ≥ 3
+            near-identical shelved blocks. type="result",
+            conversation_id="" (holds across conversations), parents
+            field lists the originals. Its members are retired to purged
+            -- the reversible state below -- and the merged block takes
+            their place in recall. The file of every original survives,
+            even when purge_deletes_file is set: merging is "better said
+            elsewhere", and must not share a delete with forgetting.
+
     purged: status flipped and embedding dropped, so the block is
             unrecallable but recoverable; the msgpack file is deleted
             only when purge_deletes_file is set. POST /admin/blocks/restore
@@ -86,9 +95,12 @@ Three of them, in the order they are checked:
 
 1. **A pinned block is never purged and never rewritten.** Nothing automatic
    can override it; `POST /admin/blocks/{id}/pin` is the only way in or out.
-2. **A block that has ever been recalled is never purged by age.** Retrieval is
-   the only evidence the system gathers on its own that a memory is
-   load-bearing.
+2. **A block that keeps being recalled stays.** Recalls and uncontested
+   recalls are converted into days of life (utility), spent against time
+   since the block was last *useful* — so a block recalled every week
+   outlives one recalled once eighteen months ago, which is exactly what the
+   old rule could not say. (That old rule — "recalled once, ever → immortal" —
+   made the store only ever grow, and was replaced 2026-08-05.)
 3. **Purging is reversible.** It flips a status and drops the search vector;
    the msgpack file survives unless `purge_deletes_file` is set, and restore
    re-embeds from it.
@@ -119,8 +131,14 @@ The two are deliberately separate, and only one of them uses the model.
 | `corrected`, source `manual` | Purge at once. The user pressed the button. |
 | `corrected`, source `pattern` | Stop recalling it at once; purge only if never recalled and older than `corrected_grace_s`. |
 | `corrected`, source `model` | No special power — must clear the ordinary bar below. |
-| Never recalled, older than `purge_age_s` | Purge. Retrieval is the only evidence available that a memory is load-bearing. |
+| Older than `purge_age_s` AND utility at/below `utility_floor` | Purge. Utility = recalls × `utility_recall_weight` + uncontested recalls × `utility_uncontested_weight`, as days of life earned, spent against time since the block was last *recalled* (not written). The age gate comes first: a block cannot be spent down before it is old enough to matter. |
 | Model found nothing reusable, never recalled, older than `worthless_age_s` | Purge. |
+
+The old rule — `recall_count > 0` made a block permanently exempt from
+age-based purging — could say only "used" and "never used". A block recalled
+once eighteen months ago outranked one recalled weekly, and the store could
+only grow. `report_decay.py` prints what the next pass would purge under
+either rule, writing nothing; run it before a pass on a store you care about.
 
 The three correction sources are weighted apart because they are not equally
 reliable, and the expensive direction is a false positive. Measured on a
@@ -128,8 +146,14 @@ reliable, and the expensive direction is a false positive. Measured on a
 patterns score precision 0.87, recall 0.76, and a **false-positive rate of
 0.12** — two of seventeen ordinary messages read as complaints. A detector that
 wrong should not be able to delete anything, so a pattern hit now hides a
-memory for a day rather than destroying it. The classifier's 13/14 is a sample
-of fourteen and is treated as weaker still.
+memory for a day rather than destroying it. The verifier arm was never
+recorded until 5 Aug 2026: on 38 labelled rows (the set grew from 34) it
+scores precision 0.59, recall 1.00, **false-positive rate 0.78** — the 1.5B
+answers "yes" even to the prompt's own canonical negative example ("can you
+also show the uninstall command?", which the few-shot labels "no"). An
+earlier "13/14" in this document no longer describes the live server; the
+model-sourced verdicts are treated as the weakest of the three sources,
+which is why a model correction cannot purge a block outright.
 
 Purging sets `status = purged` and drops the block's row from `block_vec`, which is enough to make it unrecallable and can be undone. The msgpack file survives unless `purge_deletes_file` is set.
 
@@ -152,6 +176,53 @@ clock cut it off rather than start over. Neither bound depends on the shrink
 arithmetic happening to converge.
 
 Why only `reasoning` blocks: a think trace is mostly scaffolding and compresses ~90% with nothing lost. `result` blocks are the answer the user actually saw and are already dense; `reading` blocks are pasted or fetched source material. Measured against this store, a 1.5B model handed either returns a topic sentence — a 618-token status report came back as *"A project status report detailing core features, bugs fixed, and next steps."* No wording fixed that. Those types are left to decay instead.
+
+### The abstraction pass (merging)
+
+The store records every episode and never reduces many into one — a question
+asked three times leaves three near-identical blocks, each spending judge
+budget and prompt tokens to say the same thing. `Judge._merge_pass`, the only
+pass that *creates* a memory rather than editing one, closes that:
+
+1. `index.merge_candidates` returns seeds older than `merge_min_age_s` (a
+   week: a cluster that formed in the last hour is a conversation in
+   progress, not a settled repetition) of the judge's `consolidate_types`.
+2. Each seed is queried against the vector index at `merge_cluster_sim`
+   (0.90 — well above `recall.threshold` 0.48: that one asks "is this
+   relevant", this one asks "is this the same thing said twice"). Paraphrases
+   do not reach it; near-identical ground does.
+3. A cluster of `merge_min_cluster` (3) or more eligible members — the same
+   eligibility test as the seeds, re-applied to members because the vector
+   search filters on status alone, so a pinned, corrected or still-warm block
+   could otherwise be pulled in and retired behind a merge it was never
+   eligible for — is sent to the judge to write one note that holds across
+   them.
+4. The draft is refused unless it keeps every specific. `_lost_specifics`
+   pools numbers, paths and dotted identifiers across the members and
+   compares against the draft; the first real merge ever produced,
+   "dns.cache_ttl=300 … reduces the cache TTL from 30 seconds to 60ms",
+   conflated two quantities and lost the 840ms — so asking the model to keep
+   them is not enough, it is now *checked*. A refused cluster writes a
+   `merge_rejected` WAL event and leaves everything untouched.
+5. A draft that passes is stored as a new block: `type="result"`,
+   `conversation_id=""` (it holds across the conversations it came from),
+   `parents` linking the members. The originals are retired to `purged` —
+   status flipped, vector dropped, **file always kept, even when
+   `purge_deletes_file` is on** — so a bad generalization can be undone
+   block by block.
+
+The guard is deliberately asymmetric. A refusal costs nothing (the originals
+stay shelved); an acceptance retires evidence behind a generalization that was
+never true. Measured live against a snapshot copy (`evaluate/eval_merge.py`,
+2026-08-05): a genuine nginx-timeout family merged to a correct 18-token note
+that kept every specific and fired recall for a related-but-new probe, and a
+DNS-latency family whose draft dropped `dns.cache_ttl` was refused. That
+measurement is why `judge.merge_enabled` defaults to `true`; the flag still
+switches the pass off entirely.
+
+`merge_max_per_pass` bounds how many merges one pass performs (each retires
+several blocks), and a block retired into a merge is never eligible again in
+the same pass.
 
 ### History
 
@@ -186,10 +257,21 @@ User sends /v1/chat/completions
 ├─ recall_blocks()
 │   Embeds user message via Embedding server (port 8082)
 │   Queries block_vec (sqlite-vec) for top-k cosine similarity matches
-│   Filters: skip corrected blocks, skip oversized (> budget_tokens=3000)
+│   Filters: skip corrected blocks (a span-corrected block may still
+│   enter if verifier.spans is on, with the reported span redacted from
+│   both the judge's note and the injection), skip oversized
+│   (> budget_tokens=3000)
 │   Then, if recall.judge_enabled: _filter_by_relevance() asks the small
 │   model whether each survivor actually applies to THIS question, in
 │   parallel but through the shared small-model semaphore. Fail-open.
+│   The judge is shown the note recall.judge_note names -- default
+│   "question", the block's originating question, which measured as the
+│   one thing that refused every trap family member (see Evaluation).
+│   Candidates are ranked by the judge's P(yes) and the budget is spent
+│   down that ranked list (Phase 2: score, rank, fill), not in cosine
+│   order. Pins break ties (recall.pin_priority).
+│   If the embed server errors, the query falls back to keyword_query
+│   over gist/tags (recall.tag_channel) instead of recalling nothing.
 │   Returns 0-4 blocks. These, and only these, are the blocks "served" for
 │   the turn: recall_count is incremented for exactly this set, and it is
 │   what apply_accepted_verification reads back next turn.
@@ -391,6 +473,31 @@ also means there is a server-side log to read when a slot does wedge.
 - Serialization: msgpack (binary, compact, no schema enforcement)
 - Atomic writes: temp file + `os.replace`
 
+### What a block is: three texts
+
+A block carries three different strings, and mixing them up has cost this
+project twice:
+
+- `text` — the block's own words: the think trace or the answer as stored.
+- `embed_text` — the text the block is *retrieved* by. Written on every
+  block; `config.embed_source` (`composite` by default) picks what feeds the
+  vector index — the classic question+answer composite, or the block's own
+  content. Measured on this corpus (evaluate/eval_retrieval.py), swapping to
+  content lowers trap similarity from 0.756 to 0.698 but every other family
+  by about as much, so exact-vs-trap separation gets *worse*: the claimed
+  mechanism is not there, and `embed_source` stays `composite`. Both texts
+  are always stored, so a larger corpus can reverse that with a re-embed
+  (backfill) rather than a migration. The widened corpus (53 rows, 5 Aug
+  2026) refutes it again: in content mode exact-vs-trap separation narrows
+  from 0.140 to 0.110 and crosslingual's mean top-sim (0.594) falls *below*
+  the trap family's (0.698), so content embedding can no longer even recall
+  the crosslingual family without also firing the traps.
+- `stimulus_text` — the "question" side of the block: the user message it
+  was written to answer (for a reasoning block) or its own text (for a
+  result/reading block). This is where `judge_note_text` recovers the
+  originating question for the relevance judge, and it is what a
+  merge-generalized block falls back to (its `question_text` is empty).
+
 ### VectorIndex (index.py)
 
 - Location: `{store_path}/index.db`
@@ -398,6 +505,9 @@ also means there is a server-side log to read when a slot does wedge.
 - Tables:
   - `blocks` — metadata: block_id, type, status, created_at, conversation_id, turn_index, token_count, verification, verification_source, recall_count, last_recalled, judged_at, tags, gist
   - `block_vec` — virtual table with float[dim] embedding, cosine distance
+  - `turn_recalls` — which blocks were served into which turn, recorded at
+    recall time and *consumed* on the next turn's verification, so the
+    uncontested-recall evidence survives a restart (Phase 3.3)
 - Concurrency: threading.Lock around all writes
 - Analytics queries live here too, not in the router: `growth_by_day`,
   `token_histogram`, `recall_effectiveness` — they are what the admin Memory tab
@@ -423,6 +533,7 @@ also means there is a server-side log to read when a slot does wedge.
 - Turn/recall: `turn_completed`, `prompt_budget`, `recall_budget`, `recall_embed_error`, `recall_judge_error`, `context_overflow_retry`, `upstream_error`, `upstream_transport_error`, `embed_store_error`, `web_search_error`, `chat_record_error`
 - Lifecycle: `tagged`, `tagger_error`, `verification_set`, `verifier_error`, `idle_shelve`, `startup_shelve`
 - Judge: `judge_pass`, `judge_action`, `judge_error`, `judge_parse_failed`, `judge_overflow_retry`, `judge_schema_unsupported`
+- Merge: `blocks_merged` (with parents and before/after token counts), `merge_rejected` (reason and the lost specifics), `block_retired_into_merge`, `merge_abandoned`
 - Admin: `admin_verify`, `admin_pin`, `admin_restore`, `admin_delete_blocks`, `admin_import`, `admin_kv_clear`, `admin_server_restart`
 
 `judge_pass` carries the counters a pass produced — `elapsed_s`, `visited`,
@@ -457,7 +568,14 @@ One `asyncio.Semaphore(2)`, shared by the tagger and the verifier. The judge ser
 ### EmbeddingClient (embed.py)
 
 - Calls embed server's `/v1/embeddings` endpoint
-- Hard cap at 16,000 chars per input
+- Size guard is the server's own window: reads `n_ctx` from `/props` at
+  startup (nomic-embed runs 2,048) and `fit()` trims by characters against a
+  conservative token estimate with a 10% margin. The old 16,000-character cap
+  was chosen for an 8,192-token window and sat four times above the real
+  limit, so oversized inputs reached the server, came back HTTP 400, and were
+  swallowed by `_embed_and_store`'s except — leaving blocks stored, listed,
+  and permanently unrecallable. A failed embed is logged (`embed_store_error`)
+  and repairable via `backfill_missing_vectors.py`.
 - L2-normalizes vectors for cosine similarity search
 - Blocks are embedded at creation time (not at query time)
 
@@ -518,6 +636,8 @@ nothing:
 | `eval_correction.py` | How often does correction detection fire on something that was not a correction? | Instant with `--no-model`. Scores the shipped patterns and the shipped classifier against a labelled set; `--from-chats` mines candidate rows out of a live `chats.db` for labelling. |
 | `eval_throughput.py` | What does the memory layer cost per turn? | Minutes. Same prompts direct to `:8080` and through `:8000`, streamed, reporting TTFT and decode rate apart — the middleware's work is all pre-first-token, so decode should be flat and TTFT carries the cost. |
 | `eval_e2e.py` | Does having the block actually help? | Slow and noisy. A/B: baseline goes straight to `:8080`, treatment through the middleware, store wiped and re-warmed per repeat, `temperature: 0`, fixed seed, `--repeats 3`. |
+| `eval_merge.py` | Is the abstraction pass safe to run? | Copies a snapshot store, seeds near-duplicate families, runs the real `_merge_pass` against the copy, and prints the `blocks_merged` / `merge_rejected` events plus a recall probe. Never touches a live store. |
+| `eval_judge_notes.py` | What is the judge shown, and what does that cost? | Scores the shipped note (the block's own text) against candidate rewordings on the corpus pairs, isolating the false-fire defect the sweep cannot see. |
 
 Both evals import the prompt the middleware actually sends
 (`utils.relevance_prompt`, `CorrectionVerifier._prompt`) rather than a copy. A
@@ -530,26 +650,51 @@ reasoning, others 12,000), so comparing group means across 20 prompts would
 drown any real effect.
 
 The corpus (`corpus.jsonl`) is the actual work. Every family carries adversarial
-members across six relation types: `exact` and `paraphrase` must recall,
+members across nine relation types: `exact` and `paraphrase` must recall,
 `crosslingual` (Azerbaijani) must recall, `trap` (same vocabulary, different
-answer — phase 1 vs phase 2) *should* fire but must not be blindly reused, and
-`distractor` (high lexical overlap, unrelated) and `control` must not fire. The
-false-fire rate is the number this exists to measure; trap-family answers are
-hand-graded, since no script can catch a model anchoring confidently on a
-recalled block that did not apply.
+answer — phase 1 vs phase 2) *should* fire but must not be blindly reused,
+`trap-asym` (same entities, inverted direction — the stork/baby class, added
+5 Aug 2026) likewise, `tag-same` (no shared wording, taxonomy tags overlap)
+must recall via the gist/tag channel, and `distractor` (high lexical overlap,
+unrelated), `tag-diff` (tags overlap, content differs) and `control` must not
+fire. The false-fire rate is the number this exists to measure; trap-family
+answers are hand-graded, since no script can catch a model anchoring
+confidently on a recalled block that did not apply.
 
 What the sweep shows: recall and false-fire trade against each other with no
 clean separation — at the shipped threshold of 0.62, recall is 0.96 and the
 false-fire rate is 0.55; false fires only reach zero around 0.86, where recall
 has already fallen to 0.58.
 
-That is what `recall.judge_enabled` is for, and the sweep has now been run.
-`_filter_by_relevance` takes the false-fire rate to **0.00 at every threshold**.
-Recall goes 0.96 → 0.71 at 0.62, and the entire cost is the trap family: every
-exact, paraphrase and crosslingual probe survives, every distractor and control
-is refused. The judge reads a phase-1 note against a phase-2 question and says
-it does not apply — the failure the trap family exists to expose, refused one
-stage earlier than the corpus assumed.
+That is what `recall.judge_enabled` is for. The first measured version of the
+sweep showed the judge taking the false-fire rate to **0.00 at every
+threshold** — and that number was an artefact of the harness, which showed the
+judge each seed's *prompt* as the note rather than a real block. Shown a real
+block's own text (as the shipped judge then read), it kept 5 of 6 traps, and
+false-fire at the shipped operating point is 0.64. The judge could say "does
+not apply" to a phase-1 note against a phase-2 question only when it was shown
+something that did not contain the answer material.
+
+The fix is `recall.judge_note` (default `question`): the judge now reads the
+**question that produced the block**, recovered from `stimulus_text`, falling
+back to the block's text when no question exists. Measured end to end on the
+real representation: false-fire drops 0.64 → **0.09**, traps refused 6/6, and
+every legitimate recall — exact, paraphrase, crosslingual — survives. The
+residual false fires are the risk stated plainly: a block whose originating
+question differed but whose content happens to answer the new question is now
+refused; `recall.judge_note: text` restores the old behaviour.
+
+The widened corpus (53 rows, 5 Aug 2026) sharpens the picture. At the 0.62
+operating point with the question-note judge, false-fire is **0.00** and
+recall 0.61 — but the asymmetric trap class (`trap-asym`: same entities,
+direction inverted, mean top-sim 0.866 — the stork/baby class) survives the
+judge: the 1.5B refuses 4 of 6, and the 2 that leak are the ones where
+"about" cannot tell the direction ("the restart command is wrong…" against a
+phase-1 note about the same service; a phase-3 "add OCR" question against an
+OCR-era note). The old trap family still refuses 6/6, and `tag-diff`
+probes (tags overlap, content differs) false-fire 0/3; `tag-same` recalls
+3/3, two of them only because the gist/tag keyword channel added the right
+block when embedding could not (top-sim 0.566/0.524).
 
 The more useful consequence: with false fires handled by the second stage, the
 embedding threshold no longer has to suppress them, and at 0.48 the crosslingual
@@ -572,10 +717,18 @@ before generation starts.
 
 The obvious inefficiency is that the cost is identical whether the judge admits
 everything or nothing, and on an off-topic question it is always nothing —
-three CPU calls to conclude the store has nothing to say. A similarity floor
-below which the judge is not consulted would recover most of it. Not
-implemented; the sweep data needed to choose that floor is already in
-`retrieval_sweep.csv`.
+three CPU calls to conclude the store has nothing to say. `recall.floor`
+exists to skip the judge below a cosine floor, but it ships **off (0.0)**:
+the measured corpus has no safe value anywhere (control family mean top-sim
+0.4996 sits against crosslingual's 0.6408, with n=6 per family), and the
+plan's proposed 0.30 cannot fire at all — it sits below the 0.48 retrieval
+threshold, so no candidate ever has a best similarity under it. The widened
+corpus (53 rows, 5 Aug 2026) confirms it with a second, stronger number: the
+new `trap-asym` family's mean top-sim is 0.866, and crosslingual's composite
+top-sim is 0.841, so a floor high enough to skip the judge for the traps
+would strand a legitimate family. The mechanism
+is exercised by tests at 0.60, and 0.60 remains the candidate to revisit if
+a third family ever lands between the control and crosslingual means.
 
 ---
 

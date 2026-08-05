@@ -32,3 +32,7 @@
 {"message": "yaxşı, indi də admin səhifəsinə əlavə et", "answer": "Pin bayrağı əlavə olundu.", "is_correction": false}
 {"message": "and what about the crosslingual case?", "answer": "Paraphrases recall at 0.79.", "is_correction": false}
 {"message": "show me the false positive rate for that", "answer": "The patterns are anchored to avoid bare 'wrong'.", "is_correction": false}
+{"message": "the restart command is wrong, it should be systemctl restart baz", "answer": "The config lives at /etc/foo.conf and the service restarts with systemctl restart bar.", "is_correction": true, "target": "systemctl restart bar", "survivor": "the config lives at /etc/foo.conf"}
+{"message": "the cache TTL should be 3000, you wrote 300", "answer": "Deploy with docker compose up, and set the cache TTL to 300 seconds.", "is_correction": true, "target": "300", "survivor": "deploy with docker compose up"}
+{"message": "wrong port, it listens on 8081", "answer": "The API key goes in .env, the server listens on port 8080, and logs rotate weekly.", "is_correction": true, "target": "8080", "survivor": "the api key goes in .env"}
+{"message": "now add the lint step as well", "answer": "The build needs Node 20 and the tests run with pytest.", "is_correction": false}

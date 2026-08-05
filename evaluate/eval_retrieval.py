@@ -81,12 +81,18 @@ def normalise(m):
 # --------------------------------------------------------------------------
 # metrics
 # --------------------------------------------------------------------------
-def evaluate(sims, probes, seeds, threshold, k, keep=None):
+def evaluate(sims, probes, seeds, threshold, k, keep=None, keyword=None):
     """
     sims: (n_probes, n_seeds) cosine similarity matrix
     keep: optional (n_probes, n_seeds) bool matrix from the semantic judge --
           False means the judge said this seed does not apply to this probe,
           so it is dropped before anything is counted. None = no judge.
+    keyword: optional (n_probes, n_seeds) bool matrix from the tag/gist
+          channel (Phase 5.1): True means the seed's gist/tags matched the
+          probe's distinctive terms, so it enters the judge pool alongside
+          the vector candidates regardless of similarity, exactly as
+          pipeline.recall_blocks merges keyword hits. Vector candidates still
+          need sim >= threshold to be admitted.
     Returns per-relation counts plus the two headline numbers.
     """
     per_rel = {}
@@ -96,8 +102,13 @@ def evaluate(sims, probes, seeds, threshold, k, keep=None):
     for i, p in enumerate(probes):
         row = sims[i]
         order = np.argsort(-row)[:k]
-        retrieved = [seeds[j] for j in order
-                     if row[j] >= threshold and (keep is None or keep[i][j])]
+        cand = set(order)
+        if keyword is not None:
+            cand |= set(np.where(keyword[i])[0])
+        retrieved = [seeds[j] for j in cand
+                     if (j in order and row[j] >= threshold
+                         or keyword is not None and keyword[i][j])
+                     and (keep is None or keep[i][j])]
         fams = {s["family"] for s in retrieved}
         correct = p["family"] in fams
 
@@ -138,10 +149,11 @@ def load_shipped_utils():
     here = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, os.path.join(os.path.dirname(here), "cued_recall"))
     try:
-        from cued_recall.utils import build_stimulus, truncate_tokens
+        from cued_recall.utils import (build_stimulus, truncate_tokens,
+                                       distinctive_terms)
     except ImportError as e:
         sys.exit(f"--key-source needs the cued_recall package importable: {e}")
-    return build_stimulus, truncate_tokens
+    return build_stimulus, truncate_tokens, distinctive_terms
 
 
 def load_shipped_fit():
@@ -170,7 +182,7 @@ def load_shipped_fit():
 
 
 def truncate_tokens_shipped(text, n):
-    _, truncate = load_shipped_utils()
+    _, truncate, _ = load_shipped_utils()
     return truncate(text, n)
 
 
@@ -190,7 +202,7 @@ def seed_note_texts(seeds, key_source, blocks_path, judge_note="text"):
     if judge_note == "question" or key_source == "prompt":
         return [s["prompt"] for s in seeds]
     by_id = _load_blocks(blocks_path, seeds)
-    _, truncate_tokens = load_shipped_utils()
+    _, truncate_tokens, _ = load_shipped_utils()
     return [truncate_tokens(by_id[s["id"]].get("reasoning")
                             or by_id[s["id"]].get("answer") or "", 1024)
             for s in seeds]
@@ -217,7 +229,7 @@ def seed_key_texts(seeds, key_source, blocks_path):
     if key_source == "prompt":
         return [s["prompt"] for s in seeds]
 
-    build_stimulus, truncate_tokens = load_shipped_utils()
+    build_stimulus, truncate_tokens, _ = load_shipped_utils()
     fit = load_shipped_fit()
     by_id = _load_blocks(blocks_path, seeds)
 
@@ -257,13 +269,44 @@ def load_shipped_prompt():
     return RELEVANCE_SYSTEM, relevance_prompt
 
 
-def judge_pairs(probes, seeds, sims, k, endpoint, notes=None, timeout=60):
+def keyword_hits(probes, seeds, blocks_path):
+    """(n_probes, n_seeds) bool matrix mirroring index.keyword_query.
+
+    The shipped tag/gist channel matches the probe's distinctive terms against
+    each seed's gist and tags (both already columns in the index) and admits
+    every block with at least one hit, scored by the fraction of terms
+    matched. The matrix replicates that admission rule on the corpus so the
+    eval measures the second candidate source the way production builds it --
+    including the LIKE artefacts (e.g. "move" matching inside "remove").
+    """
+    _, _, distinctive_terms = load_shipped_utils()
+    by_id = _load_blocks(blocks_path, seeds)
+    hays = []
+    for s in seeds:
+        b = by_id[s["id"]]
+        hays.append((f"{b.get('gist') or ''} "
+                     f"{' '.join(b.get('tags') or [])}").lower())
+    mat = np.zeros((len(probes), len(seeds)), dtype=bool)
+    for i, p in enumerate(probes):
+        terms = distinctive_terms(p["prompt"])
+        if not terms:
+            continue
+        for j, hay in enumerate(hays):
+            mat[i][j] = any(t in hay for t in terms)
+    return mat
+
+
+def judge_pairs(probes, seeds, sims, k, endpoint, notes=None, timeout=60,
+                keyword=None):
     """Ask the small model about every pair that could ever be retrieved.
 
     The top-k selection does not depend on the threshold, so the candidate set
     per probe is fixed and the judge can be asked once per pair rather than
     once per pair per threshold -- 33 sweep steps over the same verdicts.
     Returns a (n_probes, n_seeds) bool matrix, True = keep.
+
+    `keyword` adds the tag/gist channel's candidates to the pool: the judge
+    arbitrates both channels, which is its job in recall_blocks.
 
     `notes` is what the judge is shown as the archived note. The pipeline
     passes block.text, so under --key-source that is the block's own words;
@@ -276,7 +319,10 @@ def judge_pairs(probes, seeds, sims, k, endpoint, notes=None, timeout=60):
     keep = np.ones((len(probes), len(seeds)), dtype=bool)
     asked = 0
     for i, p in enumerate(probes):
-        for j in np.argsort(-sims[i])[:k]:
+        topk = set(np.argsort(-sims[i])[:k])
+        if keyword is not None:
+            topk |= set(np.where(keyword[i])[0])
+        for j in sorted(topk):
             payload = {
                 "messages": [
                     {"role": "system", "content": system},
@@ -304,8 +350,8 @@ def judge_pairs(probes, seeds, sims, k, endpoint, notes=None, timeout=60):
     return keep
 
 
-def sweep(sims, probes, seeds, k, keep=None):
-    return [evaluate(sims, probes, seeds, float(t), k, keep)
+def sweep(sims, probes, seeds, k, keep=None, keyword=None):
+    return [evaluate(sims, probes, seeds, float(t), k, keep, keyword)
             for t in np.arange(0.30, 0.96, 0.02)]
 
 
@@ -400,17 +446,56 @@ def main():
 
     results = sweep(sims, probes, seeds, args.k)
     judged = None
+    # The tag/gist channel (Phase 5.1): active in the judged arm whenever the
+    # corpus contains its rows. It is a pool-side feature -- the channel can
+    # only help by feeding the judge -- so the embedding-only arm stays the
+    # pure vector sweep it has always been, and the tag rows show there as
+    # the miss class they exist to cover.
+    keyword = None
+    tag_rows = [p for p in probes
+                if p.get("relation") in ("tag-same", "tag-diff")]
+    if args.judge and tag_rows:
+        keyword = keyword_hits(probes, seeds, args.blocks)
+        n_link = int(keyword.any(axis=0).sum())
+        print(f"[tags] channel active: {len(tag_rows)} tag rows, "
+              f"{n_link} seeds linkable via gist/tags")
     if args.judge:
         t0 = time.perf_counter()
         notes = seed_note_texts(seeds, args.key_source, args.blocks,
                                 judge_note=args.judge_note)
         keep = judge_pairs(probes, seeds, sims, args.k, args.judge_endpoint,
-                           notes=notes)
+                           notes=notes, keyword=keyword)
         elapsed = time.perf_counter() - t0
-        n_pairs = min(args.k, len(seeds)) * len(probes)
+        extra_pairs = 0
+        if keyword is not None:
+            for i in range(len(probes)):
+                topk = set(np.argsort(-sims[i])[: args.k])
+                extra_pairs += int(sum(keyword[i][j]
+                                       for j in range(len(seeds))
+                                       if j not in topk))
+        n_pairs = (min(args.k, len(seeds)) + extra_pairs // max(len(probes), 1)
+                   ) * len(probes)
         print(f"[judge] {elapsed:.1f}s for {n_pairs} pairs "
               f"({elapsed / max(n_pairs, 1) * 1000:.0f} ms each, serial)")
-        judged = sweep(sims, probes, seeds, args.k, keep)
+        judged = sweep(sims, probes, seeds, args.k, keep, keyword)
+        if keyword is not None and tag_rows:
+            # How many tag-same probes were saved by the channel: no vector
+            # candidate at the operating threshold, judge kept the keyword one.
+            saved = []
+            for i, p in enumerate(probes):
+                if p.get("relation") != "tag-same":
+                    continue
+                topk = set(np.argsort(-sims[i])[: args.k])
+                vec_cand = any(sims[i][j] >= 0.62 for j in topk)
+                kw_cand = set(np.where(keyword[i])[0]) - topk
+                if vec_cand:
+                    continue
+                fams = {seeds[j]["family"] for j in kw_cand
+                        if keep[i][j] and keyword[i][j]}
+                if p["family"] in fams:
+                    saved.append(p["id"])
+            if saved:
+                print(f"[tags] saved by the channel at 0.62: {', '.join(saved)}")
 
     if judged:
         print(f"{'thr':>6} {'recall':>8} {'false-fire':>11} |"
@@ -496,6 +581,7 @@ def main():
             "corpus": args.corpus,
             "key_source": args.key_source,
             "judge_note": args.judge_note,
+            "tag_channel": keyword is not None,
             "k": args.k,
             "seeds": len(seeds),
             "probes": len(probes),

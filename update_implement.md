@@ -60,7 +60,7 @@ one defect nobody had ranked turned out to be the largest.
 | 1.1 embed_text vs stimulus_text | **done**, as a switch not a swap | §6 |
 | 1.2 re-embed the store as a migration | **refused** — measured, and the premise is wrong | §8 |
 | 1.3 asymmetry wording for the judge | **tried, failed** — the fix was the note, not the wording | §9 |
-| 1.3 asymmetric trap rows in the corpus | **not done** | below |
+| 1.3 asymmetric trap rows in the corpus | **done** | §19 |
 | 2.1 score, rank, then fill | **done** | §10 |
 | 2.2 token-count honesty | **done** | §10 |
 | 3.1 prototype/abstraction pass | **done, on by default** | §12, §18 |
@@ -76,8 +76,8 @@ one defect nobody had ranked turned out to be the largest.
 | 7.2 kill the O(n) scans | **done** | §3 |
 | 7.3 pin priority in the budget | **done** — by deepseek, 2026-08-05 | §13 |
 | *cross-cutting* config surface | **partly** — keys for shipped phases only | below |
-| *cross-cutting* eval corpus rows | **not done** | below |
-| *cross-cutting* README / ARCHITECTURE / CHANGELOG | **not done** | below |
+| *cross-cutting* eval corpus rows | **done** | §19, §19a |
+| *cross-cutting* README / ARCHITECTURE / CHANGELOG | **done** | §19, docs updated 2026-08-05 |
 
 ### Findings, F1–F14
 
@@ -121,7 +121,7 @@ All shipped with the measured value as the default. Documented in
 | `judge.merge_min_cluster` | `3` | how many near-duplicates before generalising |
 | `judge.merge_min_age_s` | `604800` | how settled a cluster must be |
 | `judge.merge_max_per_pass` | `5` | merges per pass |
-| `verifier.spans` | `false` | span-level corrections: the verifier quotes the offending part and recall redacts it instead of suppressing the block; off — the yes/no prompt is the measured one (§17, by deepseek) |
+| `verifier.spans` | `false` | span-level corrections: the verifier quotes the offending part and recall redacts it instead of suppressing the block; off — the live model emits bare yes/no, the 4.2 fixture rows measure it 0/3 (§19) |
 | `recall.pin_priority` | `true` | whether a pin breaks ties in the ranked recall fill (§13, by deepseek) |
 | `recall.floor` | `0.0` | cosine floor below which the judge is skipped; **off** — the plan's 0.30 cannot fire below the 0.48 threshold and no safe value is measured yet (§14, by deepseek) |
 | `recall.tag_channel` | `true` | the gist/tag keyword channel; used as the embed-failure fallback (§14, by deepseek) |
@@ -712,16 +712,16 @@ judgements recorded in §18 (merge default) and the evals/docs below.
 
 ### Evals and docs (the plan's cross-cutting section)
 
-Both were in `update_plan.md` from the start and neither has been touched. They
-are listed separately because they are not features and are easy to lose.
+Both were in `update_plan.md` from the start; the corpus rows and the docs
+landed 2026-08-05 (§19). One item remains.
 
 | Item | State |
 |---|---|
-| **Corpus rows** — asymmetric `trap` rows (1.3), tag-overlap rows (5.1), multi-claim correction rows (4.2) | Not done. `corpus.jsonl` is unchanged at 6 seeds / 35 probes. **This is the binding constraint on everything measured so far**: every headline number in §8–§10 rests on n=6 per relation, and both the judge-note fix and the merge verifier were validated against that same small set. Widening the corpus is worth more than the next feature. |
+| **Corpus rows** — asymmetric `trap` rows (1.3), tag-overlap rows (5.1), multi-claim correction rows (4.2) | **Done** — §19. 6 seeds / 47 probes in `corpus.jsonl`, 38 rows in `corrections.jsonl`; both harnesses extended to measure the new classes with the shipped code. The rows delivered what they were for: trap-asym leaks 2/6 through the judge (0.866 mean top-sim), tag-same 3/3 / tag-diff 0/3, and the live span-mode verifier fails 0/3. `tag_second_source` wiring decision pending in §19a. |
 | **Regrade `grading_traps.md`** | Not done. It records the RECALL-ON answers anchoring on the seed's wrong stack; §9 and §10 should have changed that, and re-running it is the end-to-end confirmation the retrieval sweep cannot give. |
-| **`README.md`** — features | Not done. It still describes the similarity floor as "Not implemented" (correct) but says nothing about `judge_note`, `embed_source` or utility decay. |
-| **`ARCHITECTURE.md`** — embed_text vs stimulus_text, merge pass, utility decay | Not done. The three sections the plan names are exactly the three concepts a reader now cannot get from it. |
-| **`CHANGELOG.md`** | Not done. Twelve behaviour-changing commits are unlisted. |
+| **`README.md`** — features | **Done** — 2026-08-05 (reranker rows, utility decay, merge, spans, floor, corpus description, config table). |
+| **`ARCHITECTURE.md`** — embed_text vs stimulus_text, merge pass, utility decay | **Done** — 2026-08-05 (lifecycle diagram, retention guarantees, merge pass, embed_text vs stimulus_text, floor, evaluation). |
+| **`CHANGELOG.md`** | **Done** — 2026-08-05 (16-behaviour-change section for 29 July–5 August, corpus/corrections counts). |
 
 ## Corrections to the source documents
 
@@ -756,6 +756,95 @@ Recorded here because both documents are committed and now partly wrong:
   generalise safely when it is made to keep every specific, and refuses when
   it cannot.
 
+### 19 — The eval corpus rows (cross-cutting, 2026-08-05)
+
+The plan's cross-cutting item: asymmetric `trap` rows (1.3), tag-overlap rows
+(5.1), multi-claim correction rows (4.2). `corpus.jsonl` grows from 6 seeds /
+35 probes to 6 seeds / **47 probes**, `corrections.jsonl` from 34 to **38
+rows**. Both harnesses were extended so the new rows are measured with the
+shipped code, not asserted:
+
+- `eval_retrieval.py` gained the tag/gist channel arm: a (probes × seeds) bool
+  matrix built exactly like `index.keyword_query` — each probe's
+  `distinctive_terms` matched against the seeds' real gist/tags from
+  `seed_blocks.jsonl` (including the LIKE artefacts, e.g. "move" matching
+  inside "remove"). In the `--judge` arm the judge pool is top-k ∪ keyword
+  hits, which is what `recall_blocks` does; the embedding-only arm stays pure
+  vector, so the tag rows show there as the miss class they exist to cover.
+- `eval_correction.py` gained the span checks: rows carrying `target`/
+  `survivor` are asked the shipped span-mode prompt, and a row passes when
+  the verdict is yes, the returned span contains the target, and
+  `redact_span` leaves the survivor in place.
+
+**The asymmetric class (1.3).** Six new `trap-asym` rows: seed and probe
+share entities but invert direction (the stork/baby class): client↔server
+fallback, before↔after confirmation, remove↔add-back OCR properties,
+push↔pull, caching-is-the-fix↔caching-is-the-cause, Neovim↔VS Code. Mean
+top-sim vs the composite key is **0.866** — higher than the old traps' 0.756,
+so the F2 premise measures true: the embedding stage cannot separate the
+class (all 6 fire above 0.62). The judge refuses 4 of 6: `ocr1-trapasym`
+kept its own seed (the fallback-role inversion is invisible to "is this
+block about the question") and `phase3-trapasym` was kept against the OCR
+seed ("adding OCR properties" ↔ "adding OCR function" — a cross-family
+confusion). Old traps: 0/6. So the judge's asymmetry awareness is real but
+not complete, and the corpus now measures it.
+
+**The tag/gist channel (5.1).** Six rows across three families (ssh, ocr,
+neovim): `tag-same` probes whose wording shares no content tokens with the
+seed but whose distinctive terms hit the seed's taxonomy tags (automation,
+scripting, devops — none of which appear in the seed prompts), and `tag-diff`
+probes with the same tag overlap but unrelated content. With the channel in
+the judged arm: tag-same **3/3** recalled (two of them only via the channel —
+vector top-sim 0.566/0.524, below the operating threshold), tag-diff **0/3**
+fired, judge false-fire at the operating point **0.00**. The 5.1 acceptance
+holds on the widened corpus. Two first-draft fixtures were reworded after
+measurement (the judge refused "paper bill" as a different document and kept
+"choose between two frontend build tools"); the shipped judge is that
+wording-sensitive, and the rows now measure it fairly. The verdict on
+wiring `tag_second_source` on is recorded in §19a below.
+
+**The multi-claim correction rows (4.2).** Three true rows (correction
+targets one claim of a two- or three-claim answer, with the wrong phrase as
+`target` and a second claim as `survivor`) and one false follow-up. Result:
+**0/3 pass — the live model emits bare `yes` and never the span.** The span
+instruction is added to the prompt but the few-shot answers that follow it
+are bare yes/no, and Qwen2.5-1.5B follows the examples, not the instruction.
+`redact_span` therefore never engages in production with this server: a
+corrected block keeps its bad claim. This is exactly the gap §17 flagged
+("new model output that needs the plan's multi-claim correction rows before
+it is trusted") — the rows now exist and say: not trusted. `verifier.spans`
+stays off. The 24 unit tests mock the model output and remain green; the
+fixture measures what a mock cannot.
+
+**And a verifier finding the corpus work surfaced.** The live verifier arm
+scored precision 0.59, recall 1.00, **false-positive rate 0.78** on the 38
+rows — it answers "yes" even to the prompt's own canonical negative ("can
+you also show the uninstall command?", which the few-shot labels "no").
+ARCHITECTURE.md's "13/14" no longer describes this server; either the small
+model changed under it or the old sample was unrepresentative — the current
+number is what production does today, and a model-sourced correction cannot
+purge (grace + ever-recalled guard), which is why the damage is a day hidden
+rather than a deleted memory. The docs recorded only the patterns arm
+(0.87/0.76/0.12) and never the verifier's live numbers; this is the first
+recorded one.
+
+**§8 on the widened corpus.** Re-run `--key-source content` (embedding only):
+content lowers every relation's top-sim again (exact 0.896→0.808, paraphrase
+0.831→0.767, crosslingual 0.641→0.594, trap 0.756→0.698, trap-asym
+0.866→0.783) and exact-vs-trap separation narrows 0.140→0.110, with
+crosslingual now *below* trap. The §8 verdict (keep `composite`) holds and
+is stronger. The widened corpus also confirms §14: there is still no safe
+`recall.floor` — control top-sim 0.500 vs crosslingual 0.641 means any floor
+above ~0.58 pays with real recall.
+
+### 19a — tag_second_source decision (pending)
+
+The 5.1 acceptance rows exist and pass (tag-same 3/3 via the channel,
+tag-diff 0/3 with the judge, false-fire 0.00). Wiring the channel on is a
+config flip plus the §16 test suite; the corpus work deliberately stops at
+the measurement, per one-change-per-PR. The flip is the next decision when
+the docs land.
+
 ## Reproducing
 
 ```
@@ -771,6 +860,13 @@ python eval_retrieval.py --key-source composite --judge --judge-note question \
 python eval_judge_notes.py --all-notes
 python eval_judge_notes.py --variants
 ```
+
+Since §19 (2026-08-05) the corpus is 6 seeds / 47 probes and the sweeps above
+run with the tag-channel arm active under `--judge` (the judge pool is top-k
+∪ gist/tag hits, mirroring `index.keyword_query`); the judged arm uses
+`--judge-note question`, the shipped setting. The widened-corpus records are
+`baseline_composite.json` (composite, judged, question note) and
+`content_widened.json` (content, embedding only).
 
 Every sweep above is committed as `evaluate/baseline_*.json` so the next phase
 is a diff against a file rather than against somebody's memory of a terminal.

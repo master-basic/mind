@@ -3,13 +3,46 @@
     "name": "patterns",
     "tp": 13,
     "fp": 2,
-    "tn": 15,
-    "fn": 4,
+    "tn": 16,
+    "fn": 7,
     "precision": 0.8666666666666667,
-    "recall": 0.7647058823529411,
-    "false_positive_rate": 0.11764705882352941,
-    "n_positives": 17,
-    "n_negatives": 17,
+    "recall": 0.65,
+    "false_positive_rate": 0.1111111111111111,
+    "n_positives": 20,
+    "n_negatives": 18,
     "undecided": 0
+  },
+  {
+    "name": "verifier (http://127.0.0.1:8081)",
+    "tp": 20,
+    "fp": 14,
+    "tn": 4,
+    "fn": 0,
+    "precision": 0.5882352941176471,
+    "recall": 1.0,
+    "false_positive_rate": 0.7777777777777778,
+    "n_positives": 20,
+    "n_negatives": 18,
+    "undecided": 0
+  },
+  {
+    "name": "combined (pattern, else verifier)",
+    "tp": 20,
+    "fp": 14,
+    "tn": 4,
+    "fn": 0,
+    "precision": 0.5882352941176471,
+    "recall": 1.0,
+    "false_positive_rate": 0.7777777777777778,
+    "n_positives": 20,
+    "n_negatives": 18,
+    "undecided": 0
+  },
+  {
+    "name": "span checks (multi-claim, 4.2)",
+    "passed": 0,
+    "failed": 3,
+    "undecided": 0,
+    "n": 3
   }
 ]
