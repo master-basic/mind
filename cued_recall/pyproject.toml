@@ -13,5 +13,20 @@ dependencies = [
     "numpy>=1.26.0",
 ]
 
+[project.optional-dependencies]
+# Unit tests only. The integration evals in evaluate/ need running model
+# servers and are not part of this suite.
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
 [project.scripts]
 cued-recall = "cued_recall.main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Tests cover the pure logic -- text splitting, token counting, the decay
+# table, the index -- so they run in under a second with no servers up. If a
+# test here needs a model endpoint, it belongs in evaluate/ instead.
+addopts = "-q"
