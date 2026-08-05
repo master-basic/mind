@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException
 from .index import VectorIndex
 from .models import Block, BlockStatus, BlockType, Verification
 from .store import BlockStore
+from .utils import embed_source_text
 from .taxonomy import TAXONOMY, TAXONOMY_GROUPS, TAXONOMY_VERSION, validate_gist, validate_tags
 from .wal import WAL
 
@@ -47,7 +48,8 @@ def rates_from_metrics(text: str) -> dict:
 
 
 def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_run_fn,
-                        tps_ring: list, embed=None, reasoning_endpoint: str = ""):
+                        tps_ring: list, embed=None, reasoning_endpoint: str = "",
+                        embed_source: str = "composite"):
     router = APIRouter(prefix="/admin")
 
     @router.get("/blocks")
@@ -201,10 +203,13 @@ def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_ru
             block.status = BlockStatus.shelved
             store.put(block)
             index.update_status(bid, "shelved")
-            embed_text = (block.stimulus_text or block.text)[:2000]
-            if embed_text:
+            # Same field the pipeline and judge index on, via the one helper --
+            # a restored block must be findable by the same text as one that
+            # was never purged.
+            source_text = embed_source_text(block, embed_source)[:2000]
+            if source_text:
                 try:
-                    vec = await asyncio.to_thread(embed.embed, embed_text)
+                    vec = await asyncio.to_thread(embed.embed, source_text)
                     await asyncio.to_thread(index.upsert_vector, bid, vec)
                 except Exception:
                     # Status is back either way; without a vector the block is
@@ -329,6 +334,10 @@ def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_ru
                 "gist": m.get("gist", ""),
                 "tags": m.get("tags", []),
                 "text": text,
+                # A copy of the block's own words, so it falls under the same
+                # privacy rule as `text` -- shipping it unconditionally would
+                # hand over exactly what withholding `text` is protecting.
+                "embed_text": block.embed_text if text is not None else None,
             })
         return {
             "taxonomy_version": TAXONOMY_VERSION,
@@ -361,6 +370,10 @@ def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_ru
                 token_count=item.get("token_count", 0),
                 text=text,
                 stimulus_text=stimulus,
+                # An export from an older instance has no embed_text; fall back
+                # to the text itself so the content channel is populated rather
+                # than silently empty on every imported block.
+                embed_text=(item.get("embed_text") or text or "")[:8000],
                 # Verification is not portable: someone else's "accepted" is
                 # not evidence for this instance. It has to be earned again
                 # through this instance's own conversations.
@@ -379,10 +392,10 @@ def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_ru
             # Embeddings aren't portable across instances running different
             # embedding models, so the receiving side always re-embeds locally
             # rather than trusting a vector shipped in the export.
-            embed_text = (stimulus or text)[:2000]
-            if embed_text:
+            source_text = embed_source_text(block, embed_source)[:2000]
+            if source_text:
                 try:
-                    vec = await asyncio.to_thread(embed.embed, embed_text)
+                    vec = await asyncio.to_thread(embed.embed, source_text)
                     await asyncio.to_thread(index.upsert_vector, block.block_id, vec)
                 except Exception:
                     pass

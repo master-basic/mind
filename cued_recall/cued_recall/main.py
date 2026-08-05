@@ -65,7 +65,7 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
     _clamp_context_budget(cfg)
 
     pipeline = Pipeline(cfg, store, index, embed, wal)
-    judge = Judge(cfg, store, index, wal)
+    judge = Judge(cfg, store, index, wal, embed)
     tagger = Tagger(cfg, store, index, wal)
     pipeline.tagger = tagger
     verifier = CorrectionVerifier(cfg, wal)
@@ -538,7 +538,8 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
                 "persisted": persisted}
 
     admin_router = build_admin_router(index, store, wal, run_judge_pass, tps_ring, embed,
-                                      reasoning_endpoint=cfg.reasoning_endpoint)
+                                      reasoning_endpoint=cfg.reasoning_endpoint,
+                                      embed_source=cfg.embed_source)
     app.include_router(admin_router)
 
     snapshot_task = None

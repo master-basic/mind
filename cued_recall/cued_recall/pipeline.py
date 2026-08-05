@@ -54,6 +54,7 @@ from .store import BlockStore
 from .utils import (
     build_stimulus,
     count_tokens,
+    embed_source_text,
     estimate_tokens,
     matches_correction,
     relevance_prompt,
@@ -1898,6 +1899,16 @@ class Pipeline:
                                       reading_content if len(reading_content.split()) > 1000 else "")
             block.stimulus_text = stimulus
 
+        # The second channel: what each block says, in its own words. Written
+        # for every block regardless of config.embed_source, so switching the
+        # index over is a re-embed of an existing field rather than material
+        # that has to be regenerated from turns that are long gone. For a
+        # reasoning block this is its own slice of the think trace -- not the
+        # whole trace, which is what the composite would have carried.
+        limit = self.config.embed_token_limit
+        for block in all_blocks:
+            block.embed_text = truncate_tokens(block.text, limit)
+
         for block in all_blocks:
             await asyncio.to_thread(self.store.put, block)
             await asyncio.to_thread(
@@ -1910,7 +1921,7 @@ class Pipeline:
 
         embed_tasks = []
         for block in all_blocks:
-            if block.stimulus_text:
+            if self._embed_source_text(block):
                 embed_tasks.append(self._embed_and_store(block))
         if embed_tasks:
             await asyncio.gather(*embed_tasks)
@@ -1963,11 +1974,16 @@ class Pipeline:
 
         return blocks
 
+    def _embed_source_text(self, block: Block) -> str:
+        return embed_source_text(block, self.config.embed_source)
+
     async def _embed_and_store(self, block: Block):
         # Best-effort: a failed embed must not crash block creation. The block
-        # is still stored; it just won't be vector-recallable until re-embedded.
+        # is still stored; it just won't be vector-recallable until re-embedded
+        # -- which /admin/stats now reports rather than leaving silent.
         try:
-            vec = await asyncio.to_thread(self.embed.embed, block.stimulus_text)
+            vec = await asyncio.to_thread(self.embed.embed,
+                                          self._embed_source_text(block))
             await asyncio.to_thread(self.index.upsert_vector, block.block_id, vec)
         except Exception as e:
             self.wal.write({

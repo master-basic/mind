@@ -15,6 +15,26 @@ snapshot_path: ./snapshots
 models_dir: ./data/models
 snapshot_interval_min: 15
 block_tokens_reasoning: 8000
+# Which text of a block goes into the vector index.
+#
+#   composite  the question-plus-answer that produced the block (for reasoning
+#              blocks) -- the shipped behaviour, and the one the measured
+#              operating point below was tuned against
+#   content    what the block itself says
+#
+# The trade is measurable and has not been measured. "composite" makes a
+# reasoning block's vector contain the answer, which is why a later question
+# sharing those entities scores 0.841 against phase-1 material (the trap family
+# in evaluate/). "content" removes that -- but the query is always a question,
+# and indexing an answer by its question is plausibly why paraphrase and
+# Azerbaijani recall land 6 of 6.
+#
+# Both texts are stored on every block, so switching is a re-embed and not a
+# re-ingest. Run evaluate/eval_retrieval.py's sweep first, then:
+#   python backfill_missing_vectors.py --fill-embed-text --all
+embed_source: composite
+# Cap on either embed text, in words. The embedder's window is the real limit.
+embed_token_limit: 1024
 # Prompt budget in real tokens. run.py derives this from the reasoning
 # server's --ctx-size (minus room for the reply and for tool definitions)
 # and rewrites it on every launch, so it can't drift out of sync with the

@@ -46,7 +46,21 @@ class Block:
     # last, so repeated summarising converges on a topic sentence, and the
     # earlier rounds are the only ones that were ever paying for themselves.
     truncate_count: int = 0
+    # What was being asked when this block was written. For a reasoning block
+    # that is the question-plus-answer composite from build_stimulus; for
+    # result and reading blocks it is a copy of the block's own text. Two jobs
+    # historically: the vector source, and the "Question:" context in the
+    # judge's consolidation prompt. Only the second is left -- see embed_text.
     stimulus_text: str = ""
+    # What this block actually says, in its own words. Split out from
+    # stimulus_text because the two answer different questions and only one of
+    # them belongs in a search index: embedding a reasoning block as its Q+A
+    # composite means the vector *is* the question that produced it, so any
+    # later question sharing entities with that answer scores high against it
+    # (measured 0.841 for a phase-1 block against a phase-2 question). Which of
+    # the two feeds the index is config.embed_source; both are always stored,
+    # so switching is a re-embed and not a re-ingest.
+    embed_text: str = ""
     verification: Verification = Verification.unknown
     # User-set: exempt from decay and from consolidation, at any age. Retrieval
     # is the only evidence this system gathers on its own that a memory matters,

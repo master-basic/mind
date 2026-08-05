@@ -203,6 +203,33 @@ class Config:
         # already-shelved blocks, no conflict.
         self.hot_shelve_timeout_s: int = raw.get("hot_shelve_timeout_s", 15)
         self.embed_dim: int = raw.get("embed_dim", 768)
+        # Which text of a block goes into the vector index.
+        #
+        #   "composite" -- stimulus_text: for a reasoning block, the question
+        #       and the answer it produced. This is the shipped behaviour and
+        #       the one the measured operating point (threshold 0.48, k=4,
+        #       judge on) was tuned against, so it stays the default.
+        #   "content"   -- embed_text: what the block itself says.
+        #
+        # The case for "content" is that the trap family scores high precisely
+        # because a reasoning block's vector contains the phase-1 answer, so a
+        # phase-2 question sharing those entities matches it. The case against
+        # is that the query is always a question, and indexing an answer by the
+        # question that produced it is why paraphrase and cross-lingual recall
+        # work as well as they do. That trade is measurable and has not been
+        # measured, which is exactly why this is a switch and not a rewrite:
+        # both texts are stored on every block, so changing it is a re-embed
+        # (backfill_reembed.py) rather than a re-ingest. Run the sweep in
+        # evaluate/ before changing it.
+        self.embed_source: str = raw.get("embed_source", "composite")
+        if self.embed_source not in ("composite", "content"):
+            raise ValueError(
+                f"embed_source must be 'composite' or 'content', "
+                f"got {self.embed_source!r}"
+            )
+        # Cap on either embed text. The embedder's window is the real limit;
+        # this keeps a pasted document from being sent whole.
+        self.embed_token_limit: int = raw.get("embed_token_limit", 1024)
         self.recall = RecallConfig(raw.get("recall", {}))
         self.judge = JudgeConfig(raw.get("judge", {}))
         self.tagger = TaggerConfig(raw.get("tagger", {}))

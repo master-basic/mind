@@ -148,6 +148,26 @@ def split_paragraph_boundary(text: str, max_tokens: int) -> Tuple[str, str]:
     return left.strip(), right.strip()
 
 
+def embed_source_text(block, source: str = "composite") -> str:
+    """The text of a block that should go into the vector index.
+
+    One function because four callers need the same answer and a disagreement
+    between them is invisible: the pipeline embeds at creation, the judge
+    re-embeds after truncation, the admin re-embed endpoint and the backfill
+    script repair. If any of them picked a different field, a block's vector
+    would stop describing the block and nothing would report it.
+
+    Falls back to the other field whenever the preferred one is empty, so a
+    store written before embed_text existed -- or one whose composite was never
+    built -- still embeds something rather than silently getting no vector.
+    """
+    stimulus = (getattr(block, "stimulus_text", "") or "")
+    content = (getattr(block, "embed_text", "") or "")
+    if source == "content":
+        return content or stimulus or (getattr(block, "text", "") or "")
+    return stimulus or content or (getattr(block, "text", "") or "")
+
+
 def build_stimulus(user_message: str, result_text: str,
                    reading_excerpt: str = "") -> str:
     parts = [truncate_tokens(user_message, 512)]

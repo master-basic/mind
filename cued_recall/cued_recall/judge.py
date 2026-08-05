@@ -8,9 +8,9 @@ import httpx
 
 from .config import Config
 from .index import VectorIndex
-from .models import Block, BlockStatus
+from .models import Block, BlockStatus, BlockType
 from .store import BlockStore
-from .utils import count_tokens
+from .utils import count_tokens, embed_source_text, truncate_tokens
 from .wal import WAL
 
 
@@ -34,11 +34,16 @@ class Judge:
         store: BlockStore,
         index: VectorIndex,
         wal: WAL,
+        embed=None,
     ):
         self.config = config
         self.store = store
         self.index = index
         self.wal = wal
+        # Truncation rewrites a block's words, which makes its vector describe
+        # text the block no longer holds. Optional so an offline or test Judge
+        # can run without an embedding server -- see _reembed_block.
+        self.embed = embed
         self.judge_url = config.judge_endpoint.rstrip("/") + "/v1/chat/completions"
         self.usage_sink = None
         self.tps_sink = None
@@ -637,10 +642,47 @@ class Judge:
         block.token_count = new_tokens
         block.truncate_count += 1
         block.status = BlockStatus.truncated
+        # The block's own words changed, so the text that represents it has to
+        # change with them. Without this a truncated block keeps a vector built
+        # from words it no longer contains: recall matches on one text and
+        # injects a different one, and the gap widens with each rewrite.
+        block.embed_text = truncate_tokens(summary,
+                                           self.config.embed_token_limit)
+        # For result and reading blocks stimulus_text is a copy of the block's
+        # own text (set that way at creation), so leaving it would make it a
+        # copy of text that no longer exists. A reasoning block's stimulus is
+        # the question that produced it, which truncation does not change.
+        if block.type != BlockType.reasoning:
+            block.stimulus_text = block.embed_text
         await asyncio.to_thread(self.store.put, block)
         await asyncio.to_thread(
             self.index.update_status, block.block_id, "truncated"
         )
+        await self._reembed_block(block)
+
+    async def _reembed_block(self, block: Block):
+        """Rebuild a block's vector after its text changed.
+
+        Best-effort, and deliberately non-destructive on failure: a stale
+        vector still finds the block, whereas dropping it would make the block
+        unrecallable and count as vector loss. The failure is recorded so it is
+        not silent, which is the whole complaint about the creation-time path.
+        """
+        text = embed_source_text(block, self.config.embed_source)
+        if self.embed is None or not text:
+            return
+        try:
+            vec = await asyncio.to_thread(self.embed.embed, text)
+            await asyncio.to_thread(
+                self.index.upsert_vector, block.block_id, vec
+            )
+        except Exception as e:
+            self.wal.write({
+                "event": "reembed_error",
+                "block_id": block.block_id,
+                "error": str(e),
+                "timestamp": time.time(),
+            })
 
     async def _purge_block(self, block: Block):
         block.status = BlockStatus.purged
