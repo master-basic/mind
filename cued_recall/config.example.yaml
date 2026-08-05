@@ -83,6 +83,23 @@ recall:
   # Costs one short call per candidate, in parallel, on the request path.
   judge_enabled: true
   judge_timeout_s: 5.0
+  # How many candidates the judge scores, as a multiple of k. The judge now
+  # scores the whole candidate set and the token budget is spent down that
+  # ranked list, so relevance decides what fits rather than nearness.
+  #
+  # 1 is the vector search's own top-k -- a reorder of the set the judge
+  # already saw, so TTFT is unchanged. Raising it costs one judge call per
+  # extra candidate on a single-slot CPU server (~55 ms each measured here),
+  # so 4 turns roughly 0.2 s into 0.9 s. Measure before raising it.
+  candidate_multiplier: 1
+  # Relevance score below which a candidate is dropped. The score is P(yes)
+  # over the judge's first token, read from logprobs the server already
+  # computes (+2.4 ms a call measured). 0.5 is exactly the decision the old
+  # yes/no parse made -- verified identical on all 24 corpus pairs -- and the
+  # band around it is empty: legitimate recalls score 0.899-0.998, traps
+  # 0.012-0.119. A server without logprobs falls back to the yes/no text and
+  # behaves as before.
+  judge_score_floor: 0.5
   # What the judge reads as the archived note: the question the block was
   # written to answer ("question"), or the block's own words ("text", which is
   # what shipped until 2026-08-05).

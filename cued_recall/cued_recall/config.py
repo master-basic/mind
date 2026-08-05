@@ -45,6 +45,23 @@ class RecallConfig:
         # block whose originating question differed but whose content happens
         # to answer the new one is now refused. If recall starts missing things
         # it used to find, this is the first knob to try.
+        # How many candidates to judge, as a multiple of k.
+        #
+        # 1 means the vector search's own top-k, which is what the judge has
+        # always seen -- this reorders that set rather than enlarging it, so
+        # TTFT is unchanged. Raising it widens the pool the judge ranks, and
+        # costs one judge call per extra candidate: the judge server runs
+        # single-slot on CPU at ~140 ms a call, so 4 turns roughly 0.6 s of
+        # added latency into 2.3 s. Measure before raising it.
+        self.candidate_multiplier: int = max(
+            1, int(d.get("candidate_multiplier", 1))
+        )
+        # Below this relevance score a candidate is dropped. The score is
+        # P(yes) over the judge's first token, so 0.5 is the same decision the
+        # old yes/no parse made -- measured on the evaluate/ corpus, legitimate
+        # recalls score 0.899-0.998 and traps 0.012-0.119, so the cut has a
+        # wide empty band around it rather than sitting in a crowd.
+        self.judge_score_floor: float = float(d.get("judge_score_floor", 0.5))
         self.judge_note: str = d.get("judge_note", "question")
         if self.judge_note not in ("question", "text"):
             raise ValueError(

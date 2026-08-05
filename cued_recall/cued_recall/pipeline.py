@@ -2,6 +2,7 @@ import asyncio
 import html as html_lib
 import ipaddress
 import json
+import math
 import re
 import socket
 import time
@@ -152,6 +153,10 @@ class Pipeline:
         # apply_accepted_verification. In memory only -- losing it on restart
         # costs nothing but a few unknowns.
         self._recalled_by_turn: dict = {}
+        # None = not yet known. Set False the first time the judge server
+        # rejects or omits logprobs, so later calls stop asking and fall back
+        # to parsing yes/no. Mirrors Judge._supports_schema.
+        self._judge_logprobs: Optional[bool] = None
 
     @staticmethod
     def _msg_text(m) -> str:
@@ -552,20 +557,20 @@ class Pipeline:
                 "timestamp": time.time(),
             })
             return []
+        cfg = self.config.recall
         results = await asyncio.to_thread(
             self.index.query,
             embed_vec,
-            self.config.recall.k,
-            self.config.recall.threshold,
+            cfg.k * cfg.candidate_multiplier,
+            cfg.threshold,
         )
-        blocks = []
-        total_tokens = 0
         # Why a candidate did not make it into the prompt was invisible: the
         # turn log recorded only how many blocks were admitted. Counted here so
         # the admin panel can show budget pressure -- a high skipped_oversized
         # against a low admitted count means recall.budget_tokens is starving
         # the injection rather than the index failing to find anything.
         skipped_corrected = skipped_missing = skipped_oversized = 0
+        candidates = []
         for block_id, sim in results:
             meta = await asyncio.to_thread(self.index.get_meta, block_id)
             if meta and meta.get("verification") == "corrected":
@@ -575,33 +580,57 @@ class Pipeline:
             if block is None:
                 skipped_missing += 1
                 continue
+            candidates.append((block, sim))
+
+        # Relevance first, budget second. The budget used to be filled in
+        # cosine order before the judge ran, so a candidate the judge was
+        # about to reject had already taken a slot, and a slightly less
+        # similar but genuinely relevant block behind it was never even
+        # offered -- the freed slot was not refilled. Scoring the whole
+        # candidate set first and spending the budget down the ranked list
+        # means the tokens go to what applies rather than to what is nearest.
+        rejected_by_judge = 0
+        if cfg.judge_enabled and candidates:
+            scored = await self._score_by_relevance(query_text, candidates)
+            kept = [t for t in scored if t[2] >= cfg.judge_score_floor]
+            rejected_by_judge = len(scored) - len(kept)
+            # Stable within equal scores, so a tie falls back to the cosine
+            # order the index returned rather than to dict iteration luck.
+            kept.sort(key=lambda t: t[2], reverse=True)
+        else:
+            # No judge: similarity is the only ranking available, and results
+            # already arrive in that order.
+            kept = [(b, sim, sim) for b, sim in candidates]
+
+        blocks = []
+        total_tokens = 0
+        top_score = kept[0][2] if kept else None
+        for block, sim, _score in kept:
             # Skip, don't stop. A single oversized hit (a pasted document can
             # be several times the budget on its own) used to break the loop
             # on the first iteration, returning zero memories for the turn
             # even though smaller, equally relevant blocks sat right behind
             # it. Pass over what doesn't fit and keep filling the budget.
-            if total_tokens + block.token_count > self.config.recall.budget_tokens:
+            if total_tokens + block.token_count > cfg.budget_tokens:
                 skipped_oversized += 1
                 continue
             total_tokens += block.token_count
             blocks.append((block, sim))
 
-        rejected_by_judge = 0
-        if self.config.recall.judge_enabled and blocks:
-            kept = await self._filter_by_relevance(query_text, blocks)
-            rejected_by_judge = len(blocks) - len(kept)
-            blocks = kept
-            total_tokens = sum(b.token_count for b, _ in blocks)
-
         self.wal.write({
             "event": "recall_budget",
             "candidates": len(results),
+            "judged": len(candidates) if cfg.judge_enabled else 0,
             "admitted": len(blocks),
             "rejected_by_judge": rejected_by_judge,
             "skipped_corrected": skipped_corrected,
             "skipped_missing": skipped_missing,
             "skipped_oversized": skipped_oversized,
             "tokens_used": total_tokens,
+            # The best relevance score this turn saw. A run of low ones with
+            # blocks still admitted is the signal that judge_score_floor is
+            # too generous for this store.
+            "top_score": round(top_score, 4) if top_score is not None else None,
             # Carried per event so a historical turn shows the budget that was
             # actually in force when it ran.
             "budget_tokens": self.config.recall.budget_tokens,
@@ -610,10 +639,10 @@ class Pipeline:
         })
         return blocks
 
-    async def _filter_by_relevance(
+    async def _score_by_relevance(
         self, question: str, blocks: List[Tuple[Block, float]]
-    ) -> List[Tuple[Block, float]]:
-        """Drop candidates the small model says do not apply to this question.
+    ) -> List[Tuple[Block, float, float]]:
+        """Score each candidate 0-1 on whether it applies to this question.
 
         Cosine similarity answers "is this about the same subject", which is
         not the question that matters. Measured on the evaluate/ corpus, a
@@ -621,12 +650,22 @@ class Pipeline:
         phase 2, and a block sharing only vocabulary scores 0.708 -- both above
         the 0.62 threshold, both wrong to inject.
 
-        Fail-open throughout: a timeout or an unparseable reply keeps the
-        block. The failure this guards against is a mildly irrelevant note in
-        the prompt; the failure it must not cause is losing a relevant one
-        because a CPU model was busy.
+        A score rather than a verdict, because the budget has to be spent in
+        some order and relevance is a better order than nearness. It is P(yes)
+        over the judge's first token, read from the logprobs the server already
+        computes -- so it costs nothing beyond the call that was being made
+        anyway. On the evaluate/ corpus it separates cleanly: legitimate
+        recalls land 0.899-0.998, traps 0.012-0.119.
+
+        Fail-open throughout: a timeout or an unparseable reply keeps the block
+        at exactly the floor, so it survives the cut but ranks below anything
+        the judge actually endorsed. The failure this guards against is a
+        mildly irrelevant note in the prompt; the failure it must not cause is
+        losing a relevant one because a CPU model was busy.
         """
-        async def verdict(pair):
+        floor = self.config.recall.judge_score_floor
+
+        async def score(pair):
             block, sim = pair
             try:
                 # Through the shared semaphore: the judge server has one slot,
@@ -636,27 +675,37 @@ class Pipeline:
                     async with httpx.AsyncClient(
                         timeout=self.config.recall.judge_timeout_s
                     ) as client:
-                        resp = await client.post(
-                            self.config.judge_endpoint.rstrip("/")
-                            + "/v1/chat/completions",
-                            json={
-                                "messages": [
-                                    {"role": "system",
-                                     "content": RELEVANCE_SYSTEM},
-                                    {"role": "user",
-                                     "content": relevance_prompt(
-                                         question,
-                                         judge_note_text(
-                                             block,
-                                             self.config.recall.judge_note))},
-                                ],
-                                "temperature": 0,
-                                "max_tokens": 4,
-                            },
-                        )
+                        payload = {
+                            "messages": [
+                                {"role": "system",
+                                 "content": RELEVANCE_SYSTEM},
+                                {"role": "user",
+                                 "content": relevance_prompt(
+                                     question,
+                                     judge_note_text(
+                                         block,
+                                         self.config.recall.judge_note))},
+                            ],
+                            "temperature": 0,
+                            "max_tokens": 4,
+                        }
+                        if self._judge_logprobs is not False:
+                            payload["logprobs"] = True
+                            payload["top_logprobs"] = 10
+                        url = (self.config.judge_endpoint.rstrip("/")
+                               + "/v1/chat/completions")
+                        resp = await client.post(url, json=payload)
+                        if (resp.status_code == 400
+                                and self._judge_logprobs is None):
+                            # A server without logprobs support must not turn
+                            # every judge call into a fail-open keep, which
+                            # would silently disable the second stage.
+                            self._judge_logprobs = False
+                            payload.pop("logprobs", None)
+                            payload.pop("top_logprobs", None)
+                            resp = await client.post(url, json=payload)
                         resp.raise_for_status()
-                        content = (resp.json().get("choices", [{}])[0]
-                                   .get("message", {}).get("content", ""))
+                        choice = resp.json().get("choices", [{}])[0]
             except Exception as e:
                 self.wal.write({
                     "event": "recall_judge_error",
@@ -665,15 +714,50 @@ class Pipeline:
                     "error": f"{type(e).__name__}: {e}",
                     "timestamp": time.time(),
                 })
-                return True
-            text = (content or "").strip().lower()
-            if text.startswith("no"):
-                return False
-            # Anything that is not a clear "no" keeps the block.
-            return True
+                return (block, sim, floor)
 
-        verdicts = await asyncio.gather(*[verdict(p) for p in blocks])
-        return [p for p, keep in zip(blocks, verdicts) if keep]
+            value = self._score_from_choice(choice)
+            if value is None:
+                return (block, sim, floor)
+            if self._judge_logprobs is None:
+                self._judge_logprobs = choice.get("logprobs") is not None
+            return (block, sim, value)
+
+        return list(await asyncio.gather(*[score(p) for p in blocks]))
+
+    @staticmethod
+    def _score_from_choice(choice: dict) -> Optional[float]:
+        """P(yes) from the first token, or the yes/no text if that is all there is.
+
+        Capitalisation variants are summed rather than picked: "Yes" and "yes"
+        are the same verdict, and on a small model the probability mass moves
+        between them for no reason worth modelling.
+        """
+        logprobs = choice.get("logprobs") or {}
+        content = logprobs.get("content") or []
+        if content:
+            yes = no = 0.0
+            for alt in (content[0].get("top_logprobs") or []):
+                token = (alt.get("token") or "").strip().lower()
+                if token not in ("yes", "no"):
+                    continue
+                try:
+                    p = math.exp(alt["logprob"])
+                except (KeyError, TypeError, OverflowError):
+                    continue
+                if token == "yes":
+                    yes += p
+                else:
+                    no += p
+            if yes + no > 0:
+                return yes / (yes + no)
+
+        text = ((choice.get("message") or {}).get("content") or "").strip().lower()
+        if not text:
+            return None
+        # Same decision the old parse made, expressed on the score's scale, so
+        # a server without logprobs behaves exactly as it did before.
+        return 0.0 if text.startswith("no") else 1.0
 
     def build_recall_injection(self, blocks: List[Tuple[Block, float]]) -> str:
         if not blocks:
@@ -1694,8 +1778,13 @@ class Pipeline:
         )
 
         if self.token_sink:
+            # The estimator, not a word count. This feeds judge.interval_tokens
+            # -- "how much new material has arrived" -- and a word count reads
+            # roughly 30% low on prose and far lower on code, so the judge was
+            # waiting for materially more content than the number claimed.
             self.token_sink(
-                len(full_reasoning.split()) + len(full_result.split())
+                self._estimate_tokens(full_reasoning)
+                + self._estimate_tokens(full_result)
             )
 
         # Plain transcript for the history sidebar. Blocks can't serve this:
@@ -1708,8 +1797,13 @@ class Pipeline:
             "conversation_id": conversation_id,
             "turn_index": turn_index,
             "recall_count": len(recall_blocks),
-            "reasoning_tokens": len(full_reasoning.split()),
-            "result_tokens": len(full_result.split()),
+            # Words, and named as such. These were "reasoning_tokens" and
+            # "result_tokens" while holding whitespace word counts, which is
+            # the same mislabelling that understated the store's token totals
+            # by 42% before backfill_token_counts.py caught it. Nothing reads
+            # them, so they are renamed rather than converted.
+            "reasoning_words": len(full_reasoning.split()),
+            "result_words": len(full_result.split()),
             "timestamp": time.time(),
         })
 
@@ -1832,8 +1926,13 @@ class Pipeline:
         )
 
         if self.token_sink:
+            # The estimator, not a word count. This feeds judge.interval_tokens
+            # -- "how much new material has arrived" -- and a word count reads
+            # roughly 30% low on prose and far lower on code, so the judge was
+            # waiting for materially more content than the number claimed.
             self.token_sink(
-                len(full_reasoning.split()) + len(full_result.split())
+                self._estimate_tokens(full_reasoning)
+                + self._estimate_tokens(full_result)
             )
 
         # Plain transcript for the history sidebar. Blocks can't serve this:
@@ -1846,8 +1945,13 @@ class Pipeline:
             "conversation_id": conversation_id,
             "turn_index": turn_index,
             "recall_count": len(recall_blocks),
-            "reasoning_tokens": len(full_reasoning.split()),
-            "result_tokens": len(full_result.split()),
+            # Words, and named as such. These were "reasoning_tokens" and
+            # "result_tokens" while holding whitespace word counts, which is
+            # the same mislabelling that understated the store's token totals
+            # by 42% before backfill_token_counts.py caught it. Nothing reads
+            # them, so they are renamed rather than converted.
+            "reasoning_words": len(full_reasoning.split()),
+            "result_words": len(full_result.split()),
             "timestamp": time.time(),
         })
 
