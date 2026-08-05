@@ -12,8 +12,16 @@ Measured on a 1,812-block store on 4 August 2026: 729 shelved blocks had no
 vector. 672 were empty -- no text, no stimulus, token_count 0 -- debris from
 the empty-turn bug fixed in "Stop the Gemma/OpenCode turn from going out
 empty". The other 57 held real content (26 reasoning, 16 result, 15 reading)
-and re-embedded on the first attempt, which is what says the original failure
-was transient rather than anything about the text.
+and re-embedded on the first attempt.
+
+That last fact was read as evidence the original failure was transient. It was
+not, or not only: this script used to truncate to 2,000 characters (~500
+tokens) while the pipeline truncated to 1,024 whitespace words, and on a
+2,048-token embedder 1,024 words of code measures 2,338 tokens. The pipeline
+was sending inputs the server refused with a 400 and the script was sending
+ones that fit, so "the backfill fixed it immediately" was the truncation
+difference, not the weather. The size limit is now enforced in tokens by
+EmbeddingClient.fit for every caller, so both paths send the same text.
 
     python backfill_missing_vectors.py --dry-run    # report, change nothing
     python backfill_missing_vectors.py              # re-embed
@@ -73,7 +81,11 @@ async def main() -> int:
 
     cfg = Config(Path(args.config))
     store = BlockStore(Path(cfg.store_path))
-    embed = EmbeddingClient(cfg.embed_endpoint)
+    embed = EmbeddingClient(cfg.embed_endpoint,
+                            ctx_tokens=cfg.embed_ctx_tokens,
+                            chars_per_token=cfg.chars_per_token,
+                            tokens_per_word=cfg.tokens_per_word)
+    embed.detect_ctx_tokens()
     index = VectorIndex(Path(cfg.store_path), dim=cfg.embed_dim)
     index.open()
 
@@ -129,7 +141,10 @@ async def main() -> int:
                     block.embed_text = truncate_tokens(
                         block.text, cfg.embed_token_limit)
                     await asyncio.to_thread(store.put, block)
-        text = embed_source_text(block, cfg.embed_source)[:2000]
+        # No character cap here: EmbeddingClient.fit enforces the server's real
+        # window, and a second, tighter cap in this script is what made a
+        # repaired block carry a different vector from a healthy one.
+        text = embed_source_text(block, cfg.embed_source)
         if not text.strip():
             empty += 1
             if args.purge_empty and not args.dry_run:

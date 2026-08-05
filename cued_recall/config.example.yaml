@@ -33,8 +33,16 @@ block_tokens_reasoning: 8000
 # re-ingest. Run evaluate/eval_retrieval.py's sweep first, then:
 #   python backfill_missing_vectors.py --fill-embed-text --all
 embed_source: composite
-# Cap on either embed text, in words. The embedder's window is the real limit.
+# Cap on either embed text, in whitespace words -- a first pass only. The
+# binding limit is embed_ctx_tokens below, enforced in tokens, because words
+# and tokens diverge worst on exactly the content worth keeping: 1,024 words of
+# a code-heavy think trace measures 2,338 tokens on this stack.
 embed_token_limit: 1024
+# The embedding server's context window. Detected from its /props at startup;
+# this is only the fallback for a server that will not report one. An input
+# over the window comes back HTTP 400 and the block is stored but never
+# becomes recallable.
+embed_ctx_tokens: 2048
 # Prompt budget in real tokens. run.py derives this from the reasoning
 # server's --ctx-size (minus room for the reply and for tool definitions)
 # and rewrites it on every launch, so it can't drift out of sync with the

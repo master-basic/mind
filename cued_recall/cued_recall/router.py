@@ -206,7 +206,7 @@ def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_ru
             # Same field the pipeline and judge index on, via the one helper --
             # a restored block must be findable by the same text as one that
             # was never purged.
-            source_text = embed_source_text(block, embed_source)[:2000]
+            source_text = embed_source_text(block, embed_source)
             if source_text:
                 try:
                     vec = await asyncio.to_thread(embed.embed, source_text)
@@ -392,7 +392,7 @@ def build_admin_router(index: VectorIndex, store: BlockStore, wal: WAL, judge_ru
             # Embeddings aren't portable across instances running different
             # embedding models, so the receiving side always re-embeds locally
             # rather than trusting a vector shipped in the export.
-            source_text = embed_source_text(block, embed_source)[:2000]
+            source_text = embed_source_text(block, embed_source)
             if source_text:
                 try:
                     vec = await asyncio.to_thread(embed.embed, source_text)

@@ -227,9 +227,19 @@ class Config:
                 f"embed_source must be 'composite' or 'content', "
                 f"got {self.embed_source!r}"
             )
-        # Cap on either embed text. The embedder's window is the real limit;
-        # this keeps a pasted document from being sent whole.
+        # Cap on either embed text, in whitespace words. A first pass only:
+        # the binding limit is embed_ctx_tokens, enforced in tokens by
+        # EmbeddingClient.fit, because words and tokens diverge worst exactly
+        # where it matters (1,024 words of code measured 2,338 tokens here).
         self.embed_token_limit: int = raw.get("embed_token_limit", 1024)
+        # The embedding server's context window. Overwritten at startup from
+        # the server's own /props -- the config value is only the fallback for
+        # a server that will not say. An input past this comes back HTTP 400,
+        # and _embed_and_store swallows it, so the block is stored, listed in
+        # the admin table, and unrecallable forever. The old guard was a
+        # 16,000-character cap written for an 8,192-token window while this
+        # stack runs nomic-embed at 2,048, so it never once fired.
+        self.embed_ctx_tokens: int = raw.get("embed_ctx_tokens", 2048)
         self.recall = RecallConfig(raw.get("recall", {}))
         self.judge = JudgeConfig(raw.get("judge", {}))
         self.tagger = TaggerConfig(raw.get("tagger", {}))

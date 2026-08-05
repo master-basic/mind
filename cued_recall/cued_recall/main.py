@@ -50,7 +50,16 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
     store = BlockStore(store_path)
     chats = ChatStore(store_path)
     chats.open()
-    embed = EmbeddingClient(cfg.embed_endpoint)
+    embed = EmbeddingClient(cfg.embed_endpoint,
+                            ctx_tokens=cfg.embed_ctx_tokens,
+                            chars_per_token=cfg.chars_per_token,
+                            tokens_per_word=cfg.tokens_per_word)
+    # Same principle as embed_dim below and _clamp_context_budget: the running
+    # server is the authority on its own window, not the config file. An input
+    # over that window is a 400 that _embed_and_store swallows, which is the
+    # difference between a block that is recallable and one that is stored,
+    # listed, and invisible forever.
+    cfg.embed_ctx_tokens = embed.detect_ctx_tokens()
 
     # The vector index dimension MUST match the embedding model's output
     # (e.g. nomic-embed-text-v1.5 = 768). A mismatch makes every upsert/query
