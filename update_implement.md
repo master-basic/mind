@@ -48,6 +48,84 @@ one defect nobody had ranked turned out to be the largest.
 
 232 unit tests, no servers needed, under ten seconds.
 
+### Every plan item, and where it stands
+
+`update_plan.md` in full, so "what is left" is a lookup rather than a reading.
+
+| Plan item | State | Where |
+|---|---|---|
+| 0.1 unit-test seam | **done** | §1 |
+| 0.2 missing-vector health signal | **done** | §2 |
+| 0.3 baseline run | **done** | §8 |
+| 1.1 embed_text vs stimulus_text | **done**, as a switch not a swap | §6 |
+| 1.2 re-embed the store as a migration | **refused** — measured, and the premise is wrong | §8 |
+| 1.3 asymmetry wording for the judge | **tried, failed** — the fix was the note, not the wording | §9 |
+| 1.3 asymmetric trap rows in the corpus | **not done** | below |
+| 2.1 score, rank, then fill | **done** | §10 |
+| 2.2 token-count honesty | **done** | §10 |
+| 3.1 prototype/abstraction pass | **done, shipped off** | §12 |
+| 3.2 graded utility decay | **done** | §11 |
+| 3.3 persist the acceptance signal | **done** | §11 |
+| 4.1 scope correction by block type | **done** | §4 |
+| 4.2 span-level corrections | **not done** | below |
+| 5.1 tag/gist as a retrieval channel | **not done** | below |
+| 5.2 similarity floor + embed-failure fallback | **not done** | below |
+| 6.1 re-embed when text changes | **done** | §6 |
+| 6.2 consistent "user's question" | **done** | §5 |
+| 7.1 blocks off the response path | **not done** | below |
+| 7.2 kill the O(n) scans | **done** | §3 |
+| 7.3 pin priority in the budget | **not done** | below |
+| *cross-cutting* config surface | **partly** — keys for shipped phases only | below |
+| *cross-cutting* eval corpus rows | **not done** | below |
+| *cross-cutting* README / ARCHITECTURE / CHANGELOG | **not done** | below |
+
+### Findings, F1–F14
+
+| | Finding | State |
+|---|---|---|
+| F1 | no prototype layer | **done** — merge pass, off by default (§12) |
+| F2 | symmetric retrieval / composite embedding | **measured, refuted**; the real defect was the judge's note (§8, §9) |
+| F3 | one flat level of representation | **open** — Phase 5.1 |
+| F4 | correction is all-or-nothing | **half** — turn scope fixed (§4); span-level open (4.2) |
+| F5 | decay is arithmetic, not utility | **done** (§11) |
+| F6 | budget filled by geometry before the judge | **done** (§10) |
+| F7 | index/vector drift and silent vector loss | **done**, and the cause was not what F7 said (§2, §6, §7) |
+| F8 | blocks created after `[DONE]` | **open** — Phase 7.1 |
+| F9 | inconsistent "last user message" | **done** (§5) |
+| F10 | single embedding space, no fallback | **open** — Phase 5.2 |
+| F11 | tags/gist written but never used | **open** — Phase 5.1, and §9 found the gist carries real signal |
+| F12 | per-turn O(n) scans | **done** (§3) |
+| F13 | acceptance signal is in-memory | **done** (§11) |
+| F14 | pins do not help retrieval | **open** — Phase 7.3 |
+
+### Config keys added
+
+All shipped with the measured value as the default. Documented in
+`config.example.yaml` next to the number that justifies them.
+
+| Key | Default | What it decides |
+|---|---|---|
+| `embed_source` | `composite` | which text feeds the vector index (§8) |
+| `embed_token_limit` | `1024` | first-pass word cap on either embed text |
+| `embed_ctx_tokens` | `2048` | embedder window; overwritten from `/props` at startup (§7) |
+| `recall.judge_note` | `question` | what the judge reads as the note (§9) |
+| `recall.candidate_multiplier` | `1` | how many candidates the judge scores (§10) |
+| `recall.judge_score_floor` | `0.5` | relevance score below which a candidate is dropped (§10) |
+| `judge.recall_record_ttl_s` | `604800` | how long an unconsumed recall record is kept (§11) |
+| `judge.utility_decay` | `true` | decay by earned utility rather than "ever recalled" (§11) |
+| `judge.utility_recall_weight` | `30.0` | days of idleness one recall earns |
+| `judge.utility_uncontested_weight` | `60.0` | extra days for an uncontested recall |
+| `judge.utility_floor` | `0.0` | utility at or below which a block purges |
+| `judge.merge_enabled` | `false` | the abstraction pass (§12) |
+| `judge.merge_cluster_sim` | `0.90` | similarity at which two blocks are the same ground |
+| `judge.merge_min_cluster` | `3` | how many near-duplicates before generalising |
+| `judge.merge_min_age_s` | `604800` | how settled a cluster must be |
+| `judge.merge_max_per_pass` | `5` | merges per pass |
+
+The plan also names `recall.floor`, `recall.tag_channel` and
+`recall.pin_priority`. Those belong to Phases 5 and 7.3 and do not exist yet —
+adding a key for an unimplemented behaviour would be worse than not having it.
+
 ### 1 — Test seam (Phase 0.1)
 
 `cued_recall/tests/`, `pytest` in an optional `dev` extra. Covers the pure
@@ -378,15 +456,32 @@ refused.
 
 ## Not done
 
-Blocked on nothing — these are simply next.
+Blocked on nothing — these are simply next. Roughly in the order I would take
+them.
 
-| Plan item | Why not yet |
+### Code
+
+| Plan item | Size | Why not yet |
+|---|---|---|
+| **7.3** pin priority in the budget (F14) | small | Unblocked: Phase 2's ranked fill is the hook it needed, so a pin raises a block's effective score at fill time. Cheapest remaining item. |
+| **5.2** similarity floor + embed-failure fallback (F10) | small | Independent of 5.1. Skipping the judge below a cosine floor removes the 1.5–2.2 s off-topic tax the README already calls "Not implemented"; falling back to a keyword channel stops an embed outage meaning zero recall. |
+| **7.1** blocks off the response path (F8) | medium | Straight durability fix, needs no eval. `_create_blocks` runs after `[DONE]`, so a client disconnecting there loses the turn's memory entirely. |
+| **5.1** tag/gist as a retrieval channel (F3, F11) | medium | Newly interesting: §9 measured the gist at 17/18 recall and **0/6** trap leakage, the first evidence the taxonomy carries real signal rather than being decoration. |
+| **4.2** span-level corrections (F4) | large | Needs new output from `verifier.py` — a span, not a yes/no — so it is a model-output change, not a plumbing one. |
+| **3.1** decide whether to enable merging | judgement | Built and off. Snapshot, set `merge_enabled: true`, run a pass, read the `blocks_merged` and `merge_rejected` events. The one merge measured was factually wrong and correctly refused — a sample of one. |
+
+### Evals and docs (the plan's cross-cutting section)
+
+Both were in `update_plan.md` from the start and neither has been touched. They
+are listed separately because they are not features and are easy to lose.
+
+| Item | State |
 |---|---|
-| **Phase 3.1 — deciding whether to turn merging on** | Built and defaulted off. Before enabling it on a real store: snapshot, set `merge_enabled: true`, run a pass, and read the `blocks_merged` and `merge_rejected` WAL events. The one merge measured so far was factually wrong and correctly refused; that is a sample of one. |
-| **Phase 4.2** — span-level corrections (F4) | Needs new output from `verifier.py` (a span, not a yes/no). Phase 4.1 landed. |
-| **Phase 5** — tag/gist retrieval channel, similarity floor (F3, F10, F11) | Worth revisiting: §9 measured the gist at 17/18 recall and 0/6 trap leakage, which is the first evidence that the taxonomy carries real signal rather than being decoration. The similarity floor (5.2) is independent and cheap. |
-| **Phase 7.1** — block persistence off the response path (F8) | Straight durability fix, needs no eval. |
-| **Phase 7.3** — pin priority in the budget (F14) | Unblocked now: Phase 2's ranked fill is the hook it needed. A pin would raise a block's effective score at fill time. |
+| **Corpus rows** — asymmetric `trap` rows (1.3), tag-overlap rows (5.1), multi-claim correction rows (4.2) | Not done. `corpus.jsonl` is unchanged at 6 seeds / 35 probes. **This is the binding constraint on everything measured so far**: every headline number in §8–§10 rests on n=6 per relation, and both the judge-note fix and the merge verifier were validated against that same small set. Widening the corpus is worth more than the next feature. |
+| **Regrade `grading_traps.md`** | Not done. It records the RECALL-ON answers anchoring on the seed's wrong stack; §9 and §10 should have changed that, and re-running it is the end-to-end confirmation the retrieval sweep cannot give. |
+| **`README.md`** — features | Not done. It still describes the similarity floor as "Not implemented" (correct) but says nothing about `judge_note`, `embed_source` or utility decay. |
+| **`ARCHITECTURE.md`** — embed_text vs stimulus_text, merge pass, utility decay | Not done. The three sections the plan names are exactly the three concepts a reader now cannot get from it. |
+| **`CHANGELOG.md`** | Not done. Twelve behaviour-changing commits are unlisted. |
 
 ## Corrections to the source documents
 
@@ -424,6 +519,8 @@ Recorded here because both documents are committed and now partly wrong:
 
 ```
 cd cued_recall && python -m pytest
+python report_decay.py               # what a judge pass would purge, and why
+python report_decay.py --old-rule    # what the pre-utility rule would purge
 cd ../evaluate
 python make_seed_blocks.py
 python eval_retrieval.py --key-source composite --judge --json baseline_composite.json
