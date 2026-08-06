@@ -31,7 +31,7 @@ Client ──▶ Cued Recall Middleware ──▶ llama-server (reasoning)
 ```
 
 Four server processes managed by the launcher:
-- **Reasoning** — main LLM (Qwen3.5-9B by default, catalog of 6 including 35B-A3B MoE)
+- **Reasoning** — main LLM (Qwen3.5-9B by default, catalog of 6 role models: fast assistant, vision+voice, fast thinker, MoE abliterated, coding)
 - **Judge** — rewrites long think traces; also tags blocks and classifies corrections (Qwen2.5-1.5B, CPU-only)
 - **Embedding** — vector retrieval keys (nomic-embed-text-v1.5)
 - **Middleware** — FastAPI proxy (this project)
@@ -82,12 +82,12 @@ second.
 | Web search | Working | 4 backends: DuckDuckGo (free), Brave, Serper, SearXNG |
 | Web fetch | Working | SSRF-guarded, HTML-to-text, JSON detection |
 | Tool calling | Working | Own tools (web_search, web_fetch) + client tool forwarding |
-| Model catalog | Working | 6 reasoning models with interactive menu; launch details remembered per model |
+| Model catalog | Working | 6 role models with interactive menu; launch details remembered per model |
 | VRAM autosizing | Working | Context window sized from free VRAM + GGUF KV geometry; leftover VRAM spent on MoE expert layers (`--n-cpu-moe`) |
 | MoE support | Working | 17–20 GB A3B models on a 12 GB card, experts in system RAM |
 | Wedge watchdog | Working | Detects a llama.cpp server whose `/health` answers but whose inference queue is blocked, and restarts it |
 | Server logs | Working | Each llama-server's stdout in `logs/{name}.log` |
-| Built-in chat UI | Working | Streaming, reasoning pane, file upload, Stop button |
+| Built-in chat UI | Working | Streaming, reasoning pane, file upload, image attach, voice recording (STT), Stop button |
 | Chat history | Working | Durable transcripts in `chats.db` with a sidebar; independent of the block lifecycle |
 | Admin web GUI | Working | Tabbed: Live (context, GPU, throughput), Memory (analytics), Blocks (table) |
 | GPU/system telemetry | Working | Per-GPU and per-process usage, uptime, launch plan |
@@ -135,10 +135,42 @@ run.bat                          # Windows — double-click or run in terminal
 python run.py                    # Linux
 ```
 
-First run offers a model menu, downloads 3 models (~8 GB with the default
-reasoning model), prints a launch plan showing what runs where and with how much
-context, then starts 4 servers. Chat UI at `http://127.0.0.1:8000`, admin at
-`/admin`. Later runs reuse the remembered answers without asking.
+First run offers a model menu, downloads 3 models (~9 GB with the default
+reasoning model and its vision projector), prints a launch plan showing what
+runs where and with how much context, then starts 5 servers (reasoning, judge,
+embedding, speech-to-text, middleware). Chat UI at `http://127.0.0.1:8000`,
+admin at `/admin`. Later runs reuse the remembered answers without asking.
+
+### Images and voice in the chat
+
+- **Images** — 🖼️ in the composer attaches pictures; they travel as OpenAI-style
+  `image_url` content parts through the middleware and are seen by any
+  vision-capable catalog model (choices 1, 2 and 4 ship with an mmproj
+  projector). The memory pipeline stays text-only: images are answered but not
+  embedded.
+- **Voice** — 🎤 records the mic (MediaRecorder), re-encodes the audio in the
+  browser as 16 kHz mono WAV, and POSTs it to the middleware's `/v1/stt`,
+  which proxies it to the whisper.cpp server that `run.py` starts on port 8083
+  (`whisper-server` + `ggml-large-v3-turbo-q8_0.bin` — 99 languages including
+  Russian and Azerbaijani — auto-downloaded from the `ggerganov/whisper.cpp`
+  repo into `C:\llama\whisper\models\`; pass `--skip-stt` to disable). The
+  chat page has a transcription-language selector next to the mic
+  (Auto / Русский / Azərbaycanca / English); Auto detects the language per
+  recording, and pinning a language is the reliable fix for mixed-speech
+  turns. The transcript is inserted into your message as `[You said: …]`, so
+  spoken words go through the same memory pipeline as typed ones. `--stt-model`
+  swaps the model: `ggml-large-v3-q5_0.bin` (1 GB) is the full non-turbo
+  large-v3 — a bit more accurate on short utterances but ~2× slower — and
+  `ggml-large-v3.bin` (2.9 GB, fp16) is the slowest and most accurate. For
+  short turns in a low-resource language, pin the language in the selector —
+  auto-detect can mis-pick (e.g. Azerbaijani → Turkish/Russian).
+
+  If the whisper.cpp **CUDA build** is unpacked to `C:\llama\whisper\cuda\`
+  (from `whisper-cublas-*-bin-x64.zip`), `run.py` prefers it automatically:
+  transcription drops from seconds to ~0.3 s and even the fp16 model is
+  interactive. Its ~1.1 GB of VRAM is charged against the reasoning window up
+  front (the context autosizer subtracts it), and `--stt-cpu` forces the CPU
+  build instead.
 
 ### Reaching it from another machine
 

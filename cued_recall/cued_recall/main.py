@@ -9,7 +9,7 @@ from pathlib import Path
 import uvicorn
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse, JSONResponse
 
 from .chats import ChatStore
@@ -238,6 +238,49 @@ def create_app(config_path: str = "config.yaml") -> FastAPI:
             return JSONResponse(content={"url": url, "content": content})
         except Exception as e:
             return JSONResponse(content={"error": str(e)}, status_code=500)
+
+    @app.post("/v1/stt")
+    async def speech_to_text(file: UploadFile = File(...),
+                             language: str = Form("auto")):
+        """Transcribe a voice recording through the whisper.cpp backend.
+
+        The chat page records the mic with MediaRecorder (webm/ogg) and POSTs
+        it here as multipart form data, along with a transcription language
+        (ISO code or "auto" for per-recording detection -- the chat page's
+        selector defaults to auto). The transcript comes back as plain text
+        and is fed into the next user message, so the memory pipeline treats
+        spoken words exactly like typed ones.
+        """
+        if not (cfg.stt_endpoint or "").strip():
+            return JSONResponse(content={"error": "stt_endpoint not configured"},
+                                status_code=503)
+        data = await file.read()
+        if not data:
+            return JSONResponse(content={"error": "empty audio"}, status_code=400)
+        wal.write({
+            "event": "stt_request",
+            "size_bytes": len(data),
+            "content_type": file.content_type,
+            "timestamp": time.time(),
+        })
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=90) as client:
+                r = await client.post(
+                    cfg.stt_endpoint.rstrip("/") + "/inference",
+                    files={"file": (file.filename or "audio.webm", data,
+                                    file.content_type or "audio/webm")},
+                    data={"language": language or "auto"},
+                )
+                if r.status_code != 200:
+                    return JSONResponse(
+                        content={"error": f"stt backend {r.status_code}: {r.text[:200]}"},
+                        status_code=502,
+                    )
+                text = r.json().get("text", "")
+                return JSONResponse(content={"text": text})
+        except Exception as e:
+            return JSONResponse(content={"error": str(e)}, status_code=502)
 
     @app.get("/admin")
     async def admin_page():

@@ -85,13 +85,18 @@ button.stop { background: #da3633; }
 button.stop:hover { background: #f85149; }
 .stopped-note { font-size: 11px; color: #8b949e; margin-top: 4px; }
 .attach { background: #21262d; color: #c9d1d9; padding: 0 12px; font-size: 16px; }
+.sttlang { background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 8px; font-size: 13px; padding: 0 6px; max-width: 110px; }
 .attach:hover { background: #30363d; }
 .attachments { max-width: 780px; margin: 0 auto 8px; display: flex; flex-wrap: wrap; gap: 6px; }
 .attachments:empty { display: none; }
 .chip { display: inline-flex; align-items: center; gap: 6px; background: #161b22; border: 1px solid #30363d; border-radius: 14px; padding: 3px 10px; font-size: 12px; color: #c9d1d9; }
 .chip-x { cursor: pointer; color: #8b949e; font-size: 11px; display: inline-flex; align-items: center; justify-content: center; min-width: 24px; min-height: 24px; margin: -4px -6px -4px 0; }
 .chip-x:hover { color: #f85149; }
+.chip-img { height: 18px; border-radius: 3px; display: inline-block; }
+.msg-img { max-width: 220px; max-height: 220px; border-radius: 6px; margin: 2px 6px 2px 0; display: inline-block; vertical-align: top; }
 .msg-files { font-size: 11px; color: #8b949e; margin-top: 4px; }
+.attach.recording { color: #f85149; background: #2d0a0c; }
+.attach.busy { opacity: 0.5; pointer-events: none; }
 .hint { max-width: 780px; margin: 6px auto 0; font-size: 11px; color: #484f58; }
 .err { color: #f85149; }
 
@@ -163,11 +168,21 @@ button.stop:hover { background: #f85149; }
   <div class="composer">
     <input type="file" id="file" multiple hidden
       accept=".txt,.md,.markdown,.py,.js,.ts,.json,.csv,.tsv,.log,.html,.css,.xml,.yaml,.yml,.ini,.cfg,.conf,.sh,.bat,.c,.cpp,.h,.hpp,.java,.go,.rs,.rb,.php,.sql,text/*">
+    <input type="file" id="imgfile" multiple hidden accept="image/*">
     <button id="attach" class="attach" type="button" title="Attach text or code files" aria-label="Attach text or code files">📎</button>
+    <button id="attachimg" class="attach" type="button" title="Attach images" aria-label="Attach images">🖼️</button>
+    <select id="sttlang" class="sttlang" title="Transcription language (auto detects per recording)"
+      aria-label="Transcription language">
+      <option value="auto" selected>Auto</option>
+      <option value="ru">Русский</option>
+      <option value="az">Azərbaycanca</option>
+      <option value="en">English</option>
+    </select>
+    <button id="mic" class="attach" type="button" title="Record voice (transcribed to text)" aria-label="Record voice">🎤</button>
     <textarea id="input" rows="1" enterkeyhint="enter" placeholder="Send a message…"></textarea>
     <button id="send" type="button">Send</button>
   </div>
-  <div class="hint">Enter sends, Shift+Enter for a newline. Goes through the memory middleware on this port. Attach text/code files with 📎 (their contents are read and included). Conversations are saved — pick one from the sidebar to continue it.</div>
+  <div class="hint">Enter sends, Shift+Enter for a newline. Goes through the memory middleware on this port. Attach text/code files with 📎 (their contents are read and included), images with 🖼️ (the model sees them — needs a vision-capable model choice), and speak with 🎤 (transcribed to text). Conversations are saved — pick one from the sidebar to continue it.</div>
 </footer>
   </div><!-- #main -->
 </div><!-- #shell -->
@@ -198,9 +213,14 @@ const $input = document.getElementById('input');
 const $send = document.getElementById('send');
 const $file = document.getElementById('file');
 const $attach = document.getElementById('attach');
+const $imgfile = document.getElementById('imgfile');
+const $attachimg = document.getElementById('attachimg');
+const $mic = document.getElementById('mic');
+const $sttlang = document.getElementById('sttlang');
 const $attachments = document.getElementById('attachments');
 
 const attachments = [];   // { name, content } read from disk, cleared on send
+const images = [];        // { name, dataUrl } pasted by the user, sent as image_url parts
 
 // Touch devices get mobile behaviour: no Enter-to-send (the on-screen Return
 // key types a newline instead), and no programmatic focus that would throw the
@@ -276,7 +296,33 @@ function renderAttachments() {
     chip.appendChild(x);
     $attachments.appendChild(chip);
   });
+  images.forEach((im, i) => {
+    const chip = el('span', 'chip');
+    const pic = el('img', 'chip-img');
+    pic.src = im.dataUrl;
+    pic.alt = im.name;
+    chip.appendChild(pic);
+    chip.appendChild(el('span', null, im.name));
+    const x = el('span', 'chip-x', '✕');
+    x.addEventListener('click', () => { images.splice(i, 1); renderAttachments(); });
+    chip.appendChild(x);
+    $attachments.appendChild(chip);
+  });
 }
+
+$attachimg.addEventListener('click', () => $imgfile.click());
+$imgfile.addEventListener('change', () => {
+  for (const f of $imgfile.files) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      images.push({ name: f.name, dataUrl: String(reader.result || '') });
+      renderAttachments();
+    };
+    reader.onerror = () => notify('Could not read ' + f.name);
+    reader.readAsDataURL(f);
+  }
+  $imgfile.value = '';   // allow re-selecting the same file
+});
 
 function setStatus(ok, text) {
   document.getElementById('dot').className = ok ? 'ok' : '';
@@ -371,6 +417,106 @@ function setGenerating(on) {
   $send.classList.toggle('stop', on);
 }
 
+let micRec = null;
+let micChunks = [];
+let micMime = 'audio/webm';
+
+// whisper.cpp accepts WAV/MP3/OGG but not the WebM/Opus container Chrome's
+// MediaRecorder produces by default. Decode the recording in the browser and
+// re-encode it as 16 kHz mono 16-bit PCM WAV before uploading.
+function encodeWav(samples, sampleRate) {
+  const n = samples.length;
+  const buf = new ArrayBuffer(44 + n * 2);
+  const view = new DataView(buf);
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) view.setUint8(o + i, s.charCodeAt(i)); };
+  str(0, 'RIFF'); view.setUint32(4, 36 + n * 2, true); str(8, 'WAVE');
+  str(12, 'fmt '); view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);          // PCM
+  view.setUint16(22, 1, true);          // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  str(36, 'data'); view.setUint32(40, n * 2, true);
+  let o = 44;
+  for (let i = 0; i < n; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    o += 2;
+  }
+  return buf;
+}
+
+async function blobToWav(blob) {
+  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  try {
+    const raw = await audioCtx.decodeAudioData(await blob.arrayBuffer());
+    const rate = 16000;
+    const offline = new OfflineAudioContext(1, Math.ceil(raw.duration * rate), rate);
+    const src = offline.createBufferSource();
+    src.buffer = raw;
+    src.connect(offline.destination);
+    src.start(0);
+    const rendered = await offline.startRendering();
+    return encodeWav(rendered.getChannelData(0), rate);
+  } finally {
+    audioCtx.close().catch(() => {});
+  }
+}
+
+$mic.addEventListener('click', async () => {
+  if (micRec) { micRec.stop(); return; }   // stop-recording toggle
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    // Explicit bitrate: Chrome's default opus rate (~32-64 kbps) is lossy
+    // enough to hurt short-phrase recognition before we even decode to PCM.
+    let opts = { audioBitsPerSecond: 128000 };
+    try { micRec = new MediaRecorder(stream, opts); }
+    catch (e) { micRec = new MediaRecorder(stream); }
+    micChunks = [];
+    micMime = micRec.mimeType || 'audio/webm';
+    micRec.ondataavailable = e => { if (e.data.size) micChunks.push(e.data); };
+    micRec.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop());
+      micRec = null;
+      $mic.classList.remove('recording');
+      $mic.textContent = '🎤';
+      if (!micChunks.length) return;
+      const blob = new Blob(micChunks, { type: micMime });
+      const fd = new FormData();
+      fd.append('language', $sttlang.value);
+      try {
+        fd.append('file', new Blob([await blobToWav(blob)], { type: 'audio/wav' }),
+                  'recording.wav');
+      } catch (e) {
+        notify('Could not decode the recording: ' + e.message);
+        return;
+      }
+      $mic.classList.add('busy');
+      try {
+        const r = await fetch(API + '/v1/stt', { method: 'POST', body: fd });
+        const j = await r.json();
+        if (!r.ok) throw new Error((j.error || r.status) + '');
+        if (j.text && j.text.trim()) {
+          const said = '[You said: ' + j.text.trim() + ']';
+          $input.value = ($input.value ? $input.value + ' ' : '') + said;
+          focusInput();
+        } else {
+          notify('No speech recognized — try again?');
+        }
+      } catch (e) {
+        notify('Transcription failed: ' + e.message);
+      }
+      $mic.classList.remove('busy');
+    };
+    micRec.start();
+    $mic.classList.add('recording');
+    $mic.textContent = '⏹';
+  } catch (e) {
+    notify('Microphone unavailable: ' + e.message);
+  }
+});
+
 async function send() {
   const text = $input.value.trim();
   if (!text && attachments.length === 0) return;
@@ -379,21 +525,41 @@ async function send() {
 
   // Take and clear the pending attachments
   const attached = attachments.splice(0);
+  const imgs = images.splice(0);
   renderAttachments();
 
-  // What the model receives: full file contents + the typed text
+  // What the model receives: full file contents + the typed text, plus any
+  // images as OpenAI-style image_url parts (survives the middleware's parts
+  // handling and reaches vision-capable models).
   let content = text;
-  if (attached.length) {
+  if (attached.length || imgs.length) {
     const blocks = attached
       .map(a => '[Attached file: ' + a.name + ']\n' + a.content)
       .join('\n\n');
-    content = blocks + (text ? '\n\n---\n\n' + text : '');
+    const textStr = [blocks, text].filter(Boolean).join('\n\n---\n\n');
+    if (imgs.length) {
+      const parts = [{ type: 'text', text: textStr }];
+      imgs.forEach(im => parts.push({ type: 'image_url', image_url: { url: im.dataUrl } }));
+      content = parts;
+    } else {
+      content = textStr;
+    }
   }
 
   // What the user sees: their text plus a compact file note (not the dump)
   const userBody = addMessage('user', text || '');
   if (attached.length) {
     userBody.appendChild(el('div', 'msg-files', '📎 ' + attached.map(a => a.name).join(', ')));
+  }
+  if (imgs.length) {
+    const pics = el('div', 'msg-files');
+    imgs.forEach(im => {
+      const pic = el('img', 'msg-img');
+      pic.src = im.dataUrl;
+      pic.alt = im.name;
+      pics.appendChild(pic);
+    });
+    userBody.appendChild(pics);
   }
   history.push({ role: 'user', content });
 

@@ -4,7 +4,7 @@
 
 Cued Recall is a local AI proxy that sits between an OpenAI-compatible chat client and `llama-server`, providing persistent reasoning memory via a block lifecycle — blocks are created from model responses, shelved for future recall, then either rewritten shorter by a smaller judge model or forgotten by a decay rule.
 
-## Four-Process Topology
+## Five-Process Topology
 
 ```
    run.py (launcher + supervisor)
@@ -25,13 +25,14 @@ Cued Recall is a local AI proxy that sits between an OpenAI-compatible chat clie
                      └─────────┘ └──────────┘ └───────────────┘
 ```
 
-Four server processes managed by `run.py`:
+Five server processes managed by `run.py`:
 
 | Server | Default Model | Port | Hardware |
 |---|---|---|---|
 | Reasoning | Qwen3.5-9B-Q5_K_M (catalog of 6) | 8080 | GPU, context autosized |
 | Judge | Qwen2.5-1.5B-Instruct-Q4_K_M | 8081 | CPU (`-ngl 0`) |
 | Embedding | nomic-embed-text-v1.5 | 8082 | CPU |
+| Speech-to-text | whisper.cpp whisper-server (large-v3-turbo-q8_0, 99 languages) | 8083 | CPU |
 | Middleware | This project | 8000 | CPU |
 
 `run.py` is not only a starter. It sizes the reasoning server's context window

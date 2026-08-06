@@ -20,6 +20,11 @@ except ImportError:  # pragma: no cover - Windows Python < 3.9
 import httpx
 import numpy as np
 
+# Flat token charge per image part. llama.cpp tokenizes a 4x4-tiled image to
+# ~658 tokens; padded up so the history trimmer never hands the server a
+# prompt it cannot fit.
+IMAGE_TOKENS_PER_IMAGE = 700
+
 # ddgs (Dux Distributed Global Search) is a keyless metasearch fallback for
 # web_search. Optional: if it is not installed (or its native dep won't build
 # on this Python), _DDGS_AVAILABLE is False and the backend is simply skipped.
@@ -263,6 +268,26 @@ class Pipeline:
         return estimate_tokens(text, self.config.chars_per_token,
                                self.config.tokens_per_word)
 
+    @staticmethod
+    def _msg_image_count(m) -> int:
+        """How many image_url parts a message carries (0 for plain text)."""
+        c = m.get("content", "")
+        if not isinstance(c, list):
+            return 0
+        return sum(1 for p in c
+                   if isinstance(p, dict) and p.get("type") == "image_url")
+
+    def _msg_token_estimate(self, m) -> int:
+        """Token estimate for a message including its non-text parts.
+
+        Images are charged at a flat rate each: llama.cpp tokenizes a
+        4x4-tiled image to ~658 tokens. Counting only the text under-counts,
+        hands the server a prompt bigger than its window and gets a hard 400;
+        over-counting only trims history early.
+        """
+        return (self._estimate_tokens(self._msg_text(m))
+                + self._msg_image_count(m) * IMAGE_TOKENS_PER_IMAGE)
+
     async def _count_tokens(self, text: str) -> int:
         """Exact count from the reasoning model's tokenizer, estimate on failure."""
         return await count_tokens(
@@ -314,6 +339,11 @@ class Pipeline:
         and the latest user turn, the truncation step empties the user message.
         """
         blob = "\n".join(self._msg_text(m) for m in messages)
+        # Images cannot be tokenized as text: their ~658 tokens each come from
+        # the vision encoder, which /tokenize never sees. The estimate counts
+        # them; an exact count would silently drop them and overflow again.
+        if any(self._msg_image_count(m) for m in messages):
+            return None
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 r = await client.post(
@@ -367,7 +397,7 @@ class Pipeline:
         overhead = self._payload_overhead_tokens(messages, body)
         limit = max(512, limit - overhead)
 
-        per_msg = [self._estimate_tokens(self._msg_text(m)) for m in messages]
+        per_msg = [self._msg_token_estimate(m) for m in messages]
         total = sum(per_msg)
 
         # Near the limit the estimate is not good enough to bet a hard 400 on.
@@ -550,7 +580,7 @@ class Pipeline:
         # Express the target in whatever units the estimator uses, via the
         # ratio between its estimate and the server's real count.
         real_target = target
-        est = sum(self._estimate_tokens(self._msg_text(m)) for m in messages)
+        est = sum(self._msg_token_estimate(m) for m in messages)
         if n_prompt and est:
             # SHRINK_MARGIN keeps the retry strictly smaller than the payload
             # that was just rejected. Without it the converted budget can land

@@ -42,35 +42,36 @@ TMPFS_SIZE = "64G"
 REASONING_CATALOG = [
     {
         "num": 1,
-        "label": "Qwen3.5-9B (default)                  6.6 GB  dense, full GPU",
+        "label": "Fast assistant — Qwen3.5-9B (default)     6.6 GB  dense, full GPU",
         "repo": "unsloth/Qwen3.5-9B-GGUF",
         "file": "Qwen3.5-9B-Q5_K_M.gguf",
         "moe": False,
+        "extras": [
+            {"name": "mmproj", "file": "mmproj-BF16.gguf",
+             "save_as": "mmproj-qwen3.5-9b-BF16.gguf"},
+        ],
     },
     {
         "num": 2,
-        "label": "Qwen3.5-9B ultra-uncensored-heretic   6.5 GB  dense, full GPU",
-        "repo": "mradermacher/Qwen3.5-9B-ultra-uncensored-heretic-v2-i1-GGUF",
-        "file": "Qwen3.5-9B-ultra-uncensored-heretic-v2.i1-Q5_K_M.gguf",
+        "label": "Vision, Voice assistant — Gemma 4 12B    ~6.7 GB  dense, full GPU",
+        "repo": "unsloth/gemma-4-12b-it-GGUF",
+        "file": "gemma-4-12b-it-Q4_K_M.gguf",
         "moe": False,
+        "extras": [
+            {"name": "mmproj", "file": "mmproj-BF16.gguf",
+             "save_as": "mmproj-gemma4-12b-BF16.gguf"},
+        ],
     },
     {
         "num": 3,
-        "label": "Qwen3.5-9B abliterated                5.6 GB  dense, full GPU",
-        "repo": "Al3xG/Qwen3.5-9B-abliterated-Q4_K_M-GGUF",
-        "file": "Qwen3.5-9B-abliterated-Q4_K_M.gguf",
+        "label": "Fast thinker — Qwen3.5-4B (UD-Q4_K_XL)    ~3.1 GB  dense, full GPU",
+        "repo": "unsloth/Qwen3.5-4B-GGUF",
+        "file": "Qwen3.5-4B-UD-Q4_K_XL.gguf",
         "moe": False,
     },
     {
         "num": 4,
-        "label": "Qwen3.5-35B-A3B Abliterated          19.9 GB  MoE, experts in RAM",
-        "repo": "Carlosian/Qwen3.5-35B-A3B-Abliterated-GGUF",
-        "file": "Qwen3.5-35B-A3B-Abliterated.Q4_K_S.gguf",
-        "moe": True,
-    },
-    {
-        "num": 5,
-        "label": "Gemma4-26B-A4B Uncensored Balanced      16.8 GB  MoE, experts in RAM",
+        "label": "Vision, Voice assistant (large) — Gemma4-26B-A4B  16.8 GB  MoE, experts in RAM",
         "repo": "HauhauCS/Gemma4-26B-A4B-QAT-Uncensored-HauhauCS-Balanced-MTP",
         "file": "Gemma4-26B-A4B-QAT-Uncensored-HauhauCS-Balanced-Q4_K_M.gguf",
         "moe": True,
@@ -80,8 +81,15 @@ REASONING_CATALOG = [
         ],
     },
     {
+        "num": 5,
+        "label": "Aggressive — Qwen3.5-35B-A3B Abliterated  19.9 GB  MoE, experts in RAM",
+        "repo": "Carlosian/Qwen3.5-35B-A3B-Abliterated-GGUF",
+        "file": "Qwen3.5-35B-A3B-Abliterated.Q4_K_S.gguf",
+        "moe": True,
+    },
+    {
         "num": 6,
-        "label": "Qwen3.6-35B-A3B (Q4)             19.4 GB  MoE, experts in RAM",
+        "label": "Coding — Qwen3.6-35B-A3B (Q4)       19.4 GB  MoE, experts in RAM",
         "repo": "unsloth/Qwen3.6-35B-A3B-GGUF",
         "file": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
         "moe": True,
@@ -221,6 +229,23 @@ def parse_args():
     g.add_argument("--skip-reasoning", action="store_true", help="Do not start reasoning server")
     g.add_argument("--skip-judge",     action="store_true", help="Do not start judge server")
     g.add_argument("--skip-embed",     action="store_true", help="Do not start embedding server")
+    g.add_argument("--skip-stt",       action="store_true",
+                   help="Do not start the speech-to-text (whisper) server")
+    g.add_argument("--stt-port", type=int, default=8083,
+                   help="Speech-to-text server port (default: 8083)")
+    g.add_argument("--stt-model", default="ggml-large-v3-turbo-q8_0.bin",
+                   help="whisper.cpp model file to serve (legacy ggml .bin "
+                        "format; whisper.cpp does not read GGUF). Downloaded "
+                        "from huggingface.co/ggerganov/whisper.cpp if missing "
+                        "(default: ggml-large-v3-turbo-q8_0.bin)")
+    g.add_argument("--stt-language", default="",
+                   help="Server-side fallback transcription language (ISO code, "
+                        "e.g. ru, az); empty = rely on the chat page's per-request "
+                        "language selector, which defaults to auto-detect")
+    g.add_argument("--stt-cpu", action="store_true",
+                   help="Use the CPU whisper-server build even if the CUDA "
+                        "build and a GPU are available (GPU stt is ~10-20x "
+                        "faster; its VRAM is charged to the reasoning window)")
 
     g = p.add_argument_group("Other")
     g.add_argument("--dry-run", action="store_true", help="Print planned actions without executing")
@@ -523,8 +548,13 @@ def _resolve_extras(entry, persist_dir, work_dir, same_location, args, hf_hub):
     for extra in extras:
         extra_file = extra["file"]
         extra_name = extra["name"]
-        extra_persist = persist_dir / extra_file
-        extra_work = work_dir / extra_file
+        # Two catalog entries may ship the same remote file name from
+        # different repos (unsloth names every mmproj "mmproj-BF16.gguf").
+        # save_as gives each its own local name so a Qwen projector can never
+        # be mistaken for a Gemma one when both are in the cache.
+        extra_save = extra.get("save_as", extra_file)
+        extra_persist = persist_dir / extra_save
+        extra_work = work_dir / extra_save
 
         # Already in the working dir.
         if extra_work.exists():
@@ -1087,7 +1117,8 @@ def lan_address() -> str:
 
 def autosize_reasoning_ctx(reasoning_path, embed_path=None, gpu_layers=99,
                            cpu_moe=False, pinned_ctx=None,
-                           free_mib=None, ports_busy=None, extras_paths=None):
+                           free_mib=None, ports_busy=None, extras_paths=None,
+                           stt_mib=0):
     """Plan the reasoning server's VRAM: context size, then the MoE split.
 
     One pool of memory, so one decision: the KV cache is sized first (it sets
@@ -1176,7 +1207,7 @@ def autosize_reasoning_ctx(reasoning_path, embed_path=None, gpu_layers=99,
     # its own CUDA context.
     overhead = CUDA_OVERHEAD_MIB * (2 if embed_path else 1)
     safety = max(VRAM_SAFETY_MIN_MIB, int(total_mib * VRAM_SAFETY_FRACTION))
-    budget_mib = (free_mib - weights_mib - embed_mib - extras_mib
+    budget_mib = (free_mib - weights_mib - embed_mib - extras_mib - stt_mib
                   - overhead - safety - TRANSIENT_BUF_MIB)
 
     notes.append(f"{gpu_name}: {free_mib:,} MiB free of {total_mib:,} MiB")
@@ -1185,6 +1216,7 @@ def autosize_reasoning_ctx(reasoning_path, embed_path=None, gpu_layers=99,
     notes.append(
         f"reserving {weights_mib:,} weights + {embed_mib:,} embed "
         + (f"+ {extras_mib:,} mmproj/draft " if extras_mib else "")
+        + (f"+ {stt_mib:,} whisper (GPU stt) " if stt_mib else "")
         + f"+ {overhead} CUDA + {safety} safety + {TRANSIENT_BUF_MIB} transient = "
         f"{budget_mib:,} MiB for KV"
     )
@@ -1312,10 +1344,13 @@ def del_arg(extra: list, flag: str) -> list:
     return out
 
 
-def resolve_reasoning_ctx(args, models):
+def resolve_reasoning_ctx(args, models, stt_mib=0):
     """Decide the context size and the MoE expert split; explain both.
 
     Returns (ctx, n_cpu_moe), where n_cpu_moe is None for plain --cpu-moe.
+    `stt_mib` is the VRAM a GPU whisper-server will claim after the context
+    is sized; it is charged to the KV budget so the window does not exceed
+    what the card can hold once both are resident.
     """
     default = reasoning_ctx_size()
     raw = str(getattr(args, "reasoning_ctx", "auto") or "auto").strip().lower()
@@ -1340,6 +1375,7 @@ def resolve_reasoning_ctx(args, models):
     ctx, n_cpu_moe, notes = autosize_reasoning_ctx(
         model_path, models.get("embed"), gpu_layers=99, cpu_moe=cpu_moe,
         pinned_ctx=pinned, extras_paths=models.get("reasoning_extras"),
+        stt_mib=stt_mib,
     )
 
     # An explicit --reasoning-n-cpu-moe overrides the computed split, the same
@@ -1425,6 +1461,9 @@ def update_config(storage_root, snapshot_path, args, reasoning_ctx=None):
     config["reasoning_endpoint"] = f"http://127.0.0.1:{args.reasoning_port}"
     config["judge_endpoint"] = f"http://127.0.0.1:{args.judge_port}"
     config["embed_endpoint"] = f"http://127.0.0.1:{args.embed_port}"
+    config["stt_endpoint"] = f"http://127.0.0.1:{args.stt_port}"
+    config["stt_model"] = args.stt_model
+    config["stt_language"] = args.stt_language or None
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         yaml.dump(config, f, default_flow_style=False,
                   allow_unicode=True, sort_keys=False)
@@ -1616,6 +1655,180 @@ def start_server(llama_bin, name, model_path, port, extra, host="127.0.0.1"):
     return proc
 
 
+# whisper.cpp only reads the legacy ggml format (file magic "lmgg"), never
+# GGUF. The ggml-org/whisper.cpp repo is gated, but the old ggerganov/whisper.cpp
+# alias still serves the same files publicly.
+WHISPER_MODEL_SOURCES = {
+    "ggml-large-v3-turbo-q8_0.bin": [
+        ("ggerganov/whisper.cpp", "ggml-large-v3-turbo-q8_0.bin"),
+    ],
+    "ggml-large-v3-q5_0.bin": [
+        ("ggerganov/whisper.cpp", "ggml-large-v3-q5_0.bin"),
+    ],
+    "ggml-large-v3.bin": [
+        ("ggerganov/whisper.cpp", "ggml-large-v3.bin"),
+    ],
+}
+
+
+def is_whisper_model(path: Path) -> bool:
+    """True if the file starts with the whisper.cpp model magic (legacy ggml
+    "lmgg" or GGUF, which some builds accept); guards against partial
+    downloads and corrupted copies poisoning the model cache."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) in (b"lmgg", b"GGUF")
+    except OSError:
+        return False
+
+
+def download_whisper_model(url: str, dest: Path) -> bool:
+    """Stream a whisper.cpp model from Hugging Face with progress."""
+    import urllib.request
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "cued_recall-launcher"})
+        with urllib.request.urlopen(req, timeout=30) as r, open(tmp, "wb") as f:
+            total = int(r.headers.get("Content-Length") or 0)
+            done = 0
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                if total:
+                    info(f"  whisper model {done >> 20} / {total >> 20} MiB "
+                         f"({100 * done / total:.0f}%)")
+        tmp.replace(dest)
+        if not is_whisper_model(dest):
+            warn(f"downloaded {dest.name} is not a valid whisper.cpp model; "
+                 "discarding")
+            dest.unlink(missing_ok=True)
+            return False
+        info(f"whisper model ready: {dest.name}")
+        return True
+    except Exception as e:
+        warn(f"whisper model download failed: {e}")
+        tmp.unlink(missing_ok=True)
+        return False
+
+
+def find_whisper_server(args):
+    """Locate whisper-server.exe (whisper.cpp), with the model next to it.
+
+    The middleware's /v1/stt proxies here. Neither the binary nor the model
+    lives on Hugging Face's launcher path, so this points at a local install
+    (C:\\llama\\whisper by default). The model file (--stt-model, a legacy
+    ggml .bin from the ggerganov/whisper.cpp repo; whisper.cpp does not read
+    GGUF) is downloaded on first use.
+
+    Returns (bin_path, model_path, use_gpu). The CUDA build
+    (cuda\\Release\\whisper-server.exe, from whisper-cublas-*-bin-x64.zip) is
+    preferred when present and not disabled by --stt-cpu: it transcribes in
+    ~0.2-0.5 s instead of seconds on the CPU, at the cost of ~1 GB VRAM which
+    the context autosizer charges to the KV budget. The CPU build is the
+    fallback.
+    """
+    if args.skip_stt:
+        return None, None, False
+    use_gpu = not args.stt_cpu and gpu_free_mib() is not None
+    candidates = []
+    if use_gpu:
+        candidates += [
+            Path("C:/llama/whisper/cuda/Release/whisper-server.exe"),
+            ROOT / "whisper" / "cuda" / "Release" / "whisper-server.exe",
+        ]
+    candidates += [
+        ROOT / "whisper" / "whisper-server.exe",
+        ROOT / "llama" / "whisper-server.exe",
+        Path("C:/llama/whisper/whisper-server.exe"),
+        Path("C:/llama/whisper-server.exe"),
+    ]
+    bin_path = None
+    for c in candidates:
+        if c.is_file():
+            bin_path = c
+            break
+    if bin_path is None:
+        which = shutil.which("whisper-server")
+        if which:
+            bin_path = Path(which)
+    if bin_path is None:
+        die(
+            "whisper-server (whisper.cpp) not found; voice recording needs it.\n"
+            "  Download https://github.com/ggml-org/whisper.cpp/releases\n"
+            "  and unpack whisper-bin-x64.zip to C:\\llama\\whisper\\\n"
+            "  (or pass --skip-stt to run without speech-to-text)"
+        )
+    if use_gpu and "cuda" not in bin_path.parts:
+        use_gpu = False
+    # The CUDA build lives in cuda\\Release\\, but the models stay in the
+    # shared whisper\\models\\ directory next to the CPU build.
+    models_dir = bin_path.parent / "models"
+    if not models_dir.is_dir():
+        for candidate in (Path("C:/llama/whisper/models"),
+                          ROOT / "whisper" / "models"):
+            if candidate.is_dir():
+                models_dir = candidate
+                break
+    model_path = None
+    wanted = args.stt_model
+    cand = models_dir / wanted
+    if cand.is_file() and is_whisper_model(cand):
+        model_path = cand
+    else:
+        if cand.is_file():
+            warn(f"{wanted} exists but is not a valid whisper.cpp model; "
+                 "re-downloading")
+            cand.unlink(missing_ok=True)
+        sources = WHISPER_MODEL_SOURCES.get(
+            wanted, [("ggerganov/whisper.cpp", wanted)])
+        if args.dry_run:
+            warn(f"would download whisper model {wanted} to {models_dir}")
+        else:
+            for repo, remote in sources:
+                if download_whisper_model(
+                        f"https://huggingface.co/{repo}/resolve/main/{remote}",
+                        cand):
+                    model_path = cand
+                    break
+        if model_path is None:
+            for name in ("ggml-small-q8_0.bin", "ggml-small-q5_1.bin",
+                         "ggml-small.bin"):
+                fallback = models_dir / name
+                if fallback.is_file():
+                    model_path = fallback
+                    warn(f"stt falling back to {name} "
+                         f"(download of {wanted} failed)")
+                    break
+    if model_path is None:
+        die(
+            f"No whisper model under {models_dir}. Download\n"
+            f"  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{wanted}\n"
+            f"  to {models_dir}\\ (or pass --skip-stt)"
+        )
+    return bin_path, model_path, use_gpu
+
+
+def wait_for_stt(port, proc, timeout=45):
+    """whisper-server has no /health; a listening socket + live process is up."""
+    import socket
+    for attempt in range(timeout):
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=2):
+                info(f"stt ready (port {port})")
+                return True
+        except OSError:
+            pass
+        if proc.poll() is not None:
+            warn(f"stt crashed (exit code {proc.returncode})")
+            return False
+        time.sleep(1)
+    warn(f"stt not ready after {timeout}s (port {port})")
+    return False
+
+
 def ensure_config_exists():
     """Bootstrap config.yaml from the template on a genuinely fresh clone.
 
@@ -1661,6 +1874,24 @@ def main():
         )
     info(f"llama-server: {llama_bin}")
 
+    # Resolve whisper before the context is sized: a GPU whisper-server claims
+    # its model VRAM for the whole session, so the reasoning window must be
+    # charged for it up front (and the stt process starts before llama-server
+    # so the allocation lands in that order).
+    whisper_bin, whisper_model, whisper_gpu = find_whisper_server(args)
+    stt_mib = 0
+    if whisper_gpu and whisper_model:
+        try:
+            stt_mib = (os.path.getsize(whisper_model) // (1024 * 1024)) + 300
+        except OSError:
+            pass
+    if whisper_bin:
+        info(f"whisper-server: {whisper_bin}"
+             + (" (CUDA)" if whisper_gpu else " (CPU)"))
+        if stt_mib:
+            info(f"whisper GPU model {whisper_model.name} charges "
+                 f"{stt_mib:,} MiB to the reasoning VRAM budget")
+
     # Reasoning model menu: pick from the catalog (or reuse the remembered
     # choice), then let the normal resolve flow download/copy it.
     chosen = choose_reasoning_model(args)
@@ -1683,7 +1914,7 @@ def main():
     if not models and not args.dry_run:
         die("No models resolved. Use --download-to, --models-cache, or explicit --*-model paths")
 
-    reasoning_ctx, reasoning_n_cpu_moe = resolve_reasoning_ctx(args, models)
+    reasoning_ctx, reasoning_n_cpu_moe = resolve_reasoning_ctx(args, models, stt_mib)
 
     # Everything run.bat wants to show is settled by here: the models are
     # located and the window is sized.
@@ -1778,6 +2009,28 @@ def main():
 
     processes = []
     try:
+        # stt first: the CUDA whisper-server must claim its VRAM before
+        # llama-server sizes its own allocation into the remainder.
+        stt_proc = None
+        if whisper_bin is not None:
+            # Note: do NOT pass -l auto here -- whisper-server v1.9.x then
+            # detects the language but still transcribes in English. The
+            # middleware forwards the chat page's language choice (auto by
+            # default) as a per-request form field, which works correctly.
+            stt_args = ["-t", "16"]
+            if whisper_gpu:
+                # Beam search is ~free on the GPU and measurably cleans short
+                # utterances; on the CPU build it costs real decode time for
+                # no clip-test gain, so it stays greedy there.
+                stt_args += ["-bs", "5"]
+            if args.stt_language:
+                stt_args += ["-l", args.stt_language]
+            stt_proc = start_server(whisper_bin, "stt", whisper_model,
+                                    args.stt_port, stt_args, backend_host)
+            processes.append(("stt", stt_proc, args.stt_port))
+            if not wait_for_stt(args.stt_port, stt_proc):
+                warn("speech-to-text failed to start; voice input disabled")
+
         for sd in server_defs:
             proc = start_server(llama_bin, sd["name"], sd["model"], sd["port"],
                                 sd["extra"], backend_host)
@@ -1785,6 +2038,10 @@ def main():
 
         info("Waiting for servers...")
         for i, (name, proc, port) in enumerate(processes):
+            if name == "stt":
+                # Already waited via the socket probe; whisper-server has no
+                # /health to poll.
+                continue
             if wait_for_server(name, port, proc):
                 continue
             # Both autosized numbers are estimates: VRAM can be taken by
@@ -1896,13 +2153,19 @@ def main():
         while True:
             time.sleep(3)
             # A server being replaced is briefly absent by design; only an
-            # unplanned exit should bring the stack down.
+            # unplanned exit should bring the stack down. Speech-to-text is
+            # optional: if it dies, voice input is disabled but everything
+            # else keeps running.
             for name, proc, _ in list(processes):
                 if supervisor.is_restarting(name):
                     continue
                 rc = proc.poll()
                 if rc is not None:
                     warn(f"{name} exited with code {rc}")
+                    if name == "stt":
+                        processes[:] = [p for p in processes if p[0] != "stt"]
+                        warn("speech-to-text disabled; voice input off, "
+                             "the rest of the stack keeps running")
             if any(proc.poll() is not None and not supervisor.is_restarting(name)
                    for name, proc, _ in list(processes)):
                 time.sleep(1)

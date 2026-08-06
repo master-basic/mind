@@ -2,6 +2,17 @@ listen: 127.0.0.1:8000
 reasoning_endpoint: http://127.0.0.1:8080
 judge_endpoint: http://127.0.0.1:8081
 embed_endpoint: http://127.0.0.1:8082
+# Speech-to-text backend (whisper.cpp whisper-server, started by run.py).
+# The chat page's voice button transcribes through the middleware's /v1/stt,
+# which proxies here. Empty/offline disables voice input only.
+stt_endpoint: http://127.0.0.1:8083
+# Which whisper.cpp model the launcher serves and with what language handling.
+# whisper.cpp reads the legacy ggml .bin format only (never GGUF).
+# ggml-large-v3-turbo-q8_0.bin (834 MiB, 99 languages incl. ru/az) is
+# downloaded on first use from ggerganov/whisper.cpp;
+# stt_language empty = rely on the chat page's per-request selector (auto).
+stt_model: ggml-large-v3-turbo-q8_0.bin
+stt_language: null
 think_tags:
 - <think>
 - </think>

@@ -346,6 +346,11 @@ class Config:
         self.reasoning_endpoint: str = raw.get("reasoning_endpoint", "http://127.0.0.1:8080")
         self.judge_endpoint: str = raw.get("judge_endpoint", "http://127.0.0.1:8081")
         self.embed_endpoint: str = raw.get("embed_endpoint", "http://127.0.0.1:8082")
+        self.stt_endpoint: str = raw.get("stt_endpoint", "http://127.0.0.1:8083")
+        # Read-only launcher mirror: which whisper model to serve and whether
+        # to force a language; run.py writes these, the middleware ignores them.
+        self.stt_model: str = raw.get("stt_model", "ggml-large-v3-turbo-q8_0.bin")
+        self.stt_language: str | None = raw.get("stt_language") or None
         self.think_tags: List[str] = raw.get("think_tags", ["<think>", "</think>"])
         self.store_path: str = raw.get("store_path", "/mnt/ramdisk/cued_recall")
         self.snapshot_path: str = raw.get("snapshot_path", "/var/lib/cued_recall/snapshots")

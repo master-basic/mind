@@ -5,6 +5,7 @@ description = "Cued Recall Memory Middleware — semantic block memory for reaso
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115.0",
+    "python-multipart>=0.0.9",
     "uvicorn[standard]>=0.32.0",
     "httpx>=0.28.0",
     "msgpack>=1.1.0",

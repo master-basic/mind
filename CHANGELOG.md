@@ -207,6 +207,109 @@ Progress is recorded in `update_implement.md` (§1–§19a), which is also where
 the two places the plan was wrong — Phase 1's premise, and Phase 3.1's
 `truncated` retirement — are documented.
 
+## 6 August — the model lineup and multimodal chat
+
+Researched a role-based GGUF lineup (newest model ≤ 8 months old, all fitting a
+12 GB GPU, MoE experts in system RAM) and landed it in the catalog:
+
+| # | Role | Model | Size |
+|---|------|-------|------|
+| 1 | Fast assistant | Qwen3.5-9B Q5_K_M (+mmproj, now vision-capable) | 6.6 GB |
+| 2 | Vision, Voice assistant | Gemma 4 12B Q4_K_M +mmproj | ~6.7 GB |
+| 3 | Fast thinker | Qwen3.5-4B UD-Q4_K_XL (thinking mode) | ~3.1 GB |
+| 4 | Vision, Voice assistant (large) | Gemma 4 26B-A4B Q4_K_M +mmproj +MTP (MoE) | 16.8 GB |
+| 5 | Aggressive | Qwen3.5-35B-A3B Abliterated (MoE) | 19.9 GB |
+| 6 | Coding | Qwen3.6-35B-A3B (MoE) | 19.4 GB |
+
+The catalog was renumbered from the pre-existing six to exactly these six role
+models; the 9B heretic/abliterated variants are gone, and the Gemma 4 26B-A4B
+entry now carries the role-4 label instead of its old name.
+
+Extras resolution got a `save_as` key: unsloth names every projector
+`mmproj-BF16.gguf`, so the first launch of Gemma 4 12B silently reused the
+Qwen3.5-9B projector already in the cache and llama-server died with
+`mismatch between text model (n_embd = 3840) and mmproj (n_embd = 4096)`.
+Choices 1 and 2 now stage their projectors under unique names
+(`mmproj-qwen3.5-9b-…` / `mmproj-gemma4-12b-…`).
+
+Voice chat: Chrome records `audio/webm;codecs=opus`, which whisper.cpp cannot
+demux (`failed to decode audio data from memory buffer` → HTTP 400). The chat
+page now decodes the recording in the browser (`decodeAudioData` →
+`OfflineAudioContext`) and re-encodes it as 16 kHz mono PCM WAV before the
+`/v1/stt` upload.
+
+The transcription model is no longer whisper-small: `run.py` serves
+`ggml-large-v3-turbo-q8_0.bin` (834 MiB, 99 languages, ru/az included) by
+default with `-t 16`, and downloads it on first use. whisper.cpp only reads
+the legacy ggml `.bin` format — it has no GGUF loader at all — so the GGUF
+mirror downloads (handy-computer, 845 MiB + 1.6 GiB) were dead weight that
+the server rejected with `invalid model data (bad magic)`, while the old
+small `.bin` kept loading and silently served as the fallback. The resolver
+now fetches the real legacy-format file from `ggerganov/whisper.cpp` (the
+`ggml-org` namespace is gated; the old alias is open); `--stt-model` switches
+files (`ggml-large-v3-q5_0.bin`, 1 GB full large-v3, ~2× slower, and the
+fp16 `ggml-large-v3.bin`, 2.9 GB, for maximum accuracy). Russian
+transcription went from garbled to near-verbatim on the test audio;
+Azerbaijani went from misheard ("Azərbaycan" → "Ağız etəbəyət səm") to exact
+("Azərbaycan."); on-device Russian improves ~10× versus small. The full
+large-v3 variants measured identical on degraded test clips (fp16 included)
+at 2–2.5× the turbo latency, so turbo stays the default; short low-resource
+utterances remain the hardest case — pinning the language in the chat
+selector beats auto-detect there (auto picked Turkish/Russian in tests).
+
+A CUDA whisper-server (`whisper-cublas-12.4.0-bin-x64.zip` unpacked to
+`C:\llama\whisper\cuda\`) is now used automatically when present: the whole
+model runs on the RTX 4070, transcription drops from 4–10 s to ~0.2–0.5 s,
+and the fp16 large-v3 (3.1 GB) becomes interactive. The stt process starts
+*before* llama-server so it claims its VRAM first, and the context autosizer
+charges the whisper footprint (~1.1 GB for turbo q8_0, or ~3.4 GB for fp16)
+to the reasoning KV budget so the window still fits the card.
+`--stt-cpu` forces the CPU build; the CPU path is unchanged otherwise.
+On the GPU build the server also runs beam search (`-bs 5`, ~free there) and
+the chat page records at 128 kbps opus instead of Chrome's default ~32-64
+(less loss before the 16 kHz PCM decode), both aiming at short-phrase
+accuracy.
+
+Two whisper-server quirks surfaced and are handled: `-l auto` at launch makes
+it detect the language but still transcribe in English (v1.9.x bug), so the
+launcher no longer passes it — the middleware forwards the chat page's
+per-request language instead (default `auto`, which detects correctly). The
+chat page gained a language selector next to the mic
+(Auto / Русский / Azərbaycanca / English); pinning a language is the reliable
+fix for turns that mix or start in a low-resource language.
+
+Speech-to-text is now resilient in two ways: a corrupt or half-downloaded
+model file is detected by magic bytes and re-downloaded instead of crashing
+the server (`invalid model data (bad magic)`), and a dead stt process no
+longer brings the whole stack down — voice input is disabled and the rest
+keeps running, instead of stopping all four servers.
+
+Researched and rejected for the fast-thinker slot: Phi-4-mini-reasoning and
+SmolLM3-3B (too old), GLM-4.7-Flash (too big for the role), Nemotron 3 Nano 4B
+(fails the community reasoning gauntlet that Qwen3.5-4B passes), Qwen3.6-6.7B
+(existence unverified — Qwen3.6 ships from 27B up).
+
+The chat UI went multimodal:
+
+- **Images** — 🖼️ attaches pictures as OpenAI-style `image_url` content parts;
+  the pipeline passes non-text parts through untouched (`_prepend_text` was
+  already parts-safe), charges each image a flat 700 tokens against the context
+  budget (`_msg_token_estimate`, `IMAGE_TOKENS_PER_IMAGE`), and skips the
+  server-side exact token count when images are present (a tokenizer cannot see
+  vision-encoder tokens). Memory stays text-only: images are seen, not embedded.
+- **Voice** — 🎤 records with MediaRecorder, POSTs to a new `/v1/stt` endpoint,
+  which proxies multipart audio to a whisper.cpp `whisper-server` that `run.py`
+  launches on 8083 (whisper-small q8_0, CPU; `--skip-stt` disables; missing
+  binary/model gets a pointed error instead of a silent no-op). The transcript
+  lands in the message as `[You said: …]` and flows through the normal text
+  pipeline, memory included.
+- `run.bat`'s echo menu now matches the catalog (it had drifted to a Hermes3.6
+  entry the catalog no longer had).
+
+Tests: `tests/test_multimodal.py` (7 tests: image counting, flat-rate token
+charge, parts surviving recall injection, no-tokenize-with-images, budget
+trimming with pictures). Suite: **317 passed, 1 skipped**.
+
 ## What it does, with numbers
 
 Measured, not asserted — see [evaluate/benchmark.md](evaluate/benchmark.md):
@@ -223,10 +326,11 @@ Measured, not asserted — see [evaluate/benchmark.md](evaluate/benchmark.md):
 | Consolidation on think traces | 76–94% smaller, 7 of 8 keeping the concrete facts |
 
 And what it is made of: ~5,500 lines of Python in the middleware, ~1,400 in the
-launcher, four processes, three models, one GPU.
+launcher, five processes, four models, one GPU.
 
 Working end to end: an OpenAI-compatible proxy with streaming and tools; a
-built-in chat UI with history; semantic recall with a second-stage relevance
+built-in chat UI with history, image attachment and voice transcription; a
+semantic recall with a second-stage relevance
 filter that reads the originating question; a block lifecycle with
 consolidation, utility decay, pinning and restore; a merge pass that derives
 one block from near-identical ones; span-level corrections; correction
