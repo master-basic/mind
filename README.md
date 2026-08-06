@@ -347,7 +347,7 @@ mind/
 ├── snapshots/                       # Block store backups (persistent)
 ├── evaluate/                        # Retrieval + end-to-end benchmarks
 │   ├── benchmark.md                 # Method notes and results
-│   ├── corpus.jsonl                 # Hand-built probe corpus, 6 relation types
+│   ├── corpus.jsonl                 # Hand-built probe corpus, 9 relation types
 │   ├── corrections.jsonl            # Labelled correction/not-correction rows
 │   ├── eval_retrieval.py            # Threshold sweep (no generation), --judge arm
 │   ├── eval_correction.py           # Precision/recall/false-positive rate for corrections

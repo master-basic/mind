@@ -192,15 +192,18 @@ an assertion. What got built, in commit order:
   threshold), and when the embed server errors, recall now degrades to a
   gist/tag keyword channel instead of the whole store vanishing.
 - **Tag/gist as a second candidate source** (Phase 5.1) — ships off: the
-  acceptance rows are not in the corpus yet. The channel itself is on, because
+  acceptance rows now exist and pass (tag-same 3/3, tag-diff 0/3, 5 Aug 2026);
+  wiring decision pending on the next PR. The channel itself is on, because
   it is the embed-failure fallback.
 - **Span-level corrections** (Phase 4.2) — off by default: when the verifier
   says a claim is wrong, it also quotes the offending phrase, and recall
-  redacts just that span instead of suppressing the whole block.
+  redacts just that span instead of suppressing the whole block. Live
+  measurement (5 Aug, 38 rows): the 1.5B produces bare `yes` with empty span
+  even in span mode; the 4.2 fixture measures 0/3 pass — stays off.
 - **Pin priority in the budget** (Phase 7.3) — a pin was exempt from decay
   but bought nothing at retrieval; it is now the tie-break in the ranked fill.
 
-Progress is recorded in `update_implement.md` (§1–§18), which is also where
+Progress is recorded in `update_implement.md` (§1–§19a), which is also where
 the two places the plan was wrong — Phase 1's premise, and Phase 3.1's
 `truncated` retirement — are documented.
 
@@ -212,6 +215,8 @@ Measured, not asserted — see [evaluate/benchmark.md](evaluate/benchmark.md):
 |---|---|
 | Recall, embedding only @ 0.62 | 0.96 recall, **0.55 false-fire** |
 | Recall, with the relevance judge, note = question | 0.75 recall, **0.09 false-fire**, traps refused 6/6 — the 0.00 originally recorded was a harness artefact that showed the judge a seed prompt, not a real block |
+| Widened corpus (53 rows, 5 Aug), judged @ 0.62 | 0.61 recall, **0.00 false-fire**; old traps 6/6, trap-asym leaks 2/6 (direction invisible to "about"); tag-same 3/3 via channel, tag-diff 0/3 |
+| Correction verifier (live, 5 Aug, n=38) | precision 0.59, recall 1.00, **FPR 0.78** — the 1.5B says "yes" even to its own few-shot negative; span mode 0/3 pass (bare `yes`, empty span) |
 | Crosslingual (Azerbaijani) recall | 3/6 → **6/6**, once the judge let the threshold drop to 0.48 |
 | Correction patterns | precision 0.87, recall 0.76, false-positive rate 0.12 (n=34) |
 | Judge pass on a 164-block store | 163 blocks visited in **7.3 s**, 1 model call |
@@ -238,7 +243,7 @@ breaking on external calls — they fail soft and get logged, nothing backs off.
 KV slot save/restore is unfinished. The end-to-end benchmark has a harness and
 no published results, because the grading that matters there is done by hand.
 
-The corpus is 47 rows and the correction set is 34, both hand-written. They
+The corpus is 53 rows and the correction set is 38, both hand-written. They
 bound the shape of the problem, not the rate.
 
 ## What the six days actually taught
