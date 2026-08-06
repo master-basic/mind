@@ -765,16 +765,35 @@ VRAM_SAFETY_MIN_MIB = 1024
 TRANSIENT_BUF_MIB = 512
 # Below this a context is too small to be useful; better to fail loudly.
 MIN_AUTO_CTX = 8192
-# And above this it is too slow to be useful. VRAM stops being the binding
-# constraint once an MoE parks its experts in system RAM: nothing then holds
-# the sizing back from the model's trained context, and the pipeline fills
-# whatever window it is handed with recalled memory, so every turn pays the
-# full prefill rather than just having headroom. Measured at ~385 tok/s on a
-# 4070 with Hermes3.6-35B-A3B, a full window costs 2.8 minutes of prompt
-# processing here against 11.3 minutes at the 262,144 the VRAM math allowed.
-# This is a latency ceiling, not a memory one -- pin --reasoning-ctx N to go
-# past it deliberately.
-MAX_AUTO_CTX = 65536
+# And above this the window stops paying for itself. VRAM is not what binds:
+# once an MoE parks its experts in system RAM, only the attention layers have
+# to be resident, and on a hybrid-attention model the KV is cheap besides --
+# Qwen3.6-35B-A3B caches just 10 of its 40 layers, 20 KiB/token, so even its
+# full 262,144 is 5 GiB of KV against a ~6 GiB budget on a 12 GiB 4070.
+#
+# What a bigger window actually costs is decode speed, because the KV and the
+# experts come out of the same pool: every gigabyte of cache is a gigabyte of
+# expert layers evicted to system RAM. On that card with ~11.5 GiB free the
+# split runs --n-cpu-moe 30 at 65,536 (10/40 expert layers on the GPU), 33 at
+# 131,072 (7/40), and 39 at 262,144 (1/40). The step from 65k to 131k costs
+# three layers; going on to 262k costs nine more, and charges that slower decode
+# to every turn including the short ones. 131,072 is where that trade stops
+# being worth it. Those splits move with whatever the desktop is holding at
+# launch -- a browser sitting on a gigabyte pushed 131,072 to --n-cpu-moe 37
+# here -- so free the GPU before starting if decode speed matters.
+#
+# Prefill is not the reason for the ceiling. Measured on the 4070 at --n-cpu-moe
+# 37: 780 tok/s over a 40k prompt, so a cold full 131,072 window is about 2.8
+# minutes. (An earlier note here put this at 385 tok/s, which came from a short
+# prompt where the fixed overhead dominates and roughly halves the apparent
+# rate.) That cost is paid once rather than per turn anyway:
+# Recall.build_messages anchors recalled blocks to the newest user
+# message precisely so the system prompt and history stay byte-identical and
+# llama.cpp's KV prefix survives, and _fit_messages trims below target by a
+# margin so one re-prefill buys several turns.
+#
+# A latency ceiling, not a memory one -- pin --reasoning-ctx N to go past it.
+MAX_AUTO_CTX = 131072
 # A sliding-window layer's cache holds the window plus room for the batch in
 # flight, not the whole context. 2048 is llama.cpp's default --batch-size, which
 # the reasoning server does not override (only the embed server does). The exact
@@ -1259,8 +1278,9 @@ def autosize_reasoning_ctx(reasoning_path, embed_path=None, gpu_layers=99,
                      f"keeping default {default:,}")
         return default, None, notes
     if hit_latency:
-        notes.append(f"VRAM allowed more; capped at {MAX_AUTO_CTX:,} so a full "
-                     f"window stays a few minutes of prefill, not tens")
+        notes.append(f"VRAM allowed more; capped at {MAX_AUTO_CTX:,} to keep "
+                     f"expert layers on the GPU -- pin --reasoning-ctx N to "
+                     f"trade decode speed for a longer window")
     elif hit_trained:
         notes.append(f"capped at the model's trained context ({int(trained_ctx):,})")
 

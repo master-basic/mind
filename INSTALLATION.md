@@ -224,7 +224,7 @@ Windows Firewall has to allow every port that was opened, not just 8000; the sta
 
 ### opencode
 
-opencode needs `npm` set so it knows which SDK adapter to use for a custom provider. A working `opencode.json`:
+opencode needs `npm` set so it knows which SDK adapter to use for a custom provider. Put this in your **global** opencode config (`~/.config/opencode/opencode.json`), not in a per-project one — the middleware is a machine-wide service, and a project-level copy is a second place for the numbers below to go stale:
 
 ```json
 {
@@ -242,7 +242,8 @@ opencode needs `npm` set so it knows which SDK adapter to use for a custom provi
           "name": "Local LLM",
           "tool_call": true,
           "reasoning": true,
-          "interleaved": { "field": "reasoning_content" }
+          "interleaved": { "field": "reasoning_content" },
+          "limit": { "context": 126976, "output": 10000 }
         }
       }
     }
@@ -250,6 +251,8 @@ opencode needs `npm` set so it knows which SDK adapter to use for a custom provi
   "model": "local/local-model"
 }
 ```
+
+Set `limit.context` to the `max_context_tokens` the launcher prints at startup — the reasoning server's `--ctx-size` minus the 4096-token reply reserve (126,976 for the default 131,072 window). opencode uses this to decide when to summarize, so if it is lower than the real window you lose context you were paying VRAM for, and if it is higher opencode overruns the middleware's budget and history gets trimmed underneath it.
 
 Agentic clients need a model that is genuinely good at tool calling. Abliterated or "uncensored" merges often emit malformed tool calls or loop on the same call — pick a stock or coder-tuned model if tools misbehave.
 
@@ -365,7 +368,9 @@ Install ImDisk Toolkit, then close and reopen your terminal.
 Not enough VRAM for all three models. Try:
 - A smaller reasoning model from the launcher menu
 - `--skip-judge` (frees VRAM; tagging and compression stop working)
-- Lower `--ctx-size` in `run.py`'s `SERVER_DEFAULTS`
+- `--reasoning-ctx N` to pin a smaller window (e.g. `--reasoning-ctx 65536`). Editing `--ctx-size` in `run.py`'s `SERVER_DEFAULTS` will not help: that value is only the fallback for when free VRAM cannot be read, and the autosizer normally overrides it.
+
+Closing anything else using the GPU before launching is worth doing first — the autosizer sizes the window from *free* VRAM, so a browser holding a gigabyte silently costs you context.
 
 **The client 404s when adding the middleware**
 It is probably calling `GET /v1/models` during setup. That endpoint exists — check the base URL ends in `/v1`.
