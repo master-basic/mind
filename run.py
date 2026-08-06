@@ -1744,11 +1744,15 @@ def download_whisper_model(url: str, dest: Path) -> bool:
 WHISPER_RELEASE_URL = (
     "https://github.com/ggml-org/whisper.cpp/releases/latest/download"
 )
-# asset -> (relative path of whisper-server.exe inside the zip). The CUDA zip
-# lays out cuda\\Release\\whisper-server.exe; the CPU zip keeps it at the root.
+# asset -> (asset, subdir-under-install-dir, path of whisper-server.exe inside
+# the zip). Both release zips lay their binaries under a Release\\ prefix; the
+# CUDA zip carries the CUDA runtime DLLs, so to keep the two builds from
+# clobbering each other's shared DLLs it goes in its own cuda\\ subfolder:
+#   <llama>\\whisper\\Release\\whisper-server.exe            (CPU build)
+#   <llama>\\whisper\\cuda\\Release\\whisper-server.exe   (CUDA build)
 WHISPER_SERVER_ZIPS = {
-    "cpu": ("whisper-bin-x64.zip", "whisper-server.exe"),
-    "cuda": ("whisper-cublas-12.4.0-bin-x64.zip", "cuda/Release/whisper-server.exe"),
+    "cpu": ("whisper-bin-x64.zip", "", "Release/whisper-server.exe"),
+    "cuda": ("whisper-cublas-12.4.0-bin-x64.zip", "cuda", "Release/whisper-server.exe"),
 }
 
 
@@ -1801,25 +1805,21 @@ def provision_whisper_server(use_gpu: bool, install_dir: Path) -> Optional[Path]
     machine that was never set up by hand. Returns the binary path, or None.
     Prefers the CUDA build when a GPU is available, else the CPU build.
     """
-    if use_gpu:
-        asset, rel = WHISPER_SERVER_ZIPS["cuda"]
-        if download_and_unzip(f"{WHISPER_RELEASE_URL}/{asset}", install_dir):
-            cand = install_dir / rel
+
+    def try_build(kind: str) -> Optional[Path]:
+        asset, sub, rel = WHISPER_SERVER_ZIPS[kind]
+        target = install_dir / sub if sub else install_dir
+        if download_and_unzip(f"{WHISPER_RELEASE_URL}/{asset}", target):
+            cand = target / rel
             if cand.is_file():
-                # The CUDA zip may not carry the shared models/ dir; the CPU
-                # build is the one that conventionally holds it, so unpack
-                # that too when we are on a fresh install.
-                if not (install_dir / "whisper-server.exe").is_file():
-                    asset_c, _rel_c = WHISPER_SERVER_ZIPS["cpu"]
-                    download_and_unzip(
-                        f"{WHISPER_RELEASE_URL}/{asset_c}", install_dir)
                 return cand
-    asset, rel = WHISPER_SERVER_ZIPS["cpu"]
-    if download_and_unzip(f"{WHISPER_RELEASE_URL}/{asset}", install_dir):
-        cand = install_dir / rel
-        if cand.is_file():
+        return None
+
+    if use_gpu:
+        cand = try_build("cuda")
+        if cand is not None:
             return cand
-    return None
+    return try_build("cpu")
 
 
 def find_whisper_server(args, llama_bin=None):
@@ -1858,10 +1858,13 @@ def find_whisper_server(args, llama_bin=None):
             ROOT / "whisper" / "cuda" / "Release" / "whisper-server.exe",
         ]
     candidates += [
+        install_dir / "Release" / "whisper-server.exe",
         install_dir / "whisper-server.exe",
+        Path("C:/llama/whisper/Release/whisper-server.exe"),
+        Path("C:/llama/whisper/whisper-server.exe"),
+        ROOT / "whisper" / "Release" / "whisper-server.exe",
         ROOT / "whisper" / "whisper-server.exe",
         ROOT / "llama" / "whisper-server.exe",
-        Path("C:/llama/whisper/whisper-server.exe"),
         Path("C:/llama/whisper-server.exe"),
     ]
     bin_path = None
@@ -1895,16 +1898,10 @@ def find_whisper_server(args, llama_bin=None):
         )
     if use_gpu and "cuda" not in bin_path.parts:
         use_gpu = False
-    # The CUDA build lives in cuda\\Release\\, but the models stay in the
-    # shared whisper\\models\\ directory next to the CPU build.
-    models_dir = bin_path.parent / "models"
-    if not models_dir.is_dir():
-        for candidate in (install_dir / "models",
-                          Path("C:/llama/whisper/models"),
-                          ROOT / "whisper" / "models"):
-            if candidate.is_dir():
-                models_dir = candidate
-                break
+    # Whisper models live in the shared <install_dir>\\models directory, which
+    # the release zips do not ship; make sure it exists for the download.
+    models_dir = install_dir / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
     model_path = None
     wanted = args.stt_model
     cand = models_dir / wanted
