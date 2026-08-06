@@ -1822,7 +1822,7 @@ def provision_whisper_server(use_gpu: bool, install_dir: Path) -> Optional[Path]
     return None
 
 
-def find_whisper_server(args):
+def find_whisper_server(args, llama_bin=None):
     """Locate whisper-server.exe (whisper.cpp), with the model next to it.
 
     The middleware's /v1/stt proxies here. Neither the binary nor the model
@@ -1830,6 +1830,11 @@ def find_whisper_server(args):
     (C:\\llama\\whisper by default). The model file (--stt-model, a legacy
     ggml .bin from the ggerganov/whisper.cpp repo; whisper.cpp does not read
     GGUF) is downloaded on first use.
+
+    The install dir is <folder containing llama-server>\\whisper -- the whisper
+    build lives next to the rest of the llama stack (e.g. S:\\llama\\whisper),
+    not inside the repo. When llama_bin is unknown it falls back to
+    <repo>\\whisper.
 
     Returns (bin_path, model_path, use_gpu). The CUDA build
     (cuda\\Release\\whisper-server.exe, from whisper-cublas-*-bin-x64.zip) is
@@ -1841,13 +1846,19 @@ def find_whisper_server(args):
     if args.skip_stt:
         return None, None, False
     use_gpu = not args.stt_cpu and gpu_free_mib() is not None
+    if llama_bin is not None:
+        install_dir = Path(llama_bin).resolve().parent / "whisper"
+    else:
+        install_dir = ROOT / "whisper"
     candidates = []
     if use_gpu:
         candidates += [
+            install_dir / "cuda" / "Release" / "whisper-server.exe",
             Path("C:/llama/whisper/cuda/Release/whisper-server.exe"),
             ROOT / "whisper" / "cuda" / "Release" / "whisper-server.exe",
         ]
     candidates += [
+        install_dir / "whisper-server.exe",
         ROOT / "whisper" / "whisper-server.exe",
         ROOT / "llama" / "whisper-server.exe",
         Path("C:/llama/whisper/whisper-server.exe"),
@@ -1864,8 +1875,8 @@ def find_whisper_server(args):
             bin_path = Path(which)
     if bin_path is None and not args.dry_run:
         # Automate the install the manual instructions used to demand: pull the
-        # release zip (CPU, or CUDA when a GPU is present) into <repo>/whisper/.
-        install_dir = ROOT / "whisper"
+        # release zip (CPU, or CUDA when a GPU is present) into the whisper dir
+        # next to llama-server.
         bin_path = provision_whisper_server(use_gpu, install_dir)
         if bin_path is not None:
             info(f"whisper-server provisioned at {bin_path}")
@@ -1873,7 +1884,7 @@ def find_whisper_server(args):
         if args.dry_run:
             kind = "CUDA" if use_gpu else "CPU"
             warn(f"would auto-download whisper-server.exe ({kind}) "
-                 f"to {ROOT / 'whisper'}")
+                 f"to {install_dir}")
             return None, None, False
         die(
             "whisper-server (whisper.cpp) not found and could not be "
@@ -1888,7 +1899,8 @@ def find_whisper_server(args):
     # shared whisper\\models\\ directory next to the CPU build.
     models_dir = bin_path.parent / "models"
     if not models_dir.is_dir():
-        for candidate in (Path("C:/llama/whisper/models"),
+        for candidate in (install_dir / "models",
+                          Path("C:/llama/whisper/models"),
                           ROOT / "whisper" / "models"):
             if candidate.is_dir():
                 models_dir = candidate
@@ -1999,7 +2011,7 @@ def main():
     # its model VRAM for the whole session, so the reasoning window must be
     # charged for it up front (and the stt process starts before llama-server
     # so the allocation lands in that order).
-    whisper_bin, whisper_model, whisper_gpu = find_whisper_server(args)
+    whisper_bin, whisper_model, whisper_gpu = find_whisper_server(args, llama_bin)
     stt_mib = 0
     if whisper_gpu and whisper_model:
         try:
