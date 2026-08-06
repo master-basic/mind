@@ -29,6 +29,7 @@ import argparse
 import threading
 from collections import namedtuple
 from pathlib import Path
+from typing import Optional
 
 ROOT = Path(__file__).parent.resolve()
 CONFIG_PATH = ROOT / "cued_recall" / "config.yaml"
@@ -1734,6 +1735,93 @@ def download_whisper_model(url: str, dest: Path) -> bool:
         return False
 
 
+# whisper.cpp ships its Windows binaries as GitHub release zips. The model is
+# already auto-downloaded; the server binary used to be a manual install
+# (die() with "unpack whisper-bin-x64.zip to C:\\llama\\whisper"), so a fresh
+# machine had no working voice input until someone did it by hand. These are
+# the same assets, pulled from the release endpoint and unpacked to
+# <repo>/whisper/ the first time they are needed.
+WHISPER_RELEASE_URL = (
+    "https://github.com/ggml-org/whisper.cpp/releases/latest/download"
+)
+# asset -> (relative path of whisper-server.exe inside the zip). The CUDA zip
+# lays out cuda\\Release\\whisper-server.exe; the CPU zip keeps it at the root.
+WHISPER_SERVER_ZIPS = {
+    "cpu": ("whisper-bin-x64.zip", "whisper-server.exe"),
+    "cuda": ("whisper-cublas-12.4.0-bin-x64.zip", "cuda/Release/whisper-server.exe"),
+}
+
+
+def download_and_unzip(url: str, dest_dir: Path) -> bool:
+    """Stream a release zip and unpack it under dest_dir (progress like the
+    model downloader). Returns True only if the archive downloaded and unpacked
+    cleanly; a partial or non-zip download is discarded, never left behind.
+    """
+    import tempfile
+    import urllib.request
+    import zipfile
+    fd, tmp_path = tempfile.mkstemp(suffix=".zip")
+    os.close(fd)
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "cued_recall-launcher"})
+        info(f"downloading {url}")
+        with urllib.request.urlopen(req, timeout=60) as r, open(tmp_path, "wb") as f:
+            total = int(r.headers.get("Content-Length") or 0)
+            done = 0
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                if total:
+                    info(f"  {done >> 20} / {total >> 20} MiB "
+                         f"({100 * done / total:.0f}%)")
+        if not zipfile.is_zipfile(tmp_path):
+            warn(f"downloaded {url} is not a zip; discarding")
+            return False
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(tmp_path) as z:
+            z.extractall(dest_dir)
+        info(f"unpacked whisper.cpp binaries to {dest_dir}")
+        return True
+    except Exception as e:
+        warn(f"whisper binary download failed: {e}")
+        return False
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def provision_whisper_server(use_gpu: bool, install_dir: Path) -> Optional[Path]:
+    """Download the whisper-server binary we do not have, so voice works on a
+    machine that was never set up by hand. Returns the binary path, or None.
+    Prefers the CUDA build when a GPU is available, else the CPU build.
+    """
+    if use_gpu:
+        asset, rel = WHISPER_SERVER_ZIPS["cuda"]
+        if download_and_unzip(f"{WHISPER_RELEASE_URL}/{asset}", install_dir):
+            cand = install_dir / rel
+            if cand.is_file():
+                # The CUDA zip may not carry the shared models/ dir; the CPU
+                # build is the one that conventionally holds it, so unpack
+                # that too when we are on a fresh install.
+                if not (install_dir / "whisper-server.exe").is_file():
+                    asset_c, _rel_c = WHISPER_SERVER_ZIPS["cpu"]
+                    download_and_unzip(
+                        f"{WHISPER_RELEASE_URL}/{asset_c}", install_dir)
+                return cand
+    asset, rel = WHISPER_SERVER_ZIPS["cpu"]
+    if download_and_unzip(f"{WHISPER_RELEASE_URL}/{asset}", install_dir):
+        cand = install_dir / rel
+        if cand.is_file():
+            return cand
+    return None
+
+
 def find_whisper_server(args):
     """Locate whisper-server.exe (whisper.cpp), with the model next to it.
 
@@ -1774,9 +1862,22 @@ def find_whisper_server(args):
         which = shutil.which("whisper-server")
         if which:
             bin_path = Path(which)
+    if bin_path is None and not args.dry_run:
+        # Automate the install the manual instructions used to demand: pull the
+        # release zip (CPU, or CUDA when a GPU is present) into <repo>/whisper/.
+        install_dir = ROOT / "whisper"
+        bin_path = provision_whisper_server(use_gpu, install_dir)
+        if bin_path is not None:
+            info(f"whisper-server provisioned at {bin_path}")
     if bin_path is None:
+        if args.dry_run:
+            kind = "CUDA" if use_gpu else "CPU"
+            warn(f"would auto-download whisper-server.exe ({kind}) "
+                 f"to {ROOT / 'whisper'}")
+            return None, None, False
         die(
-            "whisper-server (whisper.cpp) not found; voice recording needs it.\n"
+            "whisper-server (whisper.cpp) not found and could not be "
+            "auto-downloaded; voice recording needs it.\n"
             "  Download https://github.com/ggml-org/whisper.cpp/releases\n"
             "  and unpack whisper-bin-x64.zip to C:\\llama\\whisper\\\n"
             "  (or pass --skip-stt to run without speech-to-text)"
